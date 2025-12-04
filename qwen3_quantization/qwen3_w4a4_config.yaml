@@ -1,0 +1,48 @@
+apiversion: "modelslim_v1"
+
+# 定义 W4A4 动态量化模板
+default_w4a4_dynamic: &default_w4a4_dynamic
+  weight:
+    scope: "per_group"
+    dtype: "int4"
+    symmetric: true
+    method: "autoround"
+    ext:
+      group_size: 128
+      scale_dtype: "bfloat16"
+  act:
+    scope: "per_token"
+    dtype: "int4"
+    symmetric: true
+    method: "minmax"
+    ext:
+      scale_dtype: "bfloat16"
+
+spec:
+  process:
+    # 1. Quarot 旋转 (处理异常值)
+    # online: True 表示开启在线旋转，这对 W4A4 至关重要
+    # max_tp_size: 1 表示单卡推理，如果是多卡请修改此值 (例如 2, 4, 8)
+    - type: "quarot"
+      online: True
+      block_size: -1
+      max_tp_size: 1
+      
+    # 2. AutoRound 量化 (优化权重)
+    # iters: 迭代次数，200 是推荐值，越高越慢但精度可能越好
+    - type: "autoround_quant"
+      iters: 200
+      enable_minmax_tuning: True
+      enable_round_tuning: True
+      strategies:
+        # 将 W4A4 策略应用于所有层 ("*")
+        - qconfig: *default_w4a4_dynamic
+          include: ["*"]
+
+  save:
+    # 保存格式配置
+    - type: "ascendv1_saver"
+      part_file_size: 4
+
+  # 校准数据集路径 (请确保该文件存在)
+  dataset: "calib_data.json"

@@ -107,7 +107,7 @@ class Qwen3MoeModelAdapter(TransformersModel,
     def get_num_attention_heads(self) -> int:
         return self.config.num_attention_heads
 
-    def get_layer_wise_ov_pair(self, decoder_module: nn.Module) -> Dict[nn.Module, nn.Module]:
+    def get_layer_wise_ov_pair(self, decoder_module: nn.Module):
         ov_pairs = {}
         if hasattr(decoder_module, 'self_attn'):
             self_attn = decoder_module.self_attn
@@ -115,7 +115,7 @@ class Qwen3MoeModelAdapter(TransformersModel,
                 ov_pairs[self_attn.o_proj] = self_attn.v_proj
         return ov_pairs
 
-    def get_layer_wise_up_down_pair(self, decoder_module: nn.Module) -> Dict[nn.Module, nn.Module]:
+    def get_layer_wise_up_down_pair(self, decoder_module: nn.Module):
         up_down_pairs = {}
         if hasattr(decoder_module, 'mlp'):
             mlp = decoder_module.mlp

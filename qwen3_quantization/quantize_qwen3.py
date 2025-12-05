@@ -34,7 +34,7 @@ def main():
     # 初始化 Adapter
     # 使用 Qwen3MoeModelAdapter
     from msmodelslim.model.qwen3_moe.model_adapter import Qwen3MoeModelAdapter
-    adapter = Qwen3MoeModelAdapter(model_path=model_path)
+    adapter = Qwen3MoeModelAdapter(model_type="Qwen3-30B", model_path=model_path)
 
     # ==========================================
     # 2. 量化配置 (W4A4)

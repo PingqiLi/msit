@@ -72,8 +72,8 @@ def main():
     
     # Float Config (For MoE Gate) - Use Float/BF16
     float_config = LinearQConfig(
-        weight=QConfig(dtype=QDType.FLOAT, scope=QScope.PER_TENSOR, symmetric=True),
-        act=QConfig(dtype=QDType.FLOAT, scope=QScope.PER_TENSOR, symmetric=True)
+        weight=QConfig(dtype=QDType.FLOAT, scope=QScope.PER_TENSOR, symmetric=True, method='minmax'),
+        act=QConfig(dtype=QDType.FLOAT, scope=QScope.PER_TENSOR, symmetric=True, method='minmax')
     )
 
     # ==========================================

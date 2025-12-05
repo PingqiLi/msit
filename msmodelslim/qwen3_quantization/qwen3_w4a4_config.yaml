@@ -53,11 +53,12 @@ spec:
               dtype: int8
               scope: per_channel
               symmetric: true
-              # method: minmax (implied default)
+              method: "minmax"
             act: 
               dtype: int8
               scope: per_token
               symmetric: true
+              method: "minmax"
           include: ["self_attn"]
         
         # 2. Gate Float (BF16)
@@ -66,10 +67,12 @@ spec:
               dtype: float
               scope: per_tensor
               symmetric: true
+              method: "minmax"
             act:
               dtype: float
               scope: per_tensor
               symmetric: true
+              method: "minmax"
           include: ["mlp.gate"]
 
         # 3. Last 2 Layers Experts W8A8
@@ -78,10 +81,12 @@ spec:
               dtype: int8
               scope: per_channel
               symmetric: true
+              method: "minmax"
             act: 
               dtype: int8
               scope: per_token
               symmetric: true
+              method: "minmax"
           include: 
             - "model.layers.46.mlp.experts"
             - "model.layers.47.mlp.experts"

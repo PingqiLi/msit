@@ -47,6 +47,46 @@ spec:
       enable_minmax_tuning: True
       enable_round_tuning: True
       strategies:
+        # 1. Attention W8A8
+        - qconfig:
+            weight:
+              dtype: int8
+              scope: per_channel
+              symmetric: true
+              # method: minmax (implied default)
+            act: 
+              dtype: int8
+              scope: per_token
+              symmetric: true
+          include: ["self_attn"]
+        
+        # 2. Gate Float (BF16)
+        - qconfig:
+            weight:
+              dtype: float
+              scope: per_tensor
+              symmetric: true
+            act:
+              dtype: float
+              scope: per_tensor
+              symmetric: true
+          include: ["mlp.gate"]
+
+        # 3. Last 2 Layers Experts W8A8
+        - qconfig:
+            weight:
+              dtype: int8
+              scope: per_channel
+              symmetric: true
+            act: 
+              dtype: int8
+              scope: per_token
+              symmetric: true
+          include: 
+            - "model.layers.46.mlp.experts"
+            - "model.layers.47.mlp.experts"
+
+        # 4. Default W4A4 (All other layers)
         - qconfig: *default_w4a4_dynamic
           include: ["*"]
 

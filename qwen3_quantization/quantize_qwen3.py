@@ -22,110 +22,135 @@ def main():
     # ==========================================
     # 1. 基础配置
     # ==========================================
-    # 模型路径 (请修改为您实际的模型路径)
+    # 模型路径
     model_path = "/workspace/weights/Qwen3-30B"
     # 输出路径
     save_path = "./qwen3_w4a4_output"
     
-    # 校准数据 (这里使用示例数据，实际请加载真实数据集)
-    calib_data = ["Hello world", "This is a test prompt for calibration."] * 10
+    # 校准数据路径
+    calib_path = os.path.join(msmodelslim_path, "lab_calib/mix_calib.jsonl")
+    if not os.path.exists(calib_path):
+        print(f"Warning: Calibration file not found at {calib_path}, using dummy data.")
+        calib_data = ["Hello world"] * 10
+    else:
+        # 简单读取jsonl文件的一列作为校准数据，这里假设是 list of strings format
+        # 如果是复杂jsonl，需根据实际Key修改读取逻辑
+        import json
+        calib_data = []
+        with open(calib_path, 'r') as f:
+            for line in f:
+                try:
+                    item = json.loads(line)
+                    # 尝试常见的key
+                    text = item.get('text') or item.get('content') or item.get('input')
+                    if text:
+                        calib_data.append(text)
+                except:
+                    pass
+        # 限制校准数据量
+        calib_data = calib_data[:128]
 
     print(f"正在加载模型适配器，路径: {model_path}")
-    # 初始化 Adapter
-    # 使用 Qwen3MoeModelAdapter
     from msmodelslim.model.qwen3_moe.model_adapter import Qwen3MoeModelAdapter
     adapter = Qwen3MoeModelAdapter(model_type="Qwen3-30B", model_path=model_path)
 
     # ==========================================
-    # 2. 量化配置 (W4A4)
+    # 2. 量化配置定义
     # ==========================================
-    # 权重配置: INT4, Per-Group (group_size=128), Symmetric, MinMax
-    weight_config = QConfig(
-        dtype=QDType.INT4,
-        scope=QScope.PER_GROUP,
-        symmetric=True,
-        method='minmax',
-        ext={'group_size': 128}
+    
+    # W4A4 Config (Default for Experts)
+    w4a4_config = LinearQConfig(
+        weight=QConfig(dtype=QDType.INT4, scope=QScope.PER_GROUP, symmetric=True, method='minmax', ext={'group_size': 128}),
+        act=QConfig(dtype=QDType.INT4, scope=QScope.PER_TOKEN, symmetric=True, method='minmax')
     )
     
-    # 激活配置: INT4, Per-Token, Symmetric, MinMax
-    act_config = QConfig(
-        dtype=QDType.INT4,
-        scope=QScope.PER_TOKEN,
-        symmetric=True,
-        method='minmax'
+    # W8A8 Config (For Attention and Last Experts)
+    w8a8_config = LinearQConfig(
+        weight=QConfig(dtype=QDType.INT8, scope=QScope.PER_CHANNEL, symmetric=True, method='minmax'),
+        act=QConfig(dtype=QDType.INT8, scope=QScope.PER_TOKEN, symmetric=True, method='minmax')
     )
     
-    linear_qconfig = LinearQConfig(weight=weight_config, act=act_config)
+    # Float Config (For MoE Gate) - Use Float/BF16
+    float_config = LinearQConfig(
+        weight=QConfig(dtype=QDType.FLOAT, scope=QScope.PER_TENSOR, symmetric=True),
+        act=QConfig(dtype=QDType.FLOAT, scope=QScope.PER_TENSOR, symmetric=True)
+    )
 
     # ==========================================
-    # 3. 算法配置 (LAOS Pipeline: IterSmooth -> Quarot -> IterSmooth -> AutoRound)
+    # 3. 策略配置 (Layers Strategy)
+    # ==========================================
+    strategies = []
+    
+    # 1. 默认策略: Experts 使用 W4A4 (除了最后两层)
+    # 这里的 include 范围可以根据实际情况调整，默认全应用W4A4然后用后续策略覆盖
+    strategies.append(QuantStrategyConfig(qconfig=w4a4_config, include=["*"]))
+
+    # 2. Attention层: W8A8
+    strategies.append(QuantStrategyConfig(
+        qconfig=w8a8_config, 
+        include=["self_attn"] # 匹配所有 self_attn 模块
+    ))
+    
+    # 3. MoE Gate: Float (BF16)
+    strategies.append(QuantStrategyConfig(
+        qconfig=float_config, 
+        include=["mlp.gate"]
+    ))
+    
+    # 4. 最后两层 Experts (Layer 46, 47): W8A8
+    # 假设总层数48, index 0-47. 
+    strategies.append(QuantStrategyConfig(
+        qconfig=w8a8_config,
+        include=[
+            "model.layers.46.mlp.experts", 
+            "model.layers.47.mlp.experts"
+        ]
+    ))
+
+    # ==========================================
+    # 4. 算法流程配置 (LAOS)
     # ==========================================
     
-    # 3.1 Iterative Smooth (第一阶段)
+    # 3.1 Iterative Smooth (1)
     from msmodelslim.quant.processor.anti_outlier import IterSmoothProcessorConfig
     iter_smooth_1 = IterSmoothProcessorConfig(
-        alpha=0.9,
-        scale_min=1e-5,
-        symmetric=False,
+        alpha=0.9, scale_min=1e-5, symmetric=False,
         enable_subgraph_type=["ov", "up-down"]
     )
 
-    # 3.2 Quarot 旋转 (处理异常值)
+    # 3.2 Quarot (Online)
     quarot_config = QuaRotProcessorConfig(
-        online=True,
-        block_size=32,
-        max_tp_size=4,
+        online=True, block_size=32, max_tp_size=4,
         down_proj_online_layers=[1,3,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26]
     )
 
-    # 3.3 Iterative Smooth (第二阶段)
+    # 3.3 Iterative Smooth (2)
     iter_smooth_2 = IterSmoothProcessorConfig(
-        alpha=0.9,
-        scale_min=1e-5,
-        symmetric=False,
+        alpha=0.9, scale_min=1e-5, symmetric=False,
         enable_subgraph_type=["norm-linear"]
     )
     
-    # 3.4 AutoRound 量化 (优化权重)
+    # 3.4 AutoRound
     autoround_config = AutoroundProcessorConfig(
         iters=400,
         enable_minmax_tuning=True,
         enable_round_tuning=True,
-        strategies=[
-            QuantStrategyConfig(
-                qconfig=linear_qconfig,
-                include=["*"]  # 应用于所有层
-            )
-        ]
+        strategies=strategies # 使用自定义策略
     )
 
     # ==========================================
-    # 4. 执行量化
+    # 5. 执行量化
     # ==========================================
-    print("初始化 Runner...")
-    # backend='hccl' 用于 NPU 分布式环境，单卡也可使用
     runner = DPLayerWiseRunner(adapter=adapter, backend='hccl')
-    
-    print("添加量化处理器...")
-    # 注意顺序：IterSmooth -> Quarot -> IterSmooth -> AutoRound
     runner.add_processor(iter_smooth_1)
     runner.add_processor(quarot_config)
     runner.add_processor(iter_smooth_2)
     runner.add_processor(autoround_config)
     
-    print("开始运行量化流程...")
-    # device_indices=[0] 指定使用第 0 号卡
     runner.run(calib_data=calib_data, device_indices=[0])
     
-    print("量化完成！")
-    
-    # ==========================================
-    # 5. 保存模型 (可选)
-    # ==========================================
-    # runner.run() 可能会自动保存，或者你可以手动保存 adapter.model
-    # adapter.model.save_pretrained(save_path)
-    # adapter.tokenizer.save_pretrained(save_path)
+    # adapter.save_model(save_path) # Uncomment to save
+    print("Quantization Finished!")
 
 if __name__ == "__main__":
     main()

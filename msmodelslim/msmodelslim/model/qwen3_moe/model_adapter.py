@@ -7,7 +7,7 @@ from torch import nn
 from msmodelslim.core.base.protocol import ProcessRequest
 from msmodelslim.core.const import DeviceType
 from msmodelslim.core.graph import AdapterConfig, MappingConfig
-from msmodelslim.quant.processor.quarot import QuaRotInterface
+from msmodelslim.quant.processor.quarot import QuaRotInterface, QuaRotOnlineInterface
 from msmodelslim.utils.logging import logger_setter
 from ..common.layer_wise_forward import generated_decoder_layer_visit_func, transformers_generated_forward_func
 from ..common.transformers import TransformersModel
@@ -23,6 +23,7 @@ class Qwen3MoeModelAdapter(TransformersModel,
                            IterSmoothInterface,
                            FlexSmoothQuantInterface,
                            QuaRotInterface,
+                           QuaRotOnlineInterface,
                            ):
     def get_model_type(self) -> str:
         return self.model_type
@@ -99,6 +100,45 @@ class Qwen3MoeModelAdapter(TransformersModel,
     def get_rotate_map(self, block_size):
         pre_run, rot_pairs, _, _ = qwen3_moe_get_rotate_map(self.config, block_size)
         return [pre_run], [pair for pair in rot_pairs.values()]
+
+    def get_head_dim(self) -> int:
+        return self.config.hidden_size // self.config.num_attention_heads
+
+    def get_num_attention_heads(self) -> int:
+        return self.config.num_attention_heads
+
+    def get_layer_wise_ov_pair(self, decoder_module: nn.Module) -> Dict[nn.Module, nn.Module]:
+        ov_pairs = {}
+        if hasattr(decoder_module, 'self_attn'):
+            self_attn = decoder_module.self_attn
+            if hasattr(self_attn, 'o_proj') and hasattr(self_attn, 'v_proj'):
+                ov_pairs[self_attn.o_proj] = self_attn.v_proj
+        return ov_pairs
+
+    def get_layer_wise_up_down_pair(self, decoder_module: nn.Module) -> Dict[nn.Module, nn.Module]:
+        up_down_pairs = {}
+        if hasattr(decoder_module, 'mlp'):
+            mlp = decoder_module.mlp
+            
+            # Handle MOE Experts
+            if hasattr(mlp, 'experts'):
+                experts = mlp.experts
+                # experts is usually a ModuleList
+                if isinstance(experts, nn.ModuleList):
+                    for expert in experts:
+                        if hasattr(expert, 'up_proj') and hasattr(expert, 'down_proj'):
+                            up_down_pairs[expert.up_proj] = expert.down_proj
+            
+            # Handle Shared Expert
+            if hasattr(mlp, 'shared_expert'):
+                shared = mlp.shared_expert
+                if hasattr(shared, 'up_proj') and hasattr(shared, 'down_proj'):
+                    up_down_pairs[shared.up_proj] = shared.down_proj
+                elif hasattr(shared, 'gate_up_proj') and hasattr(shared, 'down_proj'):
+                    # Some implementations might fuse gate_up
+                    pass 
+
+        return up_down_pairs
 
 
 def qwen3_moe_get_ln_fuse_map(config):

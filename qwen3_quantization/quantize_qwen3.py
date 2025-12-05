@@ -32,8 +32,9 @@ def main():
 
     print(f"正在加载模型适配器，路径: {model_path}")
     # 初始化 Adapter
-    # model_type="qwen3" 确保加载正确的配置
-    adapter = Qwen3ModelAdapter(model_type="qwen3", model_path=model_path)
+    # 使用 Qwen3MoeModelAdapter
+    from msmodelslim.model.qwen3_moe.model_adapter import Qwen3MoeModelAdapter
+    adapter = Qwen3MoeModelAdapter(model_path=model_path)
 
     # ==========================================
     # 2. 量化配置 (W4A4)
@@ -58,22 +59,37 @@ def main():
     linear_qconfig = LinearQConfig(weight=weight_config, act=act_config)
 
     # ==========================================
-    # 3. 算法配置 (Quarot + AutoRound)
+    # 3. 算法配置 (LAOS Pipeline: IterSmooth -> Quarot -> IterSmooth -> AutoRound)
     # ==========================================
     
-    # 配置 Quarot (旋转)
-    # online=True: 开启在线旋转 (对 W4A4 必须)
-    # max_tp_size=1: 单卡推理设为 1。如果是多卡 TP，请设为相应的 TP 数 (如 2, 4, 8)
+    # 3.1 Iterative Smooth (第一阶段)
+    from msmodelslim.quant.processor.anti_outlier import IterSmoothProcessorConfig
+    iter_smooth_1 = IterSmoothProcessorConfig(
+        alpha=0.9,
+        scale_min=1e-5,
+        symmetric=False,
+        enable_subgraph_type=["ov", "up-down"]
+    )
+
+    # 3.2 Quarot 旋转 (处理异常值)
     quarot_config = QuaRotProcessorConfig(
         online=True,
-        block_size=-1,
-        max_tp_size=1 
+        block_size=32,
+        max_tp_size=4,
+        down_proj_online_layers=[1,3,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26]
+    )
+
+    # 3.3 Iterative Smooth (第二阶段)
+    iter_smooth_2 = IterSmoothProcessorConfig(
+        alpha=0.9,
+        scale_min=1e-5,
+        symmetric=False,
+        enable_subgraph_type=["norm-linear"]
     )
     
-    # 配置 AutoRound (自适应舍入)
-    # iters: 迭代次数，推荐 200
+    # 3.4 AutoRound 量化 (优化权重)
     autoround_config = AutoroundProcessorConfig(
-        iters=200,
+        iters=400,
         enable_minmax_tuning=True,
         enable_round_tuning=True,
         strategies=[
@@ -92,8 +108,10 @@ def main():
     runner = DPLayerWiseRunner(adapter=adapter, backend='hccl')
     
     print("添加量化处理器...")
-    # 注意顺序：先 Quarot 旋转，再 AutoRound 量化
+    # 注意顺序：IterSmooth -> Quarot -> IterSmooth -> AutoRound
+    runner.add_processor(iter_smooth_1)
     runner.add_processor(quarot_config)
+    runner.add_processor(iter_smooth_2)
     runner.add_processor(autoround_config)
     
     print("开始运行量化流程...")

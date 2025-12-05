@@ -10,9 +10,9 @@ msmodelslim_path = os.path.abspath(os.path.join(current_dir, "../msmodelslim"))
 if msmodelslim_path not in sys.path:
     sys.path.insert(0, msmodelslim_path)
 
-from msmodelslim.core import QDType, QScope
+from msmodelslim.core.QAL import QDType, QScope
 from msmodelslim.core.runner.dp_layer_wise_runner import DPLayerWiseRunner
-from msmodelslim.model.qwen3.model_adapter import Qwen3ModelAdapter
+
 from msmodelslim.quant.processor.quant.autoround import AutoroundProcessorConfig, QuantStrategyConfig
 from msmodelslim.quant.processor.quarot import QuaRotProcessorConfig
 from msmodelslim.quant.quantizer.base import QConfig

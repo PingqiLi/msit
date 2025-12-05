@@ -118,10 +118,10 @@ def main():
         enable_subgraph_type=["ov", "up-down"]
     )
 
-    # 3.2 Quarot (Online)
+    # 3.2 Quarot (Online -> Offline)
     quarot_config = QuaRotProcessorConfig(
-        online=True, block_size=32, max_tp_size=4,
-        down_proj_online_layers=[1,3,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26]
+        online=False, block_size=-1, max_tp_size=4,
+        down_proj_online_layers=[]
     )
 
     # 3.3 Iterative Smooth (2)

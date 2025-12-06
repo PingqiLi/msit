@@ -1,61 +1,75 @@
 # -*- coding: utf-8 -*-
-import sys
 import os
+import sys
+import argparse
 import torch
-
-current_dir = os.path.dirname(os.path.abspath(__file__))
-msmodelslim_path = os.path.abspath(os.path.join(current_dir, "../../"))
-if msmodelslim_path not in sys.path:
-    sys.path.insert(0, msmodelslim_path)
 
 from msmodelslim.core.QAL import QDType, QScope
 from msmodelslim.core.runner.dp_layer_wise_runner import DPLayerWiseRunner
-
+from msmodelslim.quant.processor import QuaRotProcessorConfig
 from msmodelslim.quant.processor.quant.autoround import AutoroundProcessorConfig, QuantStrategyConfig
-from msmodelslim.quant.processor.quarot import QuaRotProcessorConfig
 from msmodelslim.quant.quantizer.base import QConfig
 from msmodelslim.quant.quantizer.linear import LinearQConfig
 
-def main():
-    # ==========================================
-    # 1. 基础配置
-    # ==========================================
-    # 模型路径
-    model_path = "/workspace/weights/Qwen3-30B"
-    # 输出路径
-    save_path = "/workspace/weights/Qwen3-30B-W4A4-OfflineQuaRot"
-    
-    # 校准数据路径
-    calib_path = os.path.join(msmodelslim_path, "lab_calib/mix_calib.jsonl")
+def parse_args():
+    parser = argparse.ArgumentParser(description="Qwen3 Quantization Script")
+    parser.add_argument('--model_path', type=str, default="/workspace/weights/Qwen3-30B",
+                        help="Path to the float model")
+    parser.add_argument('--save_path', type=str, default="/workspace/weights/Qwen3-30B-W4A4-OfflineQuaRot",
+                        help="Path to save the quantized model")
+    parser.add_argument('--calib_file', type=str, default=None,
+                        help="Path to the calibration dataset file (jsonl)")
+    return parser.parse_args()
+
+def get_calib_dataset(calib_path):
     if not os.path.exists(calib_path):
         print(f"Warning: Calibration file not found at {calib_path}, using dummy data.")
-        calib_data = ["Hello world"] * 10
-    else:
-        # 简单读取jsonl文件的一列作为校准数据，这里假设是 list of strings format
-        # 如果是复杂jsonl，需根据实际Key修改读取逻辑
+        return ["Hello world"] * 10
+
+    calib_data = []
+    try:
         import json
-        calib_data = []
         with open(calib_path, 'r') as f:
             for line in f:
                 try:
                     item = json.loads(line)
-                    # 尝试常见的key
                     text = item.get('text') or item.get('content') or item.get('input')
                     if text:
                         calib_data.append(text)
                 except:
                     pass
-        # 限制校准数据量
-        calib_data = calib_data[:128]
+        return calib_data[:128]
+    except Exception as e:
+        print(f"Error loading calibration data: {e}, using dummy data.")
+        return ["Hello world"] * 10
+
+if __name__ == "__main__":
+    args = parse_args()
+
+    model_path = args.model_path
+    save_path = args.save_path
+
+    # Auto-detect calibration file path if not provided
+    if args.calib_file:
+        calib_path = args.calib_file
+    else:
+        # Try to locate mix_calib.jsonl relative to this script
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        # Structure: msit/msmodelslim/qwen3_quantization/quarot_offline/script.py
+        # Target: msit/msmodelslim/lab_calib/mix_calib.jsonl
+        calib_path = os.path.abspath(os.path.join(current_dir, "../../lab_calib/mix_calib.jsonl"))
+
+    print(f"Using calibration file: {calib_path}")
+    calib_data = get_calib_dataset(calib_path)
 
     print(f"正在加载模型适配器，路径: {model_path}")
     from msmodelslim.model.qwen3_moe.model_adapter import Qwen3MoeModelAdapter
     adapter = Qwen3MoeModelAdapter(model_type="Qwen3-30B", model_path=model_path)
 
     # ==========================================
-    # 2. 量化配置定义
+    # 2. 量化配置定义 (Quantization Config Definitions)
     # ==========================================
-    
+
     # W4A4 Config (Default for Experts)
     w4a4_config = LinearQConfig(
         weight=QConfig(dtype=QDType.INT4, scope=QScope.PER_GROUP, symmetric=True, method='minmax', ext={'group_size': 128}),
@@ -154,6 +168,3 @@ def main():
     runner.run(calib_data=calib_data, device_indices=[0])
     
     print("Quantization Finished!")
-
-if __name__ == "__main__":
-    main()

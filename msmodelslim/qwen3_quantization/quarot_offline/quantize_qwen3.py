@@ -114,19 +114,11 @@ if __name__ == "__main__":
         enable_subgraph_type=["norm-linear"]
     )
     
-    # 3.4 AutoRound
-    autoround_config = AutoroundProcessorConfig(
-        type="autoround_quant",
-        iters=2,
-        enable_minmax_tuning=True,
-        enable_round_tuning=True,
-        strategies=[]
-    )
-    
-    strategies = autoround_config.strategies
+    # 3.4 AutoRound Strategies
+    autoround_strategies = []
     
     # 1. 默认策略: Experts 使用 W4A4 (除了最后两层)
-    strategies.append(QuantStrategyConfig(
+    autoround_strategies.append(QuantStrategyConfig(
         qconfig=w4a4_config, 
         include=["*"] 
     ))
@@ -136,7 +128,7 @@ if __name__ == "__main__":
     # They are wrapped in Qwen2StdAttention module named 'self_attn' in HF transformers.
     # The linear layer name will be model.layers.X.self_attn.q_proj
     # So we need to match anything containing "self_attn".
-    strategies.append(QuantStrategyConfig(
+    autoround_strategies.append(QuantStrategyConfig(
         qconfig=w8a8_config, 
         include=["*self_attn*"] 
     ))
@@ -146,7 +138,7 @@ if __name__ == "__main__":
     # In Qwen2MoE, it might be mlp.gate. 
     # To be safe, use *mlp.gate* or *gate_proj* if that's the name.
     # Assuming 'gate' per user logs.
-    strategies.append(QuantStrategyConfig(
+    autoround_strategies.append(QuantStrategyConfig(
         qconfig=float_config, 
         include=["*mlp.gate*"]
     ))

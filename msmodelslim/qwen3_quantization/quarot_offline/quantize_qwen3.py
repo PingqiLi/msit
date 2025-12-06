@@ -24,7 +24,7 @@ def parse_args():
 def get_calib_dataset(calib_path):
     if not os.path.exists(calib_path):
         print(f"Warning: Calibration file not found at {calib_path}, using dummy data.")
-        return ["Hello world"] * 10
+        return ["Hello world"] * 128
 
     calib_data = []
     try:
@@ -38,10 +38,14 @@ def get_calib_dataset(calib_path):
                         calib_data.append(text)
                 except:
                     pass
-        return calib_data[:128]
     except Exception as e:
         print(f"Error loading calibration data: {e}, using dummy data.")
-        return ["Hello world"] * 10
+
+    if not calib_data:
+        print("Warning: Calibration data is empty, using dummy data.")
+        return ["Hello world"] * 128
+        
+    return calib_data[:128]
 
 if __name__ == "__main__":
     args = parse_args()
@@ -76,44 +80,87 @@ if __name__ == "__main__":
         act=QConfig(dtype=QDType.INT4, scope=QScope.PER_TOKEN, symmetric=True, method='minmax')
     )
     
-    # W8A8 Config (For Attention and Last Experts)
+    # W8A8 Config (For Attention & specified experts)
     w8a8_config = LinearQConfig(
         weight=QConfig(dtype=QDType.INT8, scope=QScope.PER_CHANNEL, symmetric=True, method='minmax'),
         act=QConfig(dtype=QDType.INT8, scope=QScope.PER_TOKEN, symmetric=True, method='minmax')
     )
     
-    # Float Config (For MoE Gate) - Use Float/BF16
+    # Float Config (For MoE Gates)
     float_config = LinearQConfig(
         weight=QConfig(dtype=QDType.FLOAT, scope=QScope.PER_TENSOR, symmetric=True, method='minmax'),
         act=QConfig(dtype=QDType.FLOAT, scope=QScope.PER_TENSOR, symmetric=True, method='minmax')
     )
 
     # ==========================================
-    # 3. 策略配置 (Layers Strategy)
+    # 3. 各种 Processor 配置
     # ==========================================
-    strategies = []
+    
+    # 3.1 IterSmooth (Pre)
+    from msmodelslim.quant.processor.anti_outlier import IterSmoothProcessorConfig
+    iter_smooth_1 = IterSmoothProcessorConfig(
+        alpha=0.9, scale_min=1e-5, symmetric=False,
+        enable_subgraph_type=["ov", "up-down"]
+    )
+
+    # 3.2 QuaRot
+    quarot_config = QuaRotProcessorConfig(
+        online=False, 
+        rotate_mode='hadamard', 
+        layer_norm_mode='hadamard',
+        param_extraction_mode='reorder'
+    )
+
+    # 3.3 IterSmooth (Post)
+    iter_smooth_2 = IterSmoothProcessorConfig(
+        alpha=0.9, scale_min=1e-5, symmetric=False,
+        enable_subgraph_type=["norm-linear"]
+    )
+    
+    # 3.4 AutoRound
+    autoround_config = AutoroundProcessorConfig(
+        type="autoround_quant",
+        iters=2,
+        enable_minmax_tuning=True,
+        enable_round_tuning=True,
+        strategies=[]
+    )
+    
+    strategies = autoround_config.strategies
     
     # 1. 默认策略: Experts 使用 W4A4 (除了最后两层)
-    strategies.append(QuantStrategyConfig(qconfig=w4a4_config, include=["*"]))
-
+    strategies.append(QuantStrategyConfig(
+        qconfig=w4a4_config, 
+        include=["*"] 
+    ))
+    
     # 2. Attention层: W8A8
+    # Qwen3 Attention Linear layers are typically: q_proj, k_proj, v_proj, o_proj
+    # They are wrapped in Qwen2StdAttention module named 'self_attn' in HF transformers.
+    # The linear layer name will be model.layers.X.self_attn.q_proj
+    # So we need to match anything containing "self_attn".
     strategies.append(QuantStrategyConfig(
         qconfig=w8a8_config, 
-        include=["*.self_attn"] # 匹配所有 self_attn 模块
+        include=["*self_attn*"] 
     ))
     
     # 3. MoE Gate: Float (BF16)
+    # The gate layer is typically model.layers.X.mlp.gate_proj (or gate)
+    # In Qwen2MoE, it might be mlp.gate. 
+    # To be safe, use *mlp.gate* or *gate_proj* if that's the name.
+    # Assuming 'gate' per user logs.
     strategies.append(QuantStrategyConfig(
         qconfig=float_config, 
-        include=["*.mlp.gate"]
+        include=["*mlp.gate*"]
     ))
     
     # 4. 最后两层 Experts (Layer 46, 47): W8A8
+    # 假设总层数48, index 0-47. 
     strategies.append(QuantStrategyConfig(
         qconfig=w8a8_config,
         include=[
-            "*layers.46.mlp.experts", 
-            "*layers.47.mlp.experts"
+            "*layers.46.mlp.experts*", 
+            "*layers.47.mlp.experts*"
         ]
     ))
 

@@ -583,7 +583,12 @@ class AutoroundQuantProcessor(AutoSessionProcessor):
         self.device = next(request.module.parameters()).device.type
 
         self._run_forward_if_need(request)
-        self.float_output = [output[0] for output in request.outputs]
+        self.float_output = []
+        for output in request.outputs:
+            if isinstance(output, torch.Tensor):
+                self.float_output.append(output)
+            else:
+                self.float_output.append(output[0])
         get_logger().debug(f"Captured {len(self.float_output)} float outputs")
 
         with torch.device(device=self.device):
@@ -630,8 +635,20 @@ class AutoroundQuantProcessor(AutoSessionProcessor):
         if self.enable_quanted_input:
             get_logger().debug("Running forward pass with quantized input...")
             self._run_forward_if_need(request)
-            self.quantized_output = [output[0] for output in request.outputs]
-            request.outputs = [(output_f,) + data[1:] for output_f, data in zip(self.float_output, request.outputs)]
+            self.quantized_output = []
+            for output in request.outputs:
+                if isinstance(output, torch.Tensor):
+                    self.quantized_output.append(output)
+                else:
+                    self.quantized_output.append(output[0])
+            
+            new_outputs = []
+            for output_f, data in zip(self.float_output, request.outputs):
+                if isinstance(data, torch.Tensor):
+                    new_outputs.append(output_f)
+                else:
+                    new_outputs.append((output_f,) + data[1:])
+            request.outputs = new_outputs
             get_logger().debug(f"Generated {len(self.quantized_output)} quantized outputs")
 
         # 应用最佳参数

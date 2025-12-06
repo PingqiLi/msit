@@ -101,4 +101,4 @@ spec:
       part_file_size: 4
 
   # 校准数据集路径 (请确保该文件存在)
-  dataset: "calib_data.json"
+  dataset: "mix_calib.jsonl"

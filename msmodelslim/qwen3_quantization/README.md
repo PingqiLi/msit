@@ -15,6 +15,16 @@
 确保您已安装 Ascend CANN 软件栈，并且 NPU 环境可用。
 本工具依赖同级目录下的 `msmodelslim` 源码。
 
+**重要：因为您可能需要修改 `msmodelslim` 源码，建议按以下步骤安装：**
+
+```bash
+cd ../msmodelslim
+bash install.sh
+cd ../qwen3_quantization
+```
+
+*注意：`install.sh` 会从 CANN 路径复制依赖的 `.so` 文件并重新安装 `msmodelslim`。如果您之后修改了源码（例如修复 Bug），请再次运行 `bash install.sh` 或 `pip install .` 以更新系统环境中的包。*
+
 ### 方法一：使用 Python 脚本 (推荐)
 
 直接运行 Python 脚本，适合需要自定义逻辑或调试的场景。
@@ -35,14 +45,11 @@ python quantize_qwen3.py
 2.  运行以下命令：
 
 ```bash
-# 设置 PYTHONPATH 包含 msmodelslim
-export PYTHONPATH=$PYTHONPATH:../msmodelslim
-
 # 运行 CLI
-python -m msmodelslim.cli quant \
+msmodelslim quant\
     --model_type qwen3 \
-    --model_path /path/to/Qwen3-A3B-30B \
-    --save_path ./output \
+    --model_path /workspace/weights/Qwen3-30B \
+    --save_path /workspace/weights/Qwen3-30B-W4A4-OfflineQuaRot-test \
     --config_path qwen3_w4a4_config.yaml \
     --device npu:0 \
     --trust_remote_code True

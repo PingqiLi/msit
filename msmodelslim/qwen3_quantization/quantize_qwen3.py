@@ -132,7 +132,7 @@ def main():
     
     # 3.4 AutoRound
     autoround_config = AutoroundProcessorConfig(
-        iters=400,
+        iters=2,
         enable_minmax_tuning=True,
         enable_round_tuning=True,
         strategies=strategies # 使用自定义策略

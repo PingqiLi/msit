@@ -72,24 +72,22 @@ spec:
               dtype: float
               scope: per_tensor
               symmetric: true
-              method: "minmax"
-          include: ["mlp.gate"]
+        # 1. Attention层: W8A8
+        - qconfig: *w8a8_config
+          include:
+            - "*.self_attn" # 匹配所有 self_attn 模块
 
-        # 3. Last 2 Layers Experts W8A8
-        - qconfig:
-            weight:
-              dtype: int8
-              scope: per_channel
-              symmetric: true
-              method: "minmax"
-            act: 
-              dtype: int8
-              scope: per_token
-              symmetric: true
-              method: "minmax"
-          include: 
-            - "model.layers.46.mlp.experts"
-            - "model.layers.47.mlp.experts"
+        # 2. MoE Gate: Float (BF16)
+        - qconfig: *float_config
+          include:
+            - "*.mlp.gate"
+
+        # 3. 最后两层 Experts (Layer 46, 47): W8A8
+        # 假设总层数48, index 0-47.
+        - qconfig: *w8a8_config
+          include:
+            - "*layers.46.mlp.experts"
+            - "*layers.47.mlp.experts"
 
         # 4. Default W4A4 (All other layers)
         - qconfig: *default_w4a4_dynamic

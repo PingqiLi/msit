@@ -3,10 +3,8 @@ import sys
 import os
 import torch
 
-# 确保 msmodelslim 在 PYTHONPATH 中
-# 如果脚本在 msit/qwen3_quantization 下，我们需要将 msit/msmodelslim 加入路径
 current_dir = os.path.dirname(os.path.abspath(__file__))
-msmodelslim_path = os.path.abspath(os.path.join(current_dir, "../msmodelslim"))
+msmodelslim_path = os.path.abspath(os.path.join(current_dir, "../../"))
 if msmodelslim_path not in sys.path:
     sys.path.insert(0, msmodelslim_path)
 
@@ -25,7 +23,7 @@ def main():
     # 模型路径
     model_path = "/workspace/weights/Qwen3-30B"
     # 输出路径
-    save_path = "/workspace/weights/Qwen3-30B-W4A4-OfflineQuaRot-test"
+    save_path = "/workspace/weights/Qwen3-30B-W4A4-OfflineQuaRot"
     
     # 校准数据路径
     calib_path = os.path.join(msmodelslim_path, "lab_calib/mix_calib.jsonl")
@@ -82,33 +80,31 @@ def main():
     strategies = []
     
     # 1. 默认策略: Experts 使用 W4A4 (除了最后两层)
-    # 这里的 include 范围可以根据实际情况调整，默认全应用W4A4然后用后续策略覆盖
     strategies.append(QuantStrategyConfig(qconfig=w4a4_config, include=["*"]))
 
     # 2. Attention层: W8A8
     strategies.append(QuantStrategyConfig(
         qconfig=w8a8_config, 
-        include=["self_attn"] # 匹配所有 self_attn 模块
+        include=["*.self_attn"] # 匹配所有 self_attn 模块
     ))
     
     # 3. MoE Gate: Float (BF16)
     strategies.append(QuantStrategyConfig(
         qconfig=float_config, 
-        include=["mlp.gate"]
+        include=["*.mlp.gate"]
     ))
     
     # 4. 最后两层 Experts (Layer 46, 47): W8A8
-    # 假设总层数48, index 0-47. 
     strategies.append(QuantStrategyConfig(
         qconfig=w8a8_config,
         include=[
-            "model.layers.46.mlp.experts", 
-            "model.layers.47.mlp.experts"
+            "*layers.46.mlp.experts", 
+            "*layers.47.mlp.experts"
         ]
     ))
 
     # ==========================================
-    # 4. 算法流程配置 (LAOS)
+    # 4. 算法流程配置
     # ==========================================
     
     # 3.1 Iterative Smooth (1)

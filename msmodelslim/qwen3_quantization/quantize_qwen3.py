@@ -25,7 +25,7 @@ def main():
     # 模型路径
     model_path = "/workspace/weights/Qwen3-30B"
     # 输出路径
-    save_path = "./qwen3_w4a4_output"
+    save_path = "/workspace/weights/Qwen3-30B-W4A4-OfflineQuaRot-test"
     
     # 校准数据路径
     calib_path = os.path.join(msmodelslim_path, "lab_calib/mix_calib.jsonl")
@@ -146,10 +146,17 @@ def main():
     runner.add_processor(quarot_config)
     runner.add_processor(iter_smooth_2)
     runner.add_processor(autoround_config)
+
+    # 添加 Saver Processor
+    from msmodelslim.app.quant_service.modelslim_v1.save.ascendv1 import AscendV1Config
+    save_config = AscendV1Config(
+        save_directory=save_path,
+        part_file_size=4
+    )
+    runner.add_processor(save_config)
     
     runner.run(calib_data=calib_data, device_indices=[0])
     
-    # adapter.save_model(save_path) # Uncomment to save
     print("Quantization Finished!")
 
 if __name__ == "__main__":

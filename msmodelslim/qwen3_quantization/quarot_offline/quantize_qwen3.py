@@ -124,28 +124,19 @@ if __name__ == "__main__":
     ))
     
     # 2. Attention层: W8A8
-    # Qwen3 Attention Linear layers are typically: q_proj, k_proj, v_proj, o_proj
-    # They are wrapped in Qwen2StdAttention module named 'self_attn' in HF transformers.
-    # The linear layer name will be model.layers.X.self_attn.q_proj
-    # So we need to match anything containing "self_attn".
     autoround_strategies.append(QuantStrategyConfig(
         qconfig=w8a8_config, 
         include=["*self_attn*"] 
     ))
     
     # 3. MoE Gate: Float (BF16)
-    # The gate layer is typically model.layers.X.mlp.gate_proj (or gate)
-    # In Qwen2MoE, it might be mlp.gate. 
-    # To be safe, use *mlp.gate* or *gate_proj* if that's the name.
-    # Assuming 'gate' per user logs.
     autoround_strategies.append(QuantStrategyConfig(
         qconfig=float_config, 
         include=["*mlp.gate*"]
     ))
     
     # 4. 最后两层 Experts (Layer 46, 47): W8A8
-    # 假设总层数48, index 0-47. 
-    strategies.append(QuantStrategyConfig(
+    autoround_strategies.append(QuantStrategyConfig(
         qconfig=w8a8_config,
         include=[
             "*layers.46.mlp.experts*", 
@@ -153,39 +144,17 @@ if __name__ == "__main__":
         ]
     ))
 
-    # ==========================================
-    # 4. 算法流程配置
-    # ==========================================
-    
-    # 3.1 Iterative Smooth (1)
-    from msmodelslim.quant.processor.anti_outlier import IterSmoothProcessorConfig
-    iter_smooth_1 = IterSmoothProcessorConfig(
-        alpha=0.9, scale_min=1e-5, symmetric=False,
-        enable_subgraph_type=["ov", "up-down"]
-    )
-
-    # 3.2 Quarot (Online -> Offline)
-    quarot_config = QuaRotProcessorConfig(
-        online=False, block_size=-1, max_tp_size=4,
-        down_proj_online_layers=[]
-    )
-
-    # 3.3 Iterative Smooth (2)
-    iter_smooth_2 = IterSmoothProcessorConfig(
-        alpha=0.9, scale_min=1e-5, symmetric=False,
-        enable_subgraph_type=["norm-linear"]
-    )
-    
-    # 3.4 AutoRound
+    # 3.5 AutoRound Config
     autoround_config = AutoroundProcessorConfig(
-        iters=2,
+        type="autoround_quant",
+        iters=400,
         enable_minmax_tuning=True,
         enable_round_tuning=True,
-        strategies=strategies # 使用自定义策略
+        strategies=autoround_strategies
     )
 
     # ==========================================
-    # 5. 执行量化
+    # 4. 执行量化
     # ==========================================
     runner = DPLayerWiseRunner(adapter=adapter, backend='hccl')
     runner.add_processor(iter_smooth_1)

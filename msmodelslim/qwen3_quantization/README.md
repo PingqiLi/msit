@@ -47,36 +47,10 @@ python quantize_qwen3.py
 ```bash
 # 运行 CLI
 msmodelslim quant\
-    --model_type qwen3 \
+    --model_type Qwen3-30B \
     --model_path /workspace/weights/Qwen3-30B \
     --save_path /workspace/weights/Qwen3-30B-W4A4-OfflineQuaRot-test \
     --config_path qwen3_w4a4_config.yaml \
     --device npu:0 \
     --trust_remote_code True
 ```
-
-## 如何推送到 GitHub
-
-如果您想将此本地仓库推送到您的 GitHub 账户，请按照以下步骤操作：
-
-1.  **在 GitHub 上创建新仓库**：
-    *   登录 GitHub，点击右上角的 "+" -> "New repository"。
-    *   输入仓库名称 (例如 `msit-qwen3`)，点击 "Create repository"。
-
-2.  **添加远程仓库地址**：
-    在终端中，进入 `msit` 根目录，执行以下命令 (将 URL 替换为您刚才创建的仓库地址)：
-
-    ```bash
-    # 移除旧的 remote (如果有)
-    git remote remove origin
-    
-    # 添加新的 remote
-    git remote add origin https://github.com/您的用户名/msit-qwen3.git
-    ```
-
-3.  **推送到 GitHub**：
-
-    ```bash
-    # 推送 qwen3 分支
-    git push -u origin qwen3
-    ```

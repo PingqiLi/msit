@@ -105,10 +105,7 @@ if __name__ == "__main__":
 
     # 3.2 QuaRot
     quarot_config = QuaRotProcessorConfig(
-        online=False, 
-        rotate_mode='hadamard', 
-        layer_norm_mode='hadamard',
-        param_extraction_mode='reorder'
+        online=False
     )
 
     # 3.3 IterSmooth (Post)

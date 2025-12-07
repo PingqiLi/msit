@@ -4,6 +4,11 @@ import sys
 import argparse
 import torch
 
+# Add sys.path for direct source usage
+current_directory = os.path.dirname(os.path.abspath(__file__))
+parent_directory = os.path.abspath(os.path.join(current_directory, '..', ".."))
+sys.path.append(parent_directory)
+
 from msmodelslim.core.QAL import QDType, QScope
 from msmodelslim.core.runner.dp_layer_wise_runner import DPLayerWiseRunner
 # QuaRotProcessorConfig is available in top level

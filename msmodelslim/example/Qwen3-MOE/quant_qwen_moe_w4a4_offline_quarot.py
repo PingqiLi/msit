@@ -15,6 +15,7 @@ from msmodelslim.quant.processor import QuaRotProcessorConfig
 from msmodelslim.quant.processor.quant.autoround import AutoroundProcessorConfig, QuantStrategyConfig
 from msmodelslim.quant.quantizer.base import QConfig
 from msmodelslim.quant.quantizer.linear import LinearQConfig
+from msmodelslim.utils.logging import set_logger_level
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Qwen3 Quantization Script")
@@ -53,6 +54,7 @@ def get_calib_dataset(calib_path):
     return calib_data[:128]
 
 if __name__ == "__main__":
+    set_logger_level("info")
     args = parse_args()
 
     model_path = args.model_path

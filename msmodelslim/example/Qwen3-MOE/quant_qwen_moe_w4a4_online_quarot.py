@@ -127,31 +127,32 @@ if __name__ == "__main__":
     # 3.4 AutoRound Strategies
     autoround_strategies = []
     
-    # 1. 默认策略: Experts 使用 W4A4 (除了最后两层)
-    autoround_strategies.append(QuantStrategyConfig(
-        qconfig=w4a4_config, 
-        include=["*"] 
-    ))
-    
-    # 2. Attention层: W8A8
+    # 1. Attention层: W8A8
     autoround_strategies.append(QuantStrategyConfig(
         qconfig=w8a8_config, 
         include=["*self_attn*"] 
     ))
     
-    # 3. MoE Gate: Float (BF16)
+    # 2. MoE Gate: Float (BF16)
     autoround_strategies.append(QuantStrategyConfig(
         qconfig=float_config, 
         include=["*mlp.gate*"]
     ))
     
-    # 4. 最后两层 Experts (Layer 46, 47): W8A8
+    # 3. 最后两层 Experts (Layer 46, 47): W8A8
     autoround_strategies.append(QuantStrategyConfig(
         qconfig=w8a8_config,
         include=[
             "*layers.46.mlp.experts*", 
             "*layers.47.mlp.experts*"
         ]
+    ))
+
+    # 4. 默认策略: Experts 使用 W4A4 (除了最后两层)
+    # Put this LAST as a fallback.
+    autoround_strategies.append(QuantStrategyConfig(
+        qconfig=w4a4_config, 
+        include=["*"] 
     ))
 
     # 3.5 AutoRound Config

@@ -89,6 +89,37 @@ class Qwen3MoeModelAdapter(TransformersModel,
                     }
                 ),
             ])
+
+            # Norm-Linear mapping for MoE: Post-Attn LN -> Experts (Gate/Up) + Router (Gate)
+            moe_targets = [f"model.layers.{layer_idx}.mlp.gate"]
+            for expert_idx in range(self.config.num_experts):
+                moe_targets.append(f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.gate_proj")
+                moe_targets.append(f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.up_proj")
+
+            norm_linear_moe_config = MappingConfig(
+                source=f"model.layers.{layer_idx}.post_attention_layernorm",
+                targets=moe_targets
+            )
+
+            adapter_config.append(
+                AdapterConfig(
+                    subgraph_type="norm-linear",
+                    mapping=norm_linear_moe_config
+                )
+            )
+
+            # Up-Down mapping for MoE: Experts Up -> Experts Down
+            for expert_idx in range(self.config.num_experts):
+                up_down_mapping_config = MappingConfig(
+                    source=f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.up_proj",
+                    targets=[f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.down_proj"]
+                )
+                adapter_config.append(
+                    AdapterConfig(
+                        subgraph_type="up-down",
+                        mapping=up_down_mapping_config
+                    )
+                )
         return adapter_config
 
     def get_ln_fuse_map(self):

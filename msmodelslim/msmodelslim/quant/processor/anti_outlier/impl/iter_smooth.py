@@ -116,6 +116,7 @@ def iter_smooth_impl_norm_linear(subgraph: Subgraph, config: IterSmoothConfig, c
         stat = fc_weight.abs().max(dim=0, keepdim=True)[0]
         w_scale.append(stat)
     w_scale = torch.cat(w_scale, dim=0)
+    get_logger().info(f"DEBUG: a_scale max: {a_scale.max()}, w_scale max: {w_scale.max()}")
     scales = calculator.compute_smooth_scale(a_scale, w_scale)
     shifts = {}
     if config.shift:

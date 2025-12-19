@@ -12,7 +12,7 @@ from msmodelslim.utils.logging import logger_setter
 from ..common.layer_wise_forward import generated_decoder_layer_visit_func, transformers_generated_forward_func
 from ..common.transformers import TransformersModel
 from ..interface_hub import ModelInfoInterface, ModelSlimPipelineInterfaceV0, ModelSlimPipelineInterfaceV1, \
-    IterSmoothInterface, FlexSmoothQuantInterface
+    IterSmoothInterface, FlexSmoothQuantInterface, AnalyzePipelineInterface
 
 
 @logger_setter()
@@ -20,6 +20,7 @@ class Qwen3MoeModelAdapter(TransformersModel,
                            ModelInfoInterface,
                            ModelSlimPipelineInterfaceV0,
                            ModelSlimPipelineInterfaceV1,
+                           AnalyzePipelineInterface,
                            IterSmoothInterface,
                            FlexSmoothQuantInterface,
                            QuaRotInterface,

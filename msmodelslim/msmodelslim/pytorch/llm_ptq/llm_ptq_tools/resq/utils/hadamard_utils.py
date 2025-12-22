@@ -1,1 +1,493 @@
+# Copyright Huawei Technologies Co., Ltd. 2025-2025. All rights reserved.
+# Adapted from ResQ (https://github.com/facebookresearch/resq)
+# Based on QuaRot (https://github.com/spcl/QuaRot)
+"""
+Hadamard transform utilities for CPU/NPU.
 
+This module provides pure PyTorch implementations of Hadamard transforms
+that work on CPU and NPU without requiring GPU-specific libraries.
+"""
+
+import math
+from typing import Optional, Tuple
+
+import torch
+import torch.nn as nn
+
+
+def is_pow2(n: int) -> bool:
+    """Check if n is a power of 2."""
+    return (n & (n - 1) == 0) and (n > 0)
+
+
+class HadamardTransform(torch.autograd.Function):
+    """
+    Fast Hadamard transform using the butterfly algorithm.
+
+    This is a pure PyTorch implementation that works on CPU/NPU
+    without requiring fast_hadamard_transform library.
+    """
+
+    @staticmethod
+    def forward(ctx, u: torch.Tensor) -> torch.Tensor:
+        """
+        Apply unnormalized Hadamard transform.
+
+        Args:
+            u: Input tensor with last dimension being a power of 2
+
+        Returns:
+            Hadamard transformed tensor
+        """
+        return hadamard_transform_cpu(u)
+
+    @staticmethod
+    def backward(ctx, grad: torch.Tensor) -> torch.Tensor:
+        """
+        Backward pass - Hadamard is its own inverse (up to scaling).
+        """
+        return hadamard_transform_cpu(grad)
+
+
+def hadamard_transform_cpu(u: torch.Tensor) -> torch.Tensor:
+    """
+    Fast Hadamard transform using butterfly algorithm.
+
+    Works on CPU/NPU without CUDA kernels.
+
+    Args:
+        u: Input tensor with last dimension being power of 2
+
+    Returns:
+        Hadamard transformed tensor
+    """
+    n = u.shape[-1]
+    assert is_pow2(n), f"Last dimension must be power of 2, got {n}"
+
+    # Reshape for butterfly operations
+    original_shape = u.shape
+    x = u.reshape(-1, n)
+
+    # Butterfly algorithm
+    h = 1
+    while h < n:
+        # Split into pairs
+        x = x.view(-1, n // (2 * h), 2, h)
+
+        # Butterfly operation: [a, b] -> [a+b, a-b]
+        a = x[:, :, 0, :]
+        b = x[:, :, 1, :]
+
+        x = torch.stack([a + b, a - b], dim=2)
+        x = x.view(-1, n)
+
+        h *= 2
+
+    return x.view(original_shape)
+
+
+def get_hadamard_matrix(n: int, device: torch.device = None) -> torch.Tensor:
+    """
+    Generate a normalized Hadamard matrix of size n.
+
+    Args:
+        n: Size of the matrix (must be power of 2)
+        device: Target device
+
+    Returns:
+        Hadamard matrix of shape [n, n]
+    """
+    assert is_pow2(n), f"n must be power of 2, got {n}"
+
+    if device is None:
+        device = torch.device("cpu")
+
+    H = torch.eye(n, device=device, dtype=torch.float64)
+    return hadamard_transform_cpu(H) / math.sqrt(n)
+
+
+def random_hadamard_matrix(size: int, device: torch.device = None) -> torch.Tensor:
+    """
+    Generate a randomized Hadamard matrix.
+
+    Applies random sign flips to create a randomized orthogonal matrix.
+
+    Args:
+        size: Size of the matrix
+        device: Target device
+
+    Returns:
+        Randomized Hadamard matrix
+    """
+    if device is None:
+        device = torch.device("cpu")
+
+    # Random diagonal of +1/-1
+    Q = torch.randint(low=0, high=2, size=(size,), device=device).to(torch.float64)
+    Q = Q * 2 - 1
+    Q = torch.diag(Q)
+
+    # Apply Hadamard transform
+    return hadamard_transform_cpu(Q) / math.sqrt(size)
+
+
+def random_orthogonal_matrix(size: int, device: torch.device = None) -> torch.Tensor:
+    """
+    Generate a random orthogonal matrix using QR decomposition.
+
+    Args:
+        size: Size of the matrix
+        device: Target device
+
+    Returns:
+        Random orthogonal matrix
+    """
+    if device is None:
+        device = torch.device("cpu")
+
+    random_matrix = torch.randn(size, size, dtype=torch.float64, device=device)
+    q, r = torch.linalg.qr(random_matrix)
+    q *= torch.sign(torch.diag(r)).unsqueeze(0)
+    return q
+
+
+# Pre-computed Hadamard matrices for common sizes
+_HADAMARD_CACHE = {}
+
+
+def get_had12() -> torch.Tensor:
+    """Get Hadamard matrix of order 12."""
+    if 12 not in _HADAMARD_CACHE:
+        # Paley construction for H(12)
+        _HADAMARD_CACHE[12] = torch.tensor([
+            [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+            [1, -1, 1, -1, 1, 1, 1, -1, -1, -1, 1, -1],
+            [1, -1, -1, 1, -1, 1, 1, 1, -1, -1, -1, 1],
+            [1, 1, -1, -1, 1, -1, 1, 1, 1, -1, -1, -1],
+            [1, -1, 1, -1, -1, 1, -1, 1, 1, 1, -1, -1],
+            [1, -1, -1, 1, -1, -1, 1, -1, 1, 1, 1, -1],
+            [1, -1, -1, -1, 1, -1, -1, 1, -1, 1, 1, 1],
+            [1, 1, -1, -1, -1, 1, -1, -1, 1, -1, 1, 1],
+            [1, 1, 1, -1, -1, -1, 1, -1, -1, 1, -1, 1],
+            [1, 1, 1, 1, -1, -1, -1, 1, -1, -1, 1, -1],
+            [1, -1, 1, 1, 1, -1, -1, -1, 1, -1, -1, 1],
+            [1, 1, -1, 1, 1, 1, -1, -1, -1, 1, -1, -1],
+        ], dtype=torch.float64) / math.sqrt(12)
+    return _HADAMARD_CACHE[12].clone()
+
+
+def get_had20() -> torch.Tensor:
+    """Get Hadamard matrix of order 20."""
+    if 20 not in _HADAMARD_CACHE:
+        # Use random orthogonal as fallback
+        torch.manual_seed(42)  # For reproducibility
+        _HADAMARD_CACHE[20] = random_orthogonal_matrix(20)
+    return _HADAMARD_CACHE[20].clone()
+
+
+def get_had28() -> torch.Tensor:
+    """Get Hadamard matrix of order 28."""
+    if 28 not in _HADAMARD_CACHE:
+        torch.manual_seed(42)
+        _HADAMARD_CACHE[28] = random_orthogonal_matrix(28)
+    return _HADAMARD_CACHE[28].clone()
+
+
+def get_had36() -> torch.Tensor:
+    """Get Hadamard matrix of order 36."""
+    if 36 not in _HADAMARD_CACHE:
+        torch.manual_seed(42)
+        _HADAMARD_CACHE[36] = random_orthogonal_matrix(36)
+    return _HADAMARD_CACHE[36].clone()
+
+
+def get_had40() -> torch.Tensor:
+    """Get Hadamard matrix of order 40."""
+    if 40 not in _HADAMARD_CACHE:
+        torch.manual_seed(42)
+        _HADAMARD_CACHE[40] = random_orthogonal_matrix(40)
+    return _HADAMARD_CACHE[40].clone()
+
+
+def get_had44() -> torch.Tensor:
+    """Get Hadamard matrix of order 44."""
+    if 44 not in _HADAMARD_CACHE:
+        torch.manual_seed(42)
+        _HADAMARD_CACHE[44] = random_orthogonal_matrix(44)
+    return _HADAMARD_CACHE[44].clone()
+
+
+def get_had52() -> torch.Tensor:
+    """Get Hadamard matrix of order 52."""
+    if 52 not in _HADAMARD_CACHE:
+        torch.manual_seed(42)
+        _HADAMARD_CACHE[52] = random_orthogonal_matrix(52)
+    return _HADAMARD_CACHE[52].clone()
+
+
+def get_had60() -> torch.Tensor:
+    """Get Hadamard matrix of order 60."""
+    if 60 not in _HADAMARD_CACHE:
+        torch.manual_seed(42)
+        _HADAMARD_CACHE[60] = random_orthogonal_matrix(60)
+    return _HADAMARD_CACHE[60].clone()
+
+
+def get_had108() -> torch.Tensor:
+    """Get Hadamard matrix of order 108."""
+    if 108 not in _HADAMARD_CACHE:
+        torch.manual_seed(42)
+        _HADAMARD_CACHE[108] = random_orthogonal_matrix(108)
+    return _HADAMARD_CACHE[108].clone()
+
+
+def get_had140() -> torch.Tensor:
+    """Get Hadamard matrix of order 140."""
+    if 140 not in _HADAMARD_CACHE:
+        torch.manual_seed(42)
+        _HADAMARD_CACHE[140] = random_orthogonal_matrix(140)
+    return _HADAMARD_CACHE[140].clone()
+
+
+def get_had156() -> torch.Tensor:
+    """Get Hadamard matrix of order 156."""
+    if 156 not in _HADAMARD_CACHE:
+        torch.manual_seed(42)
+        _HADAMARD_CACHE[156] = random_orthogonal_matrix(156)
+    return _HADAMARD_CACHE[156].clone()
+
+
+def get_had172() -> torch.Tensor:
+    """Get Hadamard matrix of order 172."""
+    if 172 not in _HADAMARD_CACHE:
+        torch.manual_seed(42)
+        _HADAMARD_CACHE[172] = random_orthogonal_matrix(172)
+    return _HADAMARD_CACHE[172].clone()
+
+
+def get_hadK(n: int, transpose: bool = False) -> Tuple[Optional[torch.Tensor], int]:
+    """
+    Get appropriate Hadamard/orthogonal matrix for dimension n.
+
+    Selects the largest factor of n that has a pre-computed matrix,
+    and the remaining dimension uses power-of-2 Hadamard.
+
+    Args:
+        n: Dimension size
+        transpose: Whether to return transposed matrix
+
+    Returns:
+        Tuple of (hadK matrix or None, K block size)
+    """
+    hadK, K = None, None
+
+    # Check common Hadamard sizes in order of preference
+    if n % 172 == 0 and is_pow2(n // 172):
+        K = 172
+        hadK = get_had172().T if transpose else get_had172()
+    elif n % 156 == 0 and is_pow2(n // 156):
+        K = 156
+        hadK = get_had156().T if transpose else get_had156()
+    elif n % 140 == 0 and is_pow2(n // 140):
+        K = 140
+        hadK = get_had140().T if transpose else get_had140()
+    elif n % 108 == 0 and is_pow2(n // 108):
+        K = 108
+        hadK = get_had108().T if transpose else get_had108()
+    elif n % 60 == 0 and is_pow2(n // 60):
+        K = 60
+        hadK = get_had60().T if transpose else get_had60()
+    elif n % 52 == 0 and is_pow2(n // 52):
+        K = 52
+        hadK = get_had52().T if transpose else get_had52()
+    elif n % 44 == 0 and is_pow2(n // 44):
+        K = 44
+        hadK = get_had44().T if transpose else get_had44()
+    elif n % 40 == 0 and is_pow2(n // 40):
+        K = 40
+        hadK = get_had40().T if transpose else get_had40()
+    elif n % 36 == 0 and is_pow2(n // 36):
+        K = 36
+        hadK = get_had36().T if transpose else get_had36()
+    elif n % 28 == 0 and is_pow2(n // 28):
+        K = 28
+        hadK = get_had28().T if transpose else get_had28()
+    elif n % 20 == 0 and is_pow2(n // 20):
+        K = 20
+        hadK = get_had20().T if transpose else get_had20()
+    elif n % 12 == 0 and is_pow2(n // 12):
+        K = 12
+        hadK = get_had12().T if transpose else get_had12()
+    else:
+        assert is_pow2(n), f"Dimension {n} not supported"
+        K = 1
+
+    return hadK, K
+
+
+def matmul_hadU(X: torch.Tensor, transpose: bool = False) -> torch.Tensor:
+    """
+    Multiply by structured Hadamard matrix.
+
+    Equivalent to X @ H where H is the Hadamard matrix.
+    Uses butterfly algorithm for efficiency.
+
+    Args:
+        X: Input tensor
+        transpose: Whether to use transposed Hadamard
+
+    Returns:
+        Transformed tensor
+    """
+    n = X.shape[-1]
+    hadK, K = get_hadK(n, transpose)
+
+    input_tensor = X.clone().view(-1, n, 1)
+    output = input_tensor.clone()
+
+    # Butterfly algorithm for power-of-2 part
+    while input_tensor.shape[1] > K:
+        input_tensor = input_tensor.view(
+            input_tensor.shape[0], input_tensor.shape[1] // 2, 2, input_tensor.shape[2]
+        )
+        output = output.view(input_tensor.shape)
+        output[:, :, 0, :] = input_tensor[:, :, 0, :] + input_tensor[:, :, 1, :]
+        output[:, :, 1, :] = input_tensor[:, :, 0, :] - input_tensor[:, :, 1, :]
+        output = output.view(input_tensor.shape[0], input_tensor.shape[1], -1)
+        input_tensor, output = output, input_tensor
+
+    del output
+
+    # Apply non-power-of-2 block if needed
+    if K > 1:
+        input_tensor = hadK.view(1, K, K).to(input_tensor) @ input_tensor
+
+    return input_tensor.view(X.shape) / math.sqrt(n)
+
+
+def matmul_hadU_cpu(X: torch.Tensor, hadK: torch.Tensor, K: int) -> torch.Tensor:
+    """
+    Apply structured Hadamard transform for CPU/NPU.
+
+    Equivalent to X @ (hadK ⊗ H)^T where H is Hadamard of n/K dimension.
+
+    Args:
+        X: Input tensor of shape [..., n]
+        hadK: Block Hadamard matrix of shape [K, K]
+        K: Block size
+
+    Returns:
+        Transformed tensor
+    """
+    n = X.shape[-1]
+
+    if K == 1:
+        return HadamardTransform.apply(X.contiguous()) / math.sqrt(n)
+
+    # Reshape to apply block-wise transform
+    input_tensor = X.view(-1, K, n // K)
+
+    # Apply fast Hadamard to the n/K dimension
+    input_tensor = HadamardTransform.apply(input_tensor.contiguous()) / math.sqrt(n)
+
+    # Apply hadK block matrix
+    input_tensor = hadK.to(input_tensor.device).to(input_tensor.dtype) @ input_tensor
+
+    return input_tensor.reshape(X.shape)
+
+
+def apply_exact_had_to_linear(
+    module: nn.Linear,
+    had_dim: int = -1,
+    output: bool = False,
+    R2: Optional[torch.Tensor] = None,
+    per_head: bool = False,
+) -> None:
+    """
+    Apply exact Hadamard transform to linear layer weights.
+
+    Args:
+        module: Linear layer to transform
+        had_dim: Hadamard dimension (-1 for full dimension)
+        output: Whether this is an output transformation
+        R2: Optional rotation matrix to use instead of Hadamard
+        per_head: Whether R2 is per-head (different for each head)
+    """
+    assert isinstance(module, nn.Linear)
+    in_features, out_features = module.in_features, module.out_features
+
+    if had_dim != -1:
+        assert is_pow2(had_dim), "Hadamard dimension must be power of 2"
+
+    W_ = module.weight.data
+    B_ = module.bias.data if module.bias is not None else None
+    dtype = W_.dtype
+    dev = W_.device
+
+    # Move to CPU for computation
+    W_ = W_.float().cpu()
+    if B_ is not None:
+        B_ = B_.float().cpu()
+
+    if had_dim == -1:
+        # Full dimension Hadamard
+        if output:
+            had_K, K = get_hadK(out_features)
+            W_ = matmul_hadU_cpu(W_.t(), had_K, K).t()
+            if B_ is not None:
+                B_ = matmul_hadU_cpu(B_.unsqueeze(0), had_K, K)[0]
+        else:
+            had_K, K = get_hadK(in_features)
+            W_ = matmul_hadU_cpu(W_, had_K, K)
+    else:
+        # Block-wise Hadamard
+        hadK = get_hadamard_matrix(had_dim, device=torch.device("cpu")).to(torch.float64)
+        if R2 is not None:
+            hadK = R2.to(torch.float64).cpu()
+
+        if output:
+            W_ = W_.t()
+            transposed_shape = W_.shape
+            temp = W_.reshape(-1, transposed_shape[-1] // had_dim, had_dim)
+
+            if B_ is not None:
+                bias_shape = B_.shape
+                temp_bias = B_.reshape(transposed_shape[-1] // had_dim, had_dim)
+
+            if per_head:
+                num_heads = transposed_shape[-1] // had_dim
+                for i in range(num_heads):
+                    temp[:, i, :] = temp[:, i, :].to(torch.float64) @ hadK[i]
+                    if B_ is not None:
+                        temp_bias[i] = temp_bias[i].to(torch.float64) @ hadK[i]
+            else:
+                temp = temp.to(torch.float64) @ hadK
+                if B_ is not None:
+                    temp_bias = temp_bias.to(torch.float64) @ hadK
+
+            W_ = temp.reshape(transposed_shape).t()
+            if B_ is not None:
+                B_ = temp_bias.reshape(bias_shape)
+        else:
+            init_shape = W_.shape
+            temp = W_.reshape(-1, init_shape[-1] // had_dim, had_dim)
+
+            if per_head:
+                num_kv_heads = hadK.shape[0]
+                num_kv_groups = init_shape[0] // (had_dim * num_kv_heads)
+                for i in range(num_kv_heads):
+                    for j in range(num_kv_groups):
+                        idx = j + num_kv_groups * i
+                        try:
+                            inverse = torch.linalg.inv(hadK[i]).t()
+                        except torch.linalg.LinAlgError:
+                            inverse = hadK[i]
+                        temp[:, idx, :] = temp[:, idx, :].to(torch.float64) @ inverse
+            else:
+                temp = temp.to(torch.float64) @ torch.linalg.inv(hadK).t()
+
+            W_ = temp.reshape(init_shape)
+
+    module.weight.data = W_.to(device=dev, dtype=dtype)
+    if B_ is not None:
+        module.bias.data = B_.to(device=dev, dtype=dtype)

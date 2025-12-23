@@ -11,36 +11,41 @@ where activation variances are highest, enabling mixed-precision
 quantization (4-bit/8-bit) with minimal accuracy loss.
 
 Key Features:
-- 4/8-bit hybrid quantization for activations
+- 4/8-bit hybrid quantization for activations and weights
 - Eigenvalue-based channel importance ranking
 - CPU/NPU kernel support (no GPU dependency)
 - Per-head rotation for value projections
 - Hadamard transform for outlier suppression
+- Dual weights and dual scales output format
 
 Usage:
     from msmodelslim.pytorch.llm_ptq.llm_ptq_tools.resq import (
         ResQConfig,
-        resq_quantize,
-        compute_basis,
-        resq_train,
+        ResQCalibrator,
+        resq_calibrate,
     )
 
     # Configure
     config = ResQConfig()
-    config.a_bits = 4
     config.high_bits = 8
+    config.low_bits = 4
     config.high_fraction = 0.125
 
-    # Quantize model
-    model = resq_quantize(model, config)
+    # Use calibrator
+    calibrator = ResQCalibrator(model, config, calib_data)
+    calibrator.run()
+    calibrator.save(output_path)
 
-    # Or use trainer for full pipeline
-    model = resq_train(model, dataloader, config)
+    # Or use convenience function
+    model = resq_calibrate(model, calib_data, config, output_path)
 """
 
 __all__ = [
     # Configuration
     'ResQConfig',
+    # Calibrator
+    'ResQCalibrator',
+    'resq_calibrate',
     # Main functions
     'resq_quantize',
     'compute_basis',
@@ -48,6 +53,11 @@ __all__ = [
     # Processors
     'apply_rotations',
     'rearrange_columns',
+    # Quantizer modules
+    'LinearResQQuantizer',
+    'ResQWeightQuantizer',
+    'ResQActQuantizer',
+    'add_resq_quantizers',
     # Components
     'ActQuantizer',
     'ActQuantWrapper',
@@ -56,8 +66,15 @@ __all__ = [
 ]
 
 from .config import ResQConfig
+from .calibrator import ResQCalibrator, resq_calibrate
 from .processors.resq_processor import resq_quantize, apply_rotations, rearrange_columns
 from .processors.basis_processor import compute_basis
 from .trainer import resq_train
+from .quant_modules import (
+    LinearResQQuantizer,
+    ResQWeightQuantizer,
+    ResQActQuantizer,
+    add_resq_quantizers,
+)
 from .components.act_quantizer import ActQuantizer, ActQuantWrapper
 from .components.weight_quantizer import WeightQuantizer, MixedPrecisionWeightQuantizer

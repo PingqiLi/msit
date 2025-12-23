@@ -31,6 +31,7 @@ class QuantType(str, Enum):
     W8A8_TIMESTEP = "W8A8_TIMESTEP"  # 分时间步量化
     W8A8_MIX = "W8A8_MIX"  # W8A8 Per-tensor/Per-token 参数混合导出
     W4A4_FLATQUANT_DYNAMIC = "W4A4_FLATQUANT_DYNAMIC"  # w4a4静态量化与flatquant的per-token动态量化混合量化
+    W4A8_RESQ = "W4A8_RESQ"  # ResQ 4/8-bit hybrid quantization
 
     W16A16S = "W16A16S"  # W16A16s稀疏量化
     W16A16SC = "W16A16SC"  # W16A16s稀疏量化压缩后的权重
@@ -108,6 +109,11 @@ class QuantType(str, Enum):
         if w_bit == 4 and a_bit == 4:
             return QuantType.W4A4_FLATQUANT_DYNAMIC
         return QuantType.UNKNOWN
+
+    @staticmethod
+    def get_resq_quant_type():
+        """Return ResQ quantization type for 4/8-bit hybrid."""
+        return QuantType.W4A8_RESQ
 
 
 class QuantModelJsonDescription:

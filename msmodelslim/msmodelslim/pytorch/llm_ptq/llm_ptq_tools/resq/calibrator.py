@@ -64,7 +64,7 @@ class ResQCalibrator:
         self.logger = msmodelslim_logger
         self.calib_data = calib_data or []
         self.disable_names = disable_names or []
-        self.device = get_device(cfg.dev_type)
+        self.device = get_device(cfg.dev_type, cfg.dev_id)
 
         # Load or compute basis and rotations
         self.basis_dict = None
@@ -89,27 +89,42 @@ class ResQCalibrator:
         fuse_layer_norms(model)
         cleanup_memory(verbos=False)
 
-        # Generate rotations if not provided
-        if self.rotation_dict is None:
-            self.logger.info("Generating random rotations...")
-            self.rotation_dict = generate_random_rotations(
-                hidden_dim=model.config.hidden_size,
-                head_dim=model.config.hidden_size // model.config.num_attention_heads,
-                high_fraction=self.cfg.high_fraction,
-                low_fraction=self.cfg.low_fraction,
-                seed=self.cfg.seed,
+        # Check if basis is available for full ResQ mode
+        if self.basis_dict is None:
+            self.logger.warning(
+                "=" * 60 + "\n"
+                "WARNING: No basis_path provided!\n"
+                "ResQ will run in SIMPLIFIED MODE without eigenvalue-based rotation.\n"
+                "This may result in suboptimal quantization quality.\n"
+                "For best results, pre-compute basis using compute_basis() and provide basis_path.\n"
+                "=" * 60
             )
+            # In simplified mode, skip rotation and rearrangement
+            # Just do uniform mixed-precision quantization
+            self._use_simplified_mode = True
+        else:
+            self._use_simplified_mode = False
 
-        # Apply rotations if basis is available
-        if self.basis_dict is not None:
+            # Generate rotations if not provided
+            if self.rotation_dict is None:
+                self.logger.info("Generating random rotations...")
+                self.rotation_dict = generate_random_rotations(
+                    hidden_dim=model.config.hidden_size,
+                    head_dim=model.config.hidden_size // model.config.num_attention_heads,
+                    high_fraction=self.cfg.high_fraction,
+                    low_fraction=self.cfg.low_fraction,
+                    seed=self.cfg.seed,
+                )
+
+            # Apply rotations with basis
             self.logger.info("Applying rotations to model...")
             apply_rotations(model, self.basis_dict, self.rotation_dict, self.cfg)
             cleanup_memory(verbos=False)
 
-        # Rearrange columns for mixed-precision layout
-        self.logger.info("Rearranging columns for mixed precision...")
-        rearrange_columns(model, self.cfg, training=False)
-        cleanup_memory(verbos=False)
+            # Rearrange columns for mixed-precision layout (only when basis is available)
+            self.logger.info("Rearranging columns for mixed precision...")
+            rearrange_columns(model, self.cfg, training=False)
+            cleanup_memory(verbos=False)
 
         # Replace linear layers with ResQ quantizers
         self.logger.info("Adding ResQ quantizers...")

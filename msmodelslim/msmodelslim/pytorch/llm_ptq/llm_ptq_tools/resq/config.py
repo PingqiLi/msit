@@ -8,79 +8,106 @@ ResQ configuration class.
 class ResQConfig:
     """Configuration for ResQ quantization method."""
 
-    def __init__(self):
+    def __init__(
+        self,
+        high_bits: int = 8,
+        low_bits: int = 4,
+        high_fraction: float = 0.125,
+        low_fraction: float = 0.0,
+        seed: int = 0,
+        dev_type: str = 'npu',
+        dev_id: int = 0,
+        rotate_mode: str = 'resq',
+        rotation_granularity: str = 'full_shared',
+        **kwargs
+    ):
         # General Arguments
-        self.seed = 0
+        self.seed = seed
+
+        # Device settings
+        self.dev_type = dev_type
+        self.dev_id = dev_id
 
         # Rotation mode: 'resq', 'quarot', 'spinquant', 'none'
-        self.rotate_mode = "resq"
+        self.rotate_mode = rotate_mode
         # Rotation granularity: 'full_shared', 'per_layer', 'one_per_decoder'
-        self.rotation_granularity = "full_shared"
+        self.rotation_granularity = rotation_granularity
 
         # Paths for pre-computed rotations and basis
-        self.optimized_rotation_path = None
-        self.optimized_basis_path = None
+        self.optimized_rotation_path = kwargs.get('optimized_rotation_path', None)
+        self.optimized_basis_path = kwargs.get('optimized_basis_path', None)
 
         # Mixed precision fractions
-        self.high_fraction = 0.03125  # 1/32, high precision portion
-        self.low_fraction = 0.03125   # 1/32, low precision portion
-        self.sparse_fraction = 0.0    # sparse fraction within low precision
+        self.high_fraction = high_fraction  # high precision portion (e.g., 0.125 = 1/8)
+        self.low_fraction = low_fraction    # low precision portion
+        self.sparse_fraction = kwargs.get('sparse_fraction', 0.0)
 
         # Activation Quantization Arguments
-        self.a_bits = 4
-        self.a_groupsize = -1
-        self.a_asym = False
-        self.a_clip_ratio = 1.0
+        self.a_bits = kwargs.get('a_bits', 4)
+        self.a_groupsize = kwargs.get('a_groupsize', -1)
+        self.a_asym = kwargs.get('a_asym', False)
+        self.a_clip_ratio = kwargs.get('a_clip_ratio', 1.0)
 
-        # High/Low precision bits for activations
-        self.high_bits = 8
-        self.low_bits = 8
+        # High/Low precision bits for activations and weights
+        self.high_bits = high_bits
+        self.low_bits = low_bits
 
         # Weight Quantization Arguments
-        self.w_bits = 4
-        self.w_groupsize = -1
-        self.w_asym = False
-        self.w_clip = True  # Use MSE for weight quantization
-        self.w_rtn = True   # Use RTN (round-to-nearest) instead of GPTQ
+        self.w_bits = kwargs.get('w_bits', 4)
+        self.w_groupsize = kwargs.get('w_groupsize', -1)
+        self.w_asym = kwargs.get('w_asym', False)
+        self.w_sym = kwargs.get('w_sym', True)
+        self.w_clip = kwargs.get('w_clip', True)
+        self.w_rtn = kwargs.get('w_rtn', True)
 
         # Value cache quantization
-        self.v_bits = 4
-        self.v_asym = False
-        self.v_clip_ratio = 1.0
+        self.v_bits = kwargs.get('v_bits', 4)
+        self.v_asym = kwargs.get('v_asym', False)
+        self.v_clip_ratio = kwargs.get('v_clip_ratio', 1.0)
 
         # Key cache quantization
-        self.k_bits = 4
-        self.k_groupsize = -1
-        self.k_asym = False
-        self.k_clip_ratio = 1.0
-        self.k_pre_rope = False
+        self.k_bits = kwargs.get('k_bits', 4)
+        self.k_groupsize = kwargs.get('k_groupsize', -1)
+        self.k_asym = kwargs.get('k_asym', False)
+        self.k_clip_ratio = kwargs.get('k_clip_ratio', 1.0)
+        self.k_pre_rope = kwargs.get('k_pre_rope', False)
 
         # GPTQ settings
-        self.percdamp = 0.01
-        self.act_order = False
-        self.nsamples = 128
+        self.percdamp = kwargs.get('percdamp', 0.01)
+        self.act_order = kwargs.get('act_order', False)
+        self.nsamples = kwargs.get('nsamples', 128)
 
         # Hadamard settings
-        self.fp32_had = True  # Use FP32 for Hadamard transform
-        self.int8_down_proj = True  # Use INT8 for down_proj
+        self.fp32_had = kwargs.get('fp32_had', True)
+        self.int8_down_proj = kwargs.get('int8_down_proj', True)
 
         # Down projection block size for rotation
-        self.down_proj_blocksize = 256
+        self.down_proj_blocksize = kwargs.get('down_proj_blocksize', 256)
 
         # Training rotations (for rotation optimization)
-        self.train_rotations = False
+        self.train_rotations = kwargs.get('train_rotations', False)
 
         # Calibration dataset
-        self.calib_dataset = "wikitext2"
+        self.calib_dataset = kwargs.get('calib_dataset', 'wikitext2')
 
         # Batch size
-        self.bsz = 1
+        self.bsz = kwargs.get('bsz', 1)
 
         # Data type
-        self.amp_dtype = "bfloat16"
+        self.amp_dtype = kwargs.get('amp_dtype', 'bfloat16')
 
-    def validate(self):
-        """Validate configuration parameters."""
+        # Dynamic quantization mode (for activations)
+        self.is_dynamic = kwargs.get('is_dynamic', True)
+        self.a_sym = kwargs.get('a_sym', False)
+
+    def validate(self, strict: bool = False):
+        """
+        Validate configuration parameters.
+
+        Args:
+            strict: If True, require basis_path for ResQ mode.
+                   If False, allow simplified mode without basis.
+        """
         assert self.rotate_mode in ['resq', 'quarot', 'spinquant', 'none'], \
             f"Invalid rotate_mode: {self.rotate_mode}"
         assert self.rotation_granularity in ['full_shared', 'per_layer', 'one_per_decoder'], \
@@ -90,9 +117,9 @@ class ResQConfig:
         assert self.high_fraction + self.low_fraction <= 1.0, \
             "high_fraction + low_fraction must be <= 1"
 
-        if self.rotate_mode == 'resq':
+        if strict and self.rotate_mode == 'resq':
             assert self.optimized_basis_path is not None, \
-                "optimized_basis_path is required for ResQ mode"
+                "optimized_basis_path is required for ResQ mode (use strict=False for simplified mode)"
             if not self.train_rotations:
                 assert self.optimized_rotation_path is not None, \
                     "optimized_rotation_path is required when not training rotations"

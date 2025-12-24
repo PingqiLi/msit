@@ -18,13 +18,36 @@ except ImportError:
     pass
 
 
-def get_device():
-    """Get the appropriate device (NPU, CUDA, or CPU)."""
-    if npu_available:
-        return torch.device("npu")
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    return torch.device("cpu")
+def get_device(dev_type: str = None, dev_id: int = 0):
+    """
+    Get the appropriate device (NPU, CUDA, or CPU).
+
+    Args:
+        dev_type: Device type ('npu', 'cuda', 'cpu', or None for auto-detect)
+        dev_id: Device ID (default: 0)
+
+    Returns:
+        torch.device: The device to use
+    """
+    if dev_type == 'npu':
+        if npu_available:
+            return torch.device(f"npu:{dev_id}")
+        else:
+            raise RuntimeError("NPU requested but torch_npu is not available")
+    elif dev_type == 'cuda':
+        if torch.cuda.is_available():
+            return torch.device(f"cuda:{dev_id}")
+        else:
+            raise RuntimeError("CUDA requested but not available")
+    elif dev_type == 'cpu':
+        return torch.device("cpu")
+    else:
+        # Auto-detect
+        if npu_available:
+            return torch.device("npu")
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        return torch.device("cpu")
 
 
 DEV = get_device()

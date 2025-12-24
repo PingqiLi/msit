@@ -8,14 +8,26 @@ This script performs 4/8-bit hybrid quantization using ResQ algorithm:
 - Saves dual weights and dual scales
 
 Usage:
+    # Full ResQ with on-the-fly basis computation (recommended):
     python resq_qwen3_32b.py \
         --model_path /path/to/Qwen3-32B \
         --save_directory /path/to/output \
         --calib_file ../common/wiki.jsonl \
-        --batch_size 1 \
-        --high_fraction 0.125 \
-        --high_bits 8 \
-        --low_bits 4
+        --compute_basis \
+        --save_basis_path /path/to/basis.pt
+
+    # Using pre-computed basis:
+    python resq_qwen3_32b.py \
+        --model_path /path/to/Qwen3-32B \
+        --save_directory /path/to/output \
+        --calib_file ../common/wiki.jsonl \
+        --basis_path /path/to/basis.pt
+
+    # Simplified mode (no basis, suboptimal quality):
+    python resq_qwen3_32b.py \
+        --model_path /path/to/Qwen3-32B \
+        --save_directory /path/to/output \
+        --calib_file ../common/wiki.jsonl
 
 Output format:
     - weight_low: 4-bit quantized weights (low variance channels)
@@ -50,6 +62,7 @@ from msmodelslim.utils.logging import set_logger_level
 from msmodelslim.pytorch.llm_ptq.llm_ptq_tools.resq import (
     ResQConfig,
     ResQCalibrator,
+    compute_basis,
 )
 
 
@@ -109,6 +122,12 @@ def parse_args():
     parser.add_argument('--rotation_path', type=str, default=None,
                         help="Path to pre-computed rotation matrices (optional)")
 
+    # Basis computation options
+    parser.add_argument('--compute_basis', type=cmd_bool, default=False,
+                        help="Compute basis from calibration data (recommended for best quality)")
+    parser.add_argument('--save_basis_path', type=str, default=None,
+                        help="Path to save computed basis matrices (optional)")
+
     return parser.parse_args()
 
 
@@ -148,14 +167,29 @@ def main():
     args = parse_args()
     set_logger_level("info")
 
+    # Determine mode
+    if args.basis_path:
+        mode = "FULL (pre-computed basis)"
+    elif args.compute_basis:
+        mode = "FULL (on-the-fly basis computation)"
+    else:
+        mode = "SIMPLIFIED (no basis - suboptimal quality)"
+
     print("=" * 60)
     print("ResQ Quantization for Qwen3-32B")
     print("=" * 60)
+    print(f"Mode: {mode}")
     print(f"Model path: {args.model_path}")
     print(f"Save directory: {args.save_directory}")
     print(f"High bits: {args.high_bits}, Low bits: {args.low_bits}")
     print(f"High fraction: {args.high_fraction}")
     print(f"Device: {args.dev_type}:{args.dev_id}")
+    if args.basis_path:
+        print(f"Basis path: {args.basis_path}")
+    if args.compute_basis:
+        print(f"Will compute basis from calibration data")
+        if args.save_basis_path:
+            print(f"Will save basis to: {args.save_basis_path}")
     print("=" * 60)
 
     # Set random seed
@@ -245,6 +279,65 @@ def main():
         rotation_granularity='full_shared',
     )
 
+    # Compute basis if requested
+    basis_path = args.basis_path
+    if args.compute_basis and not args.basis_path:
+        print("=" * 60)
+        print("Computing eigenvalue basis from calibration data...")
+        print("This may take a while for large models...")
+        print("=" * 60)
+
+        # Create a simple dataloader for basis computation
+        class SimpleDataLoader:
+            def __init__(self, data):
+                self.data = data
+
+            def __iter__(self):
+                for batch in self.data:
+                    # batch is a list of tensors [input_ids, attention_mask, ...]
+                    result = {'input_ids': batch[0]}
+                    if len(batch) > 1 and batch[1] is not None:
+                        result['attention_mask'] = batch[1]
+                    yield result
+
+            def __len__(self):
+                return len(self.data)
+
+        basis_dataloader = SimpleDataLoader(dataset_calib)
+
+        try:
+            # Compute basis
+            basis_dict = compute_basis(
+                model=model,
+                dataloader=basis_dataloader,
+                config=resq_config,
+                device=model.device,
+            )
+
+            # Save basis if path provided
+            if args.save_basis_path:
+                save_basis_dir = os.path.dirname(args.save_basis_path)
+                if save_basis_dir:
+                    os.makedirs(save_basis_dir, exist_ok=True)
+                torch.save(basis_dict, args.save_basis_path)
+                print(f"Saved basis to: {args.save_basis_path}")
+
+            # Save basis to output directory as well
+            basis_output_path = os.path.join(save_directory, "resq_basis.pt")
+            torch.save(basis_dict, basis_output_path)
+            print(f"Saved basis to: {basis_output_path}")
+
+            # Use the computed basis path
+            basis_path = basis_output_path
+            print("Basis computation complete!")
+
+        except Exception as e:
+            print(f"WARNING: Basis computation failed: {e}")
+            print("Falling back to simplified mode (no basis)")
+            basis_path = None
+
+        print("=" * 60)
+
     # Disable names - typically lm_head is skipped
     disable_names = []
     for name, _ in model.named_modules():
@@ -260,7 +353,7 @@ def main():
         cfg=resq_config,
         calib_data=dataset_calib,
         disable_names=disable_names,
-        basis_path=args.basis_path,
+        basis_path=basis_path,  # Use computed or provided basis_path
         rotation_path=args.rotation_path,
     )
 

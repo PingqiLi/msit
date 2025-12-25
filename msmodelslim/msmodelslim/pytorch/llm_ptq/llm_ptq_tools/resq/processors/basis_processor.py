@@ -76,10 +76,13 @@ def perform_eigen_decomp(
 
             # Eigendecomposition
             eigenvalues, eigenvectors = torch.linalg.eigh(H)
+            # Move to CPU before sorting (NPU doesn't support argsort on float64)
+            eigenvalues = eigenvalues.cpu()
+            eigenvectors = eigenvectors.cpu()
             # Sort by eigenvalue (ascending)
             sorted_idx = torch.argsort(eigenvalues)
-            eval_list.append(eigenvalues[sorted_idx].cpu())
-            evec_list.append(eigenvectors[:, sorted_idx].cpu())
+            eval_list.append(eigenvalues[sorted_idx])
+            evec_list.append(eigenvectors[:, sorted_idx])
 
         return torch.stack(eval_list), torch.stack(evec_list)
     else:
@@ -91,10 +94,13 @@ def perform_eigen_decomp(
 
         # Eigendecomposition
         eigenvalues, eigenvectors = torch.linalg.eigh(H)
+        # Move to CPU before sorting (NPU doesn't support argsort on float64)
+        eigenvalues = eigenvalues.cpu()
+        eigenvectors = eigenvectors.cpu()
         # Sort by eigenvalue (ascending)
         sorted_idx = torch.argsort(eigenvalues)
 
-        return eigenvalues[sorted_idx].cpu(), eigenvectors[:, sorted_idx].cpu()
+        return eigenvalues[sorted_idx], eigenvectors[:, sorted_idx]
 
 
 class InputCatcher(nn.Module):

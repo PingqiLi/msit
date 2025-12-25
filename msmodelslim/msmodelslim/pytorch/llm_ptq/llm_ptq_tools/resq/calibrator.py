@@ -220,8 +220,10 @@ class ResQCalibrator:
 
         # Collect all weights and parameters
         weight_dict = {}
+        # Use dynamic format based on config: W{low_bits}W{high_bits}_RESQ
+        model_quant_type = f"W{self.cfg.low_bits}W{self.cfg.high_bits}_RESQ"
         quant_description = {
-            "model_quant_type": QuantType.W4A8_RESQ.value,
+            "model_quant_type": model_quant_type,
             "high_bits": self.cfg.high_bits,
             "low_bits": self.cfg.low_bits,
             "high_fraction": self.cfg.high_fraction,

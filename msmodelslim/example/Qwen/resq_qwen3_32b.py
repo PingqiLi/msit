@@ -56,7 +56,7 @@ sys.path.append(parent_directory)
 from example.common.security.path import get_valid_read_path, get_write_directory
 from example.common.security.type import check_number
 from example.common.utils import SafeGenerator, cmd_bool
-from msmodelslim.tools.copy_config_files import copy_config_files, modify_config_json
+from msmodelslim.tools.copy_config_files import copy_config_files
 from msmodelslim.utils.logging import set_logger_level
 
 # Import ResQ components
@@ -130,12 +130,6 @@ def parse_args():
                         help="Path to save computed basis matrices (optional)")
 
     return parser.parse_args()
-
-
-def custom_hook(model_config):
-    """Custom hook to modify config.json for ResQ format."""
-    model_config["quantize"] = "w4a8_resq"
-
 
 def get_calib_dataset_batch(model_tokenizer, calib_list, batch_size, seq_len, device="npu"):
     """Prepare calibration dataset in batches."""
@@ -347,11 +341,17 @@ def main():
 
             # Save basis if path provided
             if args.save_basis_path:
-                save_basis_dir = os.path.dirname(args.save_basis_path)
+                save_basis_path = args.save_basis_path
+                # Handle if path is a directory (ends with / or is an existing dir)
+                if save_basis_path.endswith('/') or save_basis_path.endswith('\\'):
+                    save_basis_path = os.path.join(save_basis_path, "resq_basis.pt")
+                elif os.path.isdir(save_basis_path):
+                    save_basis_path = os.path.join(save_basis_path, "resq_basis.pt")
+                save_basis_dir = os.path.dirname(save_basis_path)
                 if save_basis_dir:
                     os.makedirs(save_basis_dir, exist_ok=True)
-                torch.save(basis_dict, args.save_basis_path)
-                print(f"Saved basis to: {args.save_basis_path}")
+                torch.save(basis_dict, save_basis_path)
+                print(f"Saved basis to: {save_basis_path}")
 
             # Save basis to output directory as well
             basis_output_path = os.path.join(save_directory, "resq_basis.pt")
@@ -430,15 +430,23 @@ def main():
         save_type=["safe_tensor"],
     )
 
-    # Copy config files
-    import functools
+    # Copy config files with custom hook for ResQ
+    def resq_config_hook(src_path, dst_path, quant_config, mindie_format):
+        """Custom hook to modify config.json for ResQ format."""
+        with open(src_path, 'r', encoding='utf-8') as f:
+            model_config = json.load(f)
+        # Use dynamic format: W{low_bits}W{high_bits}_RESQ
+        model_config["quantize"] = f"W{args.low_bits}W{args.high_bits}_RESQ"
+        with open(dst_path, 'w', encoding='utf-8') as f:
+            json.dump(model_config, f, indent=2)
+
     custom_hooks = {
-        'config.json': functools.partial(modify_config_json, custom_hook=custom_hook)
+        'config.json': resq_config_hook
     }
     copy_config_files(
         input_path=model_path,
         output_path=save_directory,
-        quant_config=None,  # ResQ uses its own config
+        quant_config=None,
         custom_hooks=custom_hooks
     )
 

@@ -43,6 +43,7 @@ import argparse
 import random
 import json
 import gc
+import shutil
 
 import numpy as np
 import torch
@@ -56,7 +57,6 @@ sys.path.append(parent_directory)
 from example.common.security.path import get_valid_read_path, get_write_directory
 from example.common.security.type import check_number
 from example.common.utils import SafeGenerator, cmd_bool
-from msmodelslim.tools.copy_config_files import copy_config_files
 from msmodelslim.utils.logging import set_logger_level
 
 # Import ResQ components
@@ -130,6 +130,12 @@ def parse_args():
                         help="Path to save computed basis matrices (optional)")
 
     return parser.parse_args()
+
+
+def custom_hook(model_config):
+    """Custom hook to modify config.json for ResQ format."""
+    model_config["quantize"] = "w4a8_resq"
+
 
 def get_calib_dataset_batch(model_tokenizer, calib_list, batch_size, seq_len, device="npu"):
     """Prepare calibration dataset in batches."""
@@ -430,25 +436,20 @@ def main():
         save_type=["safe_tensor"],
     )
 
-    # Copy config files with custom hook for ResQ
-    def resq_config_hook(src_path, dst_path, quant_config, mindie_format):
-        """Custom hook to modify config.json for ResQ format."""
-        with open(src_path, 'r', encoding='utf-8') as f:
-            model_config = json.load(f)
-        # Use dynamic format: W{low_bits}W{high_bits}_RESQ
-        model_config["quantize"] = f"W{args.low_bits}W{args.high_bits}_RESQ"
-        with open(dst_path, 'w', encoding='utf-8') as f:
-            json.dump(model_config, f, indent=2)
-
-    custom_hooks = {
-        'config.json': resq_config_hook
-    }
-    copy_config_files(
-        input_path=model_path,
-        output_path=save_directory,
-        quant_config=None,
-        custom_hooks=custom_hooks
-    )
+    # Copy config files manually (avoid using quant_config parameter)
+    for file in os.listdir(model_path):
+        if file.endswith('.json') or file.endswith('.py'):
+            src_path = os.path.join(model_path, file)
+            dst_path = os.path.join(save_directory, file)
+            if file == 'config.json':
+                # Modify config.json to add quantize field
+                with open(src_path, 'r', encoding='utf-8') as f:
+                    model_config = json.load(f)
+                model_config['quantize'] = 'W4A8_ResQ'
+                with open(dst_path, 'w', encoding='utf-8') as f:
+                    json.dump(model_config, f, indent=2, ensure_ascii=False)
+            else:
+                shutil.copy2(src_path, dst_path)
 
     print("=" * 60)
     print("ResQ quantization complete!")

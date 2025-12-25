@@ -18,7 +18,6 @@ from tqdm import tqdm
 
 from msmodelslim import logger as msmodelslim_logger
 from msmodelslim.pytorch.llm_ptq.llm_ptq_tools.save import SaverFactory
-from msmodelslim.pytorch.llm_ptq.llm_ptq_tools.llm_ptq_utils import QuantType
 
 from .config import ResQConfig
 from .quant_modules import LinearResQQuantizer, add_resq_quantizers
@@ -220,10 +219,8 @@ class ResQCalibrator:
 
         # Collect all weights and parameters
         weight_dict = {}
-        # Use dynamic format based on config: W{low_bits}W{high_bits}_RESQ
-        model_quant_type = f"W{self.cfg.low_bits}W{self.cfg.high_bits}_RESQ"
         quant_description = {
-            "model_quant_type": model_quant_type,
+            "model_quant_type": "W4A8_ResQ",
             "high_bits": self.cfg.high_bits,
             "low_bits": self.cfg.low_bits,
             "high_fraction": self.cfg.high_fraction,

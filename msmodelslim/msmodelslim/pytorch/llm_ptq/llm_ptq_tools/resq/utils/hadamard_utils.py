@@ -416,7 +416,8 @@ def apply_exact_had_to_linear(
     assert isinstance(module, nn.Linear)
     in_features, out_features = module.in_features, module.out_features
 
-    if had_dim != -1:
+    # Only require power of 2 when using Hadamard (R2 is None)
+    if had_dim != -1 and R2 is None:
         assert is_pow2(had_dim), "Hadamard dimension must be power of 2"
 
     W_ = module.weight.data
@@ -440,10 +441,11 @@ def apply_exact_had_to_linear(
             had_K, K = get_hadK(in_features)
             W_ = matmul_hadU_cpu(W_, had_K, K)
     else:
-        # Block-wise Hadamard
-        hadK = get_hadamard_matrix(had_dim, device=torch.device("cpu")).to(torch.float64)
+        # Block-wise Hadamard or custom rotation
         if R2 is not None:
             hadK = R2.to(torch.float64).cpu()
+        else:
+            hadK = get_hadamard_matrix(had_dim, device=torch.device("cpu")).to(torch.float64)
 
         if output:
             W_ = W_.t()

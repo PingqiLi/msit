@@ -109,6 +109,18 @@ class InputCatcher(nn.Module):
         self.position_embeddings_list = []  # Store per batch
         self.cache_positions = []  # Store per batch
 
+    def __getattr__(self, name):
+        # Forward attribute access to wrapped module for model-specific attributes
+        # (e.g., Qwen3 accesses decoder_layer.attention_type)
+        if name in ('module', 'inputs', 'attention_masks', 'position_ids_list',
+                    'position_embeddings_list', 'cache_positions', 'training',
+                    '_parameters', '_buffers', '_modules'):
+            return super().__getattr__(name)
+        try:
+            return getattr(self.module, name)
+        except AttributeError:
+            return super().__getattr__(name)
+
     def forward(self, inp, **kwargs):
         self.inputs.append(inp.cpu())
         # Store kwargs per batch (move to CPU to save device memory)

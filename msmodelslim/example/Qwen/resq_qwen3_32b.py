@@ -42,6 +42,7 @@ import sys
 import argparse
 import random
 import json
+import gc
 
 import numpy as np
 import torch
@@ -235,14 +236,29 @@ def main():
 
     # Load model
     print("Loading model...")
-    model = safe_generator.get_model_from_pretrained(
-        model_path=model_path,
-        config=config,
-        trust_remote_code=args.trust_remote_code,
-        device_map="auto",
-        torch_dtype="auto",
-        attn_implementation='eager'
-    )
+    # For basis computation, load model on CPU to enable layer-by-layer processing
+    # This saves device memory by only loading one layer at a time
+    if args.compute_basis and not args.basis_path:
+        print("Loading model on CPU for memory-efficient basis computation...")
+        model = safe_generator.get_model_from_pretrained(
+            model_path=model_path,
+            config=config,
+            trust_remote_code=args.trust_remote_code,
+            device_map="cpu",  # Load on CPU for layer-by-layer processing
+            torch_dtype=torch.bfloat16,
+            attn_implementation='eager'
+        )
+        model_device = torch.device('cpu')
+    else:
+        model = safe_generator.get_model_from_pretrained(
+            model_path=model_path,
+            config=config,
+            trust_remote_code=args.trust_remote_code,
+            device_map="auto",
+            torch_dtype="auto",
+            attn_implementation='eager'
+        )
+        model_device = model.device if hasattr(model, 'device') else torch.device('cpu')
 
     # Load calibration data
     print("Loading calibration data...")
@@ -263,8 +279,10 @@ def main():
     print(f"Loaded {len(calib_prompt)} calibration samples")
 
     # Prepare calibration dataset
+    # For basis computation, keep data on CPU; otherwise use model device
+    calib_device = 'cpu' if (args.compute_basis and not args.basis_path) else model_device
     dataset_calib = get_calib_dataset_batch(
-        tokenizer, calib_prompt, args.batch_size, args.seq_len, model.device
+        tokenizer, calib_prompt, args.batch_size, args.seq_len, calib_device
     )
 
     # Create ResQ configuration
@@ -279,12 +297,22 @@ def main():
         rotation_granularity='full_shared',
     )
 
+    # Determine the device for layer-by-layer processing
+    if args.dev_type == 'npu':
+        process_device = torch.device(f'npu:{args.dev_id}')
+    elif args.dev_type == 'cuda':
+        process_device = torch.device(f'cuda:{args.dev_id}')
+    else:
+        process_device = torch.device('cpu')
+
     # Compute basis if requested
     basis_path = args.basis_path
     if args.compute_basis and not args.basis_path:
         print("=" * 60)
         print("Computing eigenvalue basis from calibration data...")
         print("This may take a while for large models...")
+        print(f"Processing device: {process_device}")
+        print("Covariance matrices stored on CPU to save memory")
         print("=" * 60)
 
         # Create a simple dataloader for basis computation
@@ -306,12 +334,15 @@ def main():
         basis_dataloader = SimpleDataLoader(dataset_calib)
 
         try:
-            # Compute basis
+            # Compute basis with layer-by-layer processing
+            # - device: where to run layer forward passes (NPU/GPU)
+            # - cov_device: where to store covariance matrices (CPU to save memory)
             basis_dict = compute_basis(
                 model=model,
                 dataloader=basis_dataloader,
                 config=resq_config,
-                device=model.device,
+                device=process_device,
+                cov_device='cpu',  # Store covariance matrices on CPU to save NPU memory
             )
 
             # Save basis if path provided
@@ -333,10 +364,39 @@ def main():
 
         except Exception as e:
             print(f"WARNING: Basis computation failed: {e}")
+            import traceback
+            traceback.print_exc()
             print("Falling back to simplified mode (no basis)")
             basis_path = None
 
         print("=" * 60)
+
+        # After basis computation, reload model with device_map="auto" for calibration
+        print("Reloading model for calibration...")
+        del model
+        gc.collect()
+        try:
+            torch_npu.npu.empty_cache()
+        except Exception:
+            pass
+
+        model = safe_generator.get_model_from_pretrained(
+            model_path=model_path,
+            config=config,
+            trust_remote_code=args.trust_remote_code,
+            device_map="auto",
+            torch_dtype="auto",
+            attn_implementation='eager'
+        )
+
+        # Re-prepare calibration data for the new model device
+        try:
+            model_device = next(model.parameters()).device
+        except StopIteration:
+            model_device = torch.device('cpu')
+        dataset_calib = get_calib_dataset_batch(
+            tokenizer, calib_prompt, args.batch_size, args.seq_len, model_device
+        )
 
     # Disable names - typically lm_head is skipped
     disable_names = []

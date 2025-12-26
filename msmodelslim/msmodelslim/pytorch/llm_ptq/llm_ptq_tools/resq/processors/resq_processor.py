@@ -285,8 +285,16 @@ def rearrange_columns(
     """
     model_config = model.config
     num_heads = model_config.num_attention_heads
+    num_kv_heads = getattr(model_config, 'num_key_value_heads', num_heads)
     model_dim = model_config.hidden_size
-    head_dim = model_dim // num_heads
+    # Get correct head_dim from config or v_proj
+    head_dim = getattr(model_config, 'head_dim', None)
+    if head_dim is None:
+        if hasattr(model, 'model') and hasattr(model.model, 'layers') and len(model.model.layers) > 0:
+            v_proj = model.model.layers[0].self_attn.v_proj
+            head_dim = v_proj.out_features // num_kv_heads
+        else:
+            head_dim = model_dim // num_heads
 
     high_bits_length = int(config.high_fraction * model_dim)
     low_bits_length = int(config.low_fraction * model_dim)

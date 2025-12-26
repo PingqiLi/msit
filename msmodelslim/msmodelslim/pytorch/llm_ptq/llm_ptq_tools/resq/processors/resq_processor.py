@@ -110,7 +110,7 @@ def rotate_mlp_output(
         R4: Optional Hadamard block rotation
         no_had: Skip Hadamard transform if True
     """
-    from .utils.hadamard_utils import get_hadK, matmul_hadU_cpu, apply_exact_had_to_linear
+    from ..utils.hadamard_utils import get_hadK, matmul_hadU_cpu, apply_exact_had_to_linear
 
     W = layer.mlp.down_proj
     dtype = W.weight.data.dtype

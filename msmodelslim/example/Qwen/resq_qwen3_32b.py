@@ -258,7 +258,15 @@ def main():
             torch_dtype="auto",
             attn_implementation='eager'
         )
-        model_device = model.device if hasattr(model, 'device') else torch.device('cpu')
+        # Get the device of the embedding layer (where input_ids are sent first)
+        if hasattr(model, 'model') and hasattr(model.model, 'embed_tokens'):
+            model_device = model.model.embed_tokens.weight.device
+        elif hasattr(model, 'hf_device_map'):
+            # Use hf_device_map to find the first device
+            first_device = list(model.hf_device_map.values())[0]
+            model_device = torch.device(first_device) if isinstance(first_device, str) else first_device
+        else:
+            model_device = next(model.parameters()).device
 
     # Load calibration data
     print("Loading calibration data...")
@@ -396,10 +404,17 @@ def main():
         )
 
         # Re-prepare calibration data for the new model device
-        try:
-            model_device = next(model.parameters()).device
-        except StopIteration:
-            model_device = torch.device('cpu')
+        # Get the device of the embedding layer (where input_ids are sent first)
+        if hasattr(model, 'model') and hasattr(model.model, 'embed_tokens'):
+            model_device = model.model.embed_tokens.weight.device
+        elif hasattr(model, 'hf_device_map'):
+            first_device = list(model.hf_device_map.values())[0]
+            model_device = torch.device(first_device) if isinstance(first_device, str) else first_device
+        else:
+            try:
+                model_device = next(model.parameters()).device
+            except StopIteration:
+                model_device = torch.device('cpu')
         dataset_calib = get_calib_dataset_batch(
             tokenizer, calib_prompt, args.batch_size, args.seq_len, model_device
         )

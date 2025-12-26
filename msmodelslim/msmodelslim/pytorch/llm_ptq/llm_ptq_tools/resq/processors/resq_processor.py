@@ -110,6 +110,8 @@ def rotate_mlp_output(
         R4: Optional Hadamard block rotation
         no_had: Skip Hadamard transform if True
     """
+    from .utils.hadamard_utils import get_hadK, matmul_hadU_cpu, apply_exact_had_to_linear
+
     W = layer.mlp.down_proj
     dtype = W.weight.data.dtype
     dev = W.weight.device
@@ -136,8 +138,15 @@ def rotate_mlp_output(
             W_ = torch.matmul(W_, R4.cpu())
             W.weight.data = W_.reshape(W.weight.data.shape).to(dtype=dtype)
     else:
-        # Apply exact Hadamard on down_proj weights
-        apply_exact_had_to_linear(W, had_dim=-1, output=False)
+        # Apply exact Hadamard on down_proj weights only if dimension is supported
+        in_dim = W.weight.data.shape[-1]  # intermediate_size
+        try:
+            had_K, K = get_hadK(in_dim)
+            apply_exact_had_to_linear(W, had_dim=-1, output=False)
+        except AssertionError:
+            # Dimension not supported for Hadamard, skip
+            import logging
+            logging.warning(f"Skipping Hadamard on down_proj: intermediate_size={in_dim} not supported")
 
     if W.bias is not None:
         b = W.bias.data.to(dtype=torch.float64, device='cpu')

@@ -192,7 +192,15 @@ def compute_basis(
     hidden_dim = model.config.hidden_size
     num_heads = model.config.num_attention_heads
     num_kv_heads = getattr(model.config, 'num_key_value_heads', num_heads)
-    head_dim = hidden_dim // num_heads
+    # Get head_dim from config or compute from v_proj
+    head_dim = getattr(model.config, 'head_dim', None)
+    if head_dim is None:
+        # Try to get from first layer's v_proj
+        if hasattr(model, 'model') and hasattr(model.model, 'layers') and len(model.model.layers) > 0:
+            v_proj = model.model.layers[0].self_attn.v_proj
+            head_dim = v_proj.out_features // num_kv_heads
+        else:
+            head_dim = hidden_dim // num_heads
 
     # Get layers
     if hasattr(model, 'model') and hasattr(model.model, 'layers'):
@@ -201,7 +209,7 @@ def compute_basis(
         raise ValueError("Unsupported model architecture")
 
     nlayers = len(layers)
-    logger.info(f"Processing {nlayers} layers, hidden_dim={hidden_dim}, num_heads={num_heads}")
+    logger.info(f"Processing {nlayers} layers, hidden_dim={hidden_dim}, num_heads={num_heads}, num_kv_heads={num_kv_heads}, head_dim={head_dim}")
 
     # Move model to CPU first to free device memory
     model.cpu()

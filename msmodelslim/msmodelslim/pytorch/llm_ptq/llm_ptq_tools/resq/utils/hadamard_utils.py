@@ -448,19 +448,20 @@ def apply_exact_had_to_linear(
             hadK = get_hadamard_matrix(had_dim, device=torch.device("cpu")).to(torch.float64)
 
         if output:
-            # For output rotation, we rotate the OUTPUT dimension
-            # Weight shape: [in, out] -> we want to apply R to output columns
-            # W_new[:, i*had_dim:(i+1)*had_dim] = W[:, i*had_dim:(i+1)*had_dim] @ R[i]
-            init_shape = W_.shape  # [in, out]
-            out_dim = init_shape[-1]
+            # For output rotation on v_proj
+            # PyTorch Linear weight shape: [out_features, in_features]
+            # v_proj output: y = x @ W.T, we want y_new = y @ R
+            # So W_new = R.T @ W (apply R.T to first dimension)
+            init_shape = W_.shape  # [out, in]
+            out_dim = init_shape[0]  # out_features
 
             if per_head:
                 num_heads = hadK.shape[0]  # Use actual number of heads from rotation matrix
             else:
                 num_heads = out_dim // had_dim
 
-            # Reshape to [in, num_heads, had_dim]
-            temp = W_.reshape(init_shape[0], num_heads, had_dim)
+            # Reshape to [num_heads, had_dim, in_features]
+            temp = W_.reshape(num_heads, had_dim, init_shape[1])
 
             if B_ is not None:
                 bias_shape = B_.shape
@@ -468,29 +469,34 @@ def apply_exact_had_to_linear(
 
             if per_head:
                 for i in range(num_heads):
-                    temp[:, i, :] = temp[:, i, :].to(torch.float64) @ hadK[i]
+                    # Apply R.T to each head: temp[i] = R[i].T @ temp[i]
+                    temp[i] = hadK[i].t().to(torch.float64) @ temp[i].to(torch.float64)
                     if B_ is not None:
-                        temp_bias[i] = temp_bias[i].to(torch.float64) @ hadK[i]
+                        temp_bias[i] = hadK[i].t().to(torch.float64) @ temp_bias[i].to(torch.float64)
             else:
-                temp = temp.to(torch.float64) @ hadK
+                for i in range(num_heads):
+                    temp[i] = hadK.t().to(torch.float64) @ temp[i].to(torch.float64)
                 if B_ is not None:
-                    temp_bias = temp_bias.to(torch.float64) @ hadK
+                    temp_bias = (hadK.t().to(torch.float64) @ temp_bias.t()).t()
 
             W_ = temp.reshape(init_shape)
             if B_ is not None:
                 B_ = temp_bias.reshape(bias_shape)
         else:
-            # For input rotation, we rotate the INPUT dimension
-            # Weight shape: [out, in] -> we want to apply R^(-1).T to input rows
+            # For input rotation on o_proj
+            # PyTorch Linear weight shape: [out_features, in_features]
+            # We want to absorb R^(-1) into the weight
+            # y = x @ W.T, with x_new = x @ R, we need y = x_new @ R^(-1) @ W.T
+            # So W_new = W @ R^(-1).T (apply R^(-1).T to second dimension)
             init_shape = W_.shape  # [out, in]
-            in_dim = init_shape[-1]
+            in_dim = init_shape[1]  # in_features
 
             if per_head:
                 num_heads = hadK.shape[0]  # Use actual number of heads from rotation matrix
             else:
                 num_heads = in_dim // had_dim
 
-            # Reshape to [out, num_heads, had_dim]
+            # Reshape to [out_features, num_heads, had_dim]
             temp = W_.reshape(init_shape[0], num_heads, had_dim)
 
             if per_head:
@@ -498,10 +504,11 @@ def apply_exact_had_to_linear(
                     try:
                         inverse = torch.linalg.inv(hadK[i]).t()
                     except torch.linalg.LinAlgError:
-                        inverse = hadK[i]
+                        inverse = hadK[i].t()
                     temp[:, i, :] = temp[:, i, :].to(torch.float64) @ inverse
             else:
-                temp = temp.to(torch.float64) @ torch.linalg.inv(hadK).t()
+                inverse = torch.linalg.inv(hadK).t()
+                temp = temp.to(torch.float64) @ inverse
 
             W_ = temp.reshape(init_shape)
 

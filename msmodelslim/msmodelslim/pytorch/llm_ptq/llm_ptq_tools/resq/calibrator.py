@@ -107,9 +107,18 @@ class ResQCalibrator:
             # Generate rotations if not provided
             if self.rotation_dict is None:
                 self.logger.info("Generating random rotations...")
+                # Get correct head_dim from config or v_proj
+                num_kv_heads = getattr(model.config, 'num_key_value_heads', model.config.num_attention_heads)
+                head_dim = getattr(model.config, 'head_dim', None)
+                if head_dim is None:
+                    if hasattr(model, 'model') and hasattr(model.model, 'layers') and len(model.model.layers) > 0:
+                        v_proj = model.model.layers[0].self_attn.v_proj
+                        head_dim = v_proj.out_features // num_kv_heads
+                    else:
+                        head_dim = model.config.hidden_size // model.config.num_attention_heads
                 self.rotation_dict = generate_random_rotations(
                     hidden_dim=model.config.hidden_size,
-                    head_dim=model.config.hidden_size // model.config.num_attention_heads,
+                    head_dim=head_dim,
                     high_fraction=self.cfg.high_fraction,
                     low_fraction=self.cfg.low_fraction,
                     seed=self.cfg.seed,

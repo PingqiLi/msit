@@ -178,8 +178,25 @@ def rotate_ov_proj(
     v_proj = layer.self_attn.v_proj
     o_proj = layer.self_attn.o_proj
 
+    # v_proj: output dimension is num_kv_heads * head_dim
     apply_exact_had_to_linear(v_proj, had_dim=head_dim, output=True, R2=R2, per_head=per_head)
-    apply_exact_had_to_linear(o_proj, had_dim=head_dim, output=False, R2=R2, per_head=per_head)
+
+    # o_proj: input dimension is num_attention_heads * head_dim (not num_kv_heads!)
+    # For GQA, we need to replicate rotation matrices for Q heads sharing the same KV head
+    if R2 is not None and per_head:
+        num_kv_heads = R2.shape[0]
+        o_proj_in_dim = o_proj.weight.shape[1]  # [out, in] -> in_features
+        num_attention_heads = o_proj_in_dim // head_dim
+        if num_attention_heads > num_kv_heads:
+            # GQA case: replicate R2 for each Q head group
+            num_q_per_kv = num_attention_heads // num_kv_heads
+            # Repeat each rotation matrix num_q_per_kv times
+            R2_expanded = R2.repeat_interleave(num_q_per_kv, dim=0)
+            apply_exact_had_to_linear(o_proj, had_dim=head_dim, output=False, R2=R2_expanded, per_head=per_head)
+        else:
+            apply_exact_had_to_linear(o_proj, had_dim=head_dim, output=False, R2=R2, per_head=per_head)
+    else:
+        apply_exact_had_to_linear(o_proj, had_dim=head_dim, output=False, R2=R2, per_head=per_head)
 
 
 def rearrange_o_proj(

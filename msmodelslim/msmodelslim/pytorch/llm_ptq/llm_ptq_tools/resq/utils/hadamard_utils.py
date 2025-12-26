@@ -448,16 +448,25 @@ def apply_exact_had_to_linear(
             hadK = get_hadamard_matrix(had_dim, device=torch.device("cpu")).to(torch.float64)
 
         if output:
-            W_ = W_.t()
-            transposed_shape = W_.shape
-            temp = W_.reshape(-1, transposed_shape[-1] // had_dim, had_dim)
+            # For output rotation, we rotate the OUTPUT dimension
+            # Weight shape: [in, out] -> we want to apply R to output columns
+            # W_new[:, i*had_dim:(i+1)*had_dim] = W[:, i*had_dim:(i+1)*had_dim] @ R[i]
+            init_shape = W_.shape  # [in, out]
+            out_dim = init_shape[-1]
+
+            if per_head:
+                num_heads = hadK.shape[0]  # Use actual number of heads from rotation matrix
+            else:
+                num_heads = out_dim // had_dim
+
+            # Reshape to [in, num_heads, had_dim]
+            temp = W_.reshape(init_shape[0], num_heads, had_dim)
 
             if B_ is not None:
                 bias_shape = B_.shape
-                temp_bias = B_.reshape(transposed_shape[-1] // had_dim, had_dim)
+                temp_bias = B_.reshape(num_heads, had_dim)
 
             if per_head:
-                num_heads = transposed_shape[-1] // had_dim
                 for i in range(num_heads):
                     temp[:, i, :] = temp[:, i, :].to(torch.float64) @ hadK[i]
                     if B_ is not None:
@@ -467,24 +476,30 @@ def apply_exact_had_to_linear(
                 if B_ is not None:
                     temp_bias = temp_bias.to(torch.float64) @ hadK
 
-            W_ = temp.reshape(transposed_shape).t()
+            W_ = temp.reshape(init_shape)
             if B_ is not None:
                 B_ = temp_bias.reshape(bias_shape)
         else:
-            init_shape = W_.shape
-            temp = W_.reshape(-1, init_shape[-1] // had_dim, had_dim)
+            # For input rotation, we rotate the INPUT dimension
+            # Weight shape: [out, in] -> we want to apply R^(-1).T to input rows
+            init_shape = W_.shape  # [out, in]
+            in_dim = init_shape[-1]
 
             if per_head:
-                num_kv_heads = hadK.shape[0]
-                num_kv_groups = init_shape[0] // (had_dim * num_kv_heads)
-                for i in range(num_kv_heads):
-                    for j in range(num_kv_groups):
-                        idx = j + num_kv_groups * i
-                        try:
-                            inverse = torch.linalg.inv(hadK[i]).t()
-                        except torch.linalg.LinAlgError:
-                            inverse = hadK[i]
-                        temp[:, idx, :] = temp[:, idx, :].to(torch.float64) @ inverse
+                num_heads = hadK.shape[0]  # Use actual number of heads from rotation matrix
+            else:
+                num_heads = in_dim // had_dim
+
+            # Reshape to [out, num_heads, had_dim]
+            temp = W_.reshape(init_shape[0], num_heads, had_dim)
+
+            if per_head:
+                for i in range(num_heads):
+                    try:
+                        inverse = torch.linalg.inv(hadK[i]).t()
+                    except torch.linalg.LinAlgError:
+                        inverse = hadK[i]
+                    temp[:, i, :] = temp[:, i, :].to(torch.float64) @ inverse
             else:
                 temp = temp.to(torch.float64) @ torch.linalg.inv(hadK).t()
 

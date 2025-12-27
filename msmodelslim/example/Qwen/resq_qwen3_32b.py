@@ -266,7 +266,14 @@ def main():
             first_device = list(model.hf_device_map.values())[0]
             model_device = torch.device(first_device) if isinstance(first_device, str) else first_device
         else:
-            model_device = next(model.parameters()).device
+            # Fallback to explicitly use the configured device
+            if args.dev_type == 'npu':
+                model_device = torch.device(f'npu:{args.dev_id}')
+            elif args.dev_type == 'cuda':
+                model_device = torch.device(f'cuda:{args.dev_id}')
+            else:
+                model_device = next(model.parameters()).device
+        print(f"Detected model device for calibration data: {model_device}")
 
     # Load calibration data
     print("Loading calibration data...")
@@ -411,10 +418,17 @@ def main():
             first_device = list(model.hf_device_map.values())[0]
             model_device = torch.device(first_device) if isinstance(first_device, str) else first_device
         else:
-            try:
-                model_device = next(model.parameters()).device
-            except StopIteration:
-                model_device = torch.device('cpu')
+            # Fallback to explicitly use the configured device
+            if args.dev_type == 'npu':
+                model_device = torch.device(f'npu:{args.dev_id}')
+            elif args.dev_type == 'cuda':
+                model_device = torch.device(f'cuda:{args.dev_id}')
+            else:
+                try:
+                    model_device = next(model.parameters()).device
+                except StopIteration:
+                    model_device = torch.device('cpu')
+        print(f"Detected model device for calibration data (after reload): {model_device}")
         dataset_calib = get_calib_dataset_batch(
             tokenizer, calib_prompt, args.batch_size, args.seq_len, model_device
         )

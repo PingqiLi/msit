@@ -90,9 +90,6 @@ class ResQWeightQuantizer(nn.Module):
 
             weight_low = weight[:, :self.low_dim]   # [out_features, low_dim]
             weight_high = weight[:, self.low_dim:]  # [out_features, high_dim]
-
-            # Per-column quantization (min/max along dim=0)
-            quant_dim = 0
             cat_dim = 1
         else:
             # Split along out_features (rows)
@@ -103,10 +100,11 @@ class ResQWeightQuantizer(nn.Module):
 
             weight_low = weight[:self.low_dim, :]   # [low_dim, in_features]
             weight_high = weight[self.low_dim:, :]  # [high_dim, in_features]
-
-            # Per-row quantization (min/max along dim=1)
-            quant_dim = 1
             cat_dim = 0
+
+        # Always use per-row quantization (dim=1) for weight quantization
+        # Scale shape will be [num_rows, 1]
+        quant_dim = 1
 
         # Quantize low precision part (4-bit)
         if self.low_dim > 0:

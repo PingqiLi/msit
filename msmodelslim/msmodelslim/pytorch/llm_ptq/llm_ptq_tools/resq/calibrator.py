@@ -313,7 +313,7 @@ class ResQCalibrator:
                     weight_dict[f"{name}.weight_low"] = quant_weights['weight_low']
                     weight_dict[f"{name}.scale_low"] = quant_weights['scale_low']
                     weight_dict[f"{name}.offset_low"] = quant_weights['offset_low']
-                    quant_description[f"{name}.weight_low"] = f"W{self.cfg.low_bits}"
+                    quant_description[f"{name}.weight_low"] = "RESQ"
                     quant_description[f"{name}.scale_low"] = "FLOAT"
                     quant_description[f"{name}.offset_low"] = "FLOAT"
 
@@ -322,7 +322,7 @@ class ResQCalibrator:
                     weight_dict[f"{name}.weight_high"] = quant_weights['weight_high']
                     weight_dict[f"{name}.scale_high"] = quant_weights['scale_high']
                     weight_dict[f"{name}.offset_high"] = quant_weights['offset_high']
-                    quant_description[f"{name}.weight_high"] = f"W{self.cfg.high_bits}"
+                    quant_description[f"{name}.weight_high"] = "RESQ"
                     quant_description[f"{name}.scale_high"] = "FLOAT"
                     quant_description[f"{name}.offset_high"] = "FLOAT"
 

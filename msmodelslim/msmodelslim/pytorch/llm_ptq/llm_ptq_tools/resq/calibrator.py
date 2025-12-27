@@ -152,9 +152,26 @@ class ResQCalibrator:
             skip_names=skip_names,
         )
 
-        # Move model back to the target device after all transformations
-        # The transformations (fuse, rotate, rearrange, quantize) may have moved weights to CPU
+        # Remove accelerate hooks and move model to single device
+        # The transformations may have moved weights to CPU, and accelerate hooks
+        # can cause device mismatches when model was loaded with device_map="auto"
         self.logger.info(f"Moving model to device: {self.device}")
+
+        # Remove accelerate hooks if present
+        try:
+            from accelerate.hooks import remove_hook_from_module
+            for name, module in model.named_modules():
+                remove_hook_from_module(module, recurse=False)
+            self.logger.info("Removed accelerate hooks from model")
+        except Exception as e:
+            self.logger.info(f"No accelerate hooks to remove or error: {e}")
+
+        # Clear the device map
+        if hasattr(model, 'hf_device_map'):
+            model.hf_device_map = None
+            self.logger.info("Cleared hf_device_map")
+
+        # Move entire model to target device
         model = model.to(self.device)
 
         return model

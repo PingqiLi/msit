@@ -152,6 +152,11 @@ class ResQCalibrator:
             skip_names=skip_names,
         )
 
+        # Move model back to the target device after all transformations
+        # The transformations (fuse, rotate, rearrange, quantize) may have moved weights to CPU
+        self.logger.info(f"Moving model to device: {self.device}")
+        model = model.to(self.device)
+
         return model
 
     @torch.no_grad()

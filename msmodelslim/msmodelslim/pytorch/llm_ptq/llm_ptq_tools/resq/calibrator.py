@@ -160,6 +160,32 @@ class ResQCalibrator:
         self.logger.info("Starting ResQ calibration...")
         self.model.eval()
 
+        # Debug: Print model state before calibration
+        self.logger.info("=" * 60)
+        self.logger.info("[DEBUG] Model state before calibration:")
+        self.logger.info(f"[DEBUG] self.device = {self.device}")
+        if hasattr(self.model, 'model') and hasattr(self.model.model, 'embed_tokens'):
+            self.logger.info(f"[DEBUG] embed_tokens.weight.device = {self.model.model.embed_tokens.weight.device}")
+            self.logger.info(f"[DEBUG] embed_tokens.weight.dtype = {self.model.model.embed_tokens.weight.dtype}")
+        if hasattr(self.model, 'hf_device_map'):
+            self.logger.info(f"[DEBUG] hf_device_map = {self.model.hf_device_map}")
+
+        # Check first few layers
+        if hasattr(self.model, 'model') and hasattr(self.model.model, 'layers'):
+            for i, layer in enumerate(self.model.model.layers[:2]):
+                if hasattr(layer, 'self_attn') and hasattr(layer.self_attn, 'q_proj'):
+                    self.logger.info(f"[DEBUG] layer {i} q_proj.weight.device = {layer.self_attn.q_proj.weight.device}")
+                break
+
+        # Check calib_data
+        if self.calib_data and len(self.calib_data) > 0:
+            first_batch = self.calib_data[0]
+            if isinstance(first_batch, (tuple, list)):
+                self.logger.info(f"[DEBUG] calib_data[0] devices = {[t.device if hasattr(t, 'device') else type(t) for t in first_batch]}")
+            elif isinstance(first_batch, dict):
+                self.logger.info(f"[DEBUG] calib_data[0] devices = {[(k, v.device if hasattr(v, 'device') else type(v)) for k, v in first_batch.items()]}")
+        self.logger.info("=" * 60)
+
         if not self.calib_data:
             self.logger.info("No calibration data provided, running data-free mode")
             self._run_datafree_mode()
@@ -180,14 +206,25 @@ class ResQCalibrator:
         embed_device = self.device
         self.logger.info(f"Moving calibration data to device: {embed_device}")
 
-        for data in tqdm(self.calib_data, desc="Calibrating"):
+        for idx, data in enumerate(tqdm(self.calib_data, desc="Calibrating")):
             if isinstance(data, (tuple, list)):
                 # Move tensors to the correct device
                 data = tuple(t.to(embed_device) if isinstance(t, torch.Tensor) else t for t in data)
+                # Debug first iteration
+                if idx == 0:
+                    self.logger.info(f"[DEBUG] First batch after .to({embed_device}):")
+                    self.logger.info(f"[DEBUG] input tensors devices: {[t.device if isinstance(t, torch.Tensor) else type(t) for t in data]}")
+                    self.logger.info(f"[DEBUG] input tensors shapes: {[t.shape if isinstance(t, torch.Tensor) else None for t in data]}")
+                    # Check model's embed_tokens device right before forward
+                    if hasattr(self.model, 'model') and hasattr(self.model.model, 'embed_tokens'):
+                        self.logger.info(f"[DEBUG] RIGHT BEFORE FORWARD: embed_tokens.weight.device = {self.model.model.embed_tokens.weight.device}")
                 self.model(*data)
             elif isinstance(data, dict):
                 # Move tensors to the correct device
                 data = {k: v.to(embed_device) if isinstance(v, torch.Tensor) else v for k, v in data.items()}
+                if idx == 0:
+                    self.logger.info(f"[DEBUG] First batch after .to({embed_device}):")
+                    self.logger.info(f"[DEBUG] input tensors: {[(k, v.device, v.shape) if isinstance(v, torch.Tensor) else (k, type(v)) for k, v in data.items()]}")
                 self.model(**data)
 
     def _run_datafree_mode(self) -> None:

@@ -139,10 +139,11 @@ def custom_hook(model_config):
 
 def get_calib_dataset_batch(model_tokenizer, calib_list, batch_size, seq_len, device="npu"):
     """Prepare calibration dataset in batches."""
+    print(f"[DEBUG] get_calib_dataset_batch called with device={device}")
     calib_dataset = []
     calib_list = [calib_list[i:i + batch_size] for i in range(0, len(calib_list), batch_size)]
 
-    for calib_data in calib_list:
+    for idx, calib_data in enumerate(calib_list):
         inputs = model_tokenizer(
             calib_data,
             return_tensors='pt',
@@ -150,9 +151,11 @@ def get_calib_dataset_batch(model_tokenizer, calib_list, batch_size, seq_len, de
             truncation=True,
             max_length=seq_len
         ).to(device)
-        calib_dataset.append(
-            [value.to(device) for key, value in inputs.data.items() if isinstance(value, torch.Tensor)]
-        )
+        batch_tensors = [value.to(device) for key, value in inputs.data.items() if isinstance(value, torch.Tensor)]
+        calib_dataset.append(batch_tensors)
+        if idx == 0:
+            # Debug print for first batch
+            print(f"[DEBUG] First batch tensor devices: {[t.device for t in batch_tensors]}")
     return calib_dataset
 
 
@@ -440,6 +443,18 @@ def main():
             disable_names.append(name)
 
     print(f"Layers to skip: {disable_names}")
+
+    # Debug: Check model embedding device and calibration data devices
+    print("=" * 60)
+    print("[DEBUG] Device verification before calibration:")
+    if hasattr(model, 'model') and hasattr(model.model, 'embed_tokens'):
+        print(f"[DEBUG] model.model.embed_tokens.weight.device = {model.model.embed_tokens.weight.device}")
+    if hasattr(model, 'hf_device_map'):
+        print(f"[DEBUG] model.hf_device_map = {model.hf_device_map}")
+    if dataset_calib and len(dataset_calib) > 0:
+        first_batch = dataset_calib[0]
+        print(f"[DEBUG] First calib batch devices: {[t.device for t in first_batch]}")
+    print("=" * 60)
 
     # Create ResQ calibrator
     print("Initializing ResQ calibrator...")

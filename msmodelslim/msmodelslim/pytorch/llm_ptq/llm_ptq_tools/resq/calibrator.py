@@ -311,7 +311,7 @@ class ResQCalibrator:
             if isinstance(module, LinearResQQuantizer):
                 if any(proj in name for proj in ['q_proj', 'k_proj', 'v_proj', 'o_proj']):
                     quant_weights = module.get_quant_weights()
-                    self.logger.info(f"[DEBUG] {name}:")
+                    self.logger.info(f"[DEBUG] {name} (split_dim={module.split_dim}):")
                     self.logger.info(f"  original weight shape: [{module.out_features}, {module.in_features}]")
                     if 'weight_low' in quant_weights:
                         self.logger.info(f"  weight_low shape: {quant_weights['weight_low'].shape}")

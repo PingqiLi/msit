@@ -33,6 +33,7 @@ class ResQWeightQuantizer(nn.Module):
         low_bits: int = 4,
         high_fraction: float = 0.125,
         is_sym: bool = True,
+        split_dim: int = 1,  # 1 for input projections, 0 for output projections
         logger=None,
     ):
         super().__init__()
@@ -40,6 +41,7 @@ class ResQWeightQuantizer(nn.Module):
         self.low_bits = low_bits
         self.high_fraction = high_fraction
         self.is_sym = is_sym
+        self.split_dim = split_dim  # dimension to split: 0 for rows, 1 for columns
         self.logger = logger
 
         # Quantization parameters for each precision level
@@ -75,18 +77,41 @@ class ResQWeightQuantizer(nn.Module):
         Returns:
             Tuple of (quantized_weight, high_weight, low_weight)
         """
-        out_features = weight.shape[0]
-        self.compute_dimensions(out_features)
+        # Determine split dimension based on layer type
+        # split_dim=1: split along in_features (columns) for input projections (q,k,v,up,gate)
+        # split_dim=0: split along out_features (rows) for output projections (o,down)
 
-        # Split weight into low and high precision regions
-        # ResQ layout: [low_precision_dims | high_precision_dims]
-        weight_low = weight[:self.low_dim, :]
-        weight_high = weight[self.low_dim:, :]
+        if self.split_dim == 1:
+            # Split along in_features (columns)
+            out_features, in_features = weight.shape
+            self.total_dim = in_features
+            self.high_dim = int(self.high_fraction * in_features)
+            self.low_dim = in_features - self.high_dim
+
+            weight_low = weight[:, :self.low_dim]   # [out_features, low_dim]
+            weight_high = weight[:, self.low_dim:]  # [out_features, high_dim]
+
+            # Per-column quantization (min/max along dim=0)
+            quant_dim = 0
+            cat_dim = 1
+        else:
+            # Split along out_features (rows)
+            out_features, in_features = weight.shape
+            self.total_dim = out_features
+            self.high_dim = int(self.high_fraction * out_features)
+            self.low_dim = out_features - self.high_dim
+
+            weight_low = weight[:self.low_dim, :]   # [low_dim, in_features]
+            weight_high = weight[self.low_dim:, :]  # [high_dim, in_features]
+
+            # Per-row quantization (min/max along dim=1)
+            quant_dim = 1
+            cat_dim = 0
 
         # Quantize low precision part (4-bit)
         if self.low_dim > 0:
-            low_min = weight_low.min(dim=1, keepdim=True)[0]
-            low_max = weight_low.max(dim=1, keepdim=True)[0]
+            low_min = weight_low.min(dim=quant_dim, keepdim=True)[0]
+            low_max = weight_low.max(dim=quant_dim, keepdim=True)[0]
             self.low_weight_scale, self.low_weight_offset = linear_quantization_params(
                 self.low_bits, low_min, low_max,
                 integral_zero_point=True, q_signed=True, sym=self.is_sym
@@ -100,8 +125,8 @@ class ResQWeightQuantizer(nn.Module):
 
         # Quantize high precision part (8-bit)
         if self.high_dim > 0:
-            high_min = weight_high.min(dim=1, keepdim=True)[0]
-            high_max = weight_high.max(dim=1, keepdim=True)[0]
+            high_min = weight_high.min(dim=quant_dim, keepdim=True)[0]
+            high_max = weight_high.max(dim=quant_dim, keepdim=True)[0]
             self.high_weight_scale, self.high_weight_offset = linear_quantization_params(
                 self.high_bits, high_min, high_max,
                 integral_zero_point=True, q_signed=True, sym=self.is_sym
@@ -115,7 +140,7 @@ class ResQWeightQuantizer(nn.Module):
 
         # Combine quantized weights
         if self.low_dim > 0 and self.high_dim > 0:
-            quantized_weight = torch.cat([weight_low_quant, weight_high_quant], dim=0)
+            quantized_weight = torch.cat([weight_low_quant, weight_high_quant], dim=cat_dim)
         elif self.high_dim > 0:
             quantized_weight = weight_high_quant
         else:
@@ -131,8 +156,9 @@ class ResQWeightQuantizer(nn.Module):
             return quantized_weight
 
         # Use cached quantized weights
+        cat_dim = 1 if self.split_dim == 1 else 0
         if self.low_weight is not None and self.high_weight is not None:
-            return torch.cat([self.low_weight, self.high_weight], dim=0)
+            return torch.cat([self.low_weight, self.high_weight], dim=cat_dim)
         elif self.high_weight is not None:
             return self.high_weight
         else:
@@ -249,6 +275,7 @@ class LinearResQQuantizer(nn.Module):
         high_bits: int = 8,
         low_bits: int = 4,
         high_fraction: float = 0.125,
+        split_dim: int = 1,  # 1 for input projections (q,k,v,up,gate), 0 for output projections (o,down)
     ):
         super().__init__()
         self.cfg = cfg
@@ -256,6 +283,7 @@ class LinearResQQuantizer(nn.Module):
         self.high_bits = high_bits
         self.low_bits = low_bits
         self.high_fraction = high_fraction
+        self.split_dim = split_dim
 
         # Linear layer parameters
         self.in_features = None
@@ -269,6 +297,7 @@ class LinearResQQuantizer(nn.Module):
             low_bits=low_bits,
             high_fraction=high_fraction,
             is_sym=getattr(cfg, 'w_sym', True) if cfg else True,
+            split_dim=split_dim,
             logger=logger,
         )
 
@@ -378,6 +407,17 @@ def add_resq_quantizers(model: nn.Module, cfg=None, logger=None,
     """
     skip_names = skip_names or []
 
+    # Output projections split along out_features (dim=0)
+    # Input projections split along in_features (dim=1)
+    output_proj_names = ['o_proj', 'down_proj']
+
+    def _is_output_projection(name: str) -> bool:
+        """Check if layer is an output projection (o_proj, down_proj)."""
+        for proj_name in output_proj_names:
+            if proj_name in name:
+                return True
+        return False
+
     def _set_module(ori_mod, submodule_key, module):
         tokens = submodule_key.split('.')
         sub_tokens = tokens[:-1]
@@ -390,12 +430,18 @@ def add_resq_quantizers(model: nn.Module, cfg=None, logger=None,
         if name in skip_names:
             continue
         if isinstance(mod, nn.Linear):
+            # Determine split dimension based on layer type
+            # Output projections (o_proj, down_proj): split along out_features (dim=0)
+            # Input projections (q_proj, k_proj, v_proj, up_proj, gate_proj): split along in_features (dim=1)
+            split_dim = 0 if _is_output_projection(name) else 1
+
             quant_mod = LinearResQQuantizer(
                 cfg=cfg,
                 logger=logger,
                 high_bits=high_bits,
                 low_bits=low_bits,
                 high_fraction=high_fraction,
+                split_dim=split_dim,
             )
             quant_mod.set_param(mod)
             _set_module(model, name, quant_mod)

@@ -304,12 +304,13 @@ class ResQCalibrator:
             "high_fraction": self.cfg.high_fraction,
         }
 
-        # Debug: Print shapes of attention weights
+        # Debug: Print shapes of attention and MLP weights
         self.logger.info("=" * 60)
-        self.logger.info("[DEBUG] Checking attention weight shapes:")
+        self.logger.info("[DEBUG] Checking weight shapes (layer 0):")
         for name, module in self.model.named_modules():
             if isinstance(module, LinearResQQuantizer):
-                if any(proj in name for proj in ['q_proj', 'k_proj', 'v_proj', 'o_proj']):
+                # Print all projection layers in layer 0
+                if 'layers.0' in name and any(proj in name for proj in ['q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_proj', 'up_proj', 'down_proj']):
                     quant_weights = module.get_quant_weights()
                     self.logger.info(f"[DEBUG] {name} (split_dim={module.split_dim}):")
                     self.logger.info(f"  original weight shape: [{module.out_features}, {module.in_features}]")
@@ -319,11 +320,6 @@ class ResQCalibrator:
                     if 'weight_high' in quant_weights:
                         self.logger.info(f"  weight_high shape: {quant_weights['weight_high'].shape}")
                         self.logger.info(f"  scale_high shape: {quant_weights['scale_high'].shape}")
-                    # Only print first layer for brevity
-                    if 'layers.0' in name:
-                        continue
-                    else:
-                        break
         self.logger.info("=" * 60)
 
         for name, module in self.model.named_modules():
@@ -360,6 +356,77 @@ class ResQCalibrator:
                 if module.bias is not None:
                     weight_dict[f"{name}.bias"] = module.bias.data.cpu()
                     quant_description[f"{name}.bias"] = "FLOAT"
+
+        # Save online rotation matrices (Uc for Q/K after RoPE, Ud for down_proj)
+        if self.rotation_dict is not None and not self._use_simplified_mode:
+            self.logger.info("Saving online rotation matrices...")
+
+            # Build Uc (online rotation for Q/K after RoPE) from R1
+            # Uc is the combined rotation matrix for hidden dimension
+            R1_1 = self.rotation_dict.get('R1_1')
+            R1_2 = self.rotation_dict.get('R1_2')
+            R1_0 = self.rotation_dict.get('R1_0')
+
+            if R1_1 is not None and R1_2 is not None:
+                Uc = torch.block_diag(R1_1.float(), R1_2.float())
+                if R1_0 is not None:
+                    Uc = torch.block_diag(R1_0.float(), Uc)
+                weight_dict['resq.Uc'] = Uc.cpu()
+                quant_description['resq.Uc'] = "FLOAT"
+                self.logger.info(f"  Uc shape: {Uc.shape}")
+
+            # Build Ud (online rotation for down_proj input) - typically Hadamard
+            # Get intermediate size from model config
+            intermediate_size = getattr(self.model.config, 'intermediate_size', None)
+            if intermediate_size is not None:
+                try:
+                    from .utils.hadamard_utils import get_hadK
+                    had_K, K = get_hadK(intermediate_size)
+                    if had_K is not None:
+                        # Ud is the Hadamard matrix
+                        weight_dict['resq.Ud'] = had_K.float().cpu()
+                        weight_dict['resq.Ud_K'] = torch.tensor([K])
+                        quant_description['resq.Ud'] = "FLOAT"
+                        quant_description['resq.Ud_K'] = "INT"
+                        self.logger.info(f"  Ud (Hadamard) shape: {had_K.shape}, K={K}")
+                except Exception as e:
+                    self.logger.warning(f"  Could not compute Ud Hadamard: {e}")
+
+            # Save R2 for value/output projection rotations
+            R2_1 = self.rotation_dict.get('R2_1')
+            R2_2 = self.rotation_dict.get('R2_2')
+            R2_0 = self.rotation_dict.get('R2_0')
+
+            if R2_1 is not None and R2_2 is not None:
+                R2 = torch.block_diag(R2_1.float(), R2_2.float())
+                if R2_0 is not None:
+                    R2 = torch.block_diag(R2_0.float(), R2)
+                weight_dict['resq.R2'] = R2.cpu()
+                quant_description['resq.R2'] = "FLOAT"
+                self.logger.info(f"  R2 (per-head) shape: {R2.shape}")
+
+            # Save per-layer value basis rotations if available
+            if self.basis_dict is not None:
+                nlayers = len([k for k in self.basis_dict.keys() if 'self_attn.value' in k])
+                for i in range(nlayers):
+                    key = f'layer.{i}.self_attn.value'
+                    if key in self.basis_dict:
+                        U_value = self.basis_dict[key]
+                        # Combine with R2 to get the full online rotation
+                        if R2_1 is not None and R2_2 is not None:
+                            R2_full = torch.block_diag(R2_1.to(torch.float64), R2_2.to(torch.float64))
+                            if R2_0 is not None:
+                                R2_full = torch.block_diag(R2_0.to(torch.float64), R2_full)
+                            # U_value is per-head: [num_heads, head_dim, head_dim]
+                            # Apply R2 to each head
+                            U_value_R2 = torch.matmul(U_value.to(torch.float64), R2_full)
+                            weight_dict[f'resq.layer.{i}.U_value'] = U_value_R2.float().cpu()
+                            quant_description[f'resq.layer.{i}.U_value'] = "FLOAT"
+                        else:
+                            weight_dict[f'resq.layer.{i}.U_value'] = U_value.float().cpu()
+                            quant_description[f'resq.layer.{i}.U_value'] = "FLOAT"
+                if nlayers > 0:
+                    self.logger.info(f"  Saved {nlayers} per-layer U_value matrices")
 
         # Save using SafeTensors
         if "safe_tensor" in save_type:

@@ -174,27 +174,20 @@ class ResQCalibrator:
         """Run calibration with data."""
         self.logger.info(f"Running calibration with {len(self.calib_data)} samples...")
 
-        # Get the device of the embedding layer for input tensors
-        embed_device = None
-        if hasattr(self.model, 'model') and hasattr(self.model.model, 'embed_tokens'):
-            embed_device = self.model.model.embed_tokens.weight.device
-        elif hasattr(self.model, 'hf_device_map'):
-            first_device = list(self.model.hf_device_map.values())[0]
-            embed_device = torch.device(first_device) if isinstance(first_device, str) else first_device
-
-        if embed_device is not None:
-            self.logger.info(f"Moving calibration data to device: {embed_device}")
+        # Use the configured device (self.device) for input tensors
+        # Note: We use self.device instead of detecting from model.embed_tokens
+        # because _prepare_model may have moved layers during transformation
+        embed_device = self.device
+        self.logger.info(f"Moving calibration data to device: {embed_device}")
 
         for data in tqdm(self.calib_data, desc="Calibrating"):
             if isinstance(data, (tuple, list)):
-                # Move tensors to the correct device if needed
-                if embed_device is not None:
-                    data = tuple(t.to(embed_device) if isinstance(t, torch.Tensor) else t for t in data)
+                # Move tensors to the correct device
+                data = tuple(t.to(embed_device) if isinstance(t, torch.Tensor) else t for t in data)
                 self.model(*data)
             elif isinstance(data, dict):
-                # Move tensors to the correct device if needed
-                if embed_device is not None:
-                    data = {k: v.to(embed_device) if isinstance(v, torch.Tensor) else v for k, v in data.items()}
+                # Move tensors to the correct device
+                data = {k: v.to(embed_device) if isinstance(v, torch.Tensor) else v for k, v in data.items()}
                 self.model(**data)
 
     def _run_datafree_mode(self) -> None:

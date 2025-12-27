@@ -304,6 +304,28 @@ class ResQCalibrator:
             "high_fraction": self.cfg.high_fraction,
         }
 
+        # Debug: Print shapes of attention weights
+        self.logger.info("=" * 60)
+        self.logger.info("[DEBUG] Checking attention weight shapes:")
+        for name, module in self.model.named_modules():
+            if isinstance(module, LinearResQQuantizer):
+                if any(proj in name for proj in ['q_proj', 'k_proj', 'v_proj', 'o_proj']):
+                    quant_weights = module.get_quant_weights()
+                    self.logger.info(f"[DEBUG] {name}:")
+                    self.logger.info(f"  original weight shape: [{module.out_features}, {module.in_features}]")
+                    if 'weight_low' in quant_weights:
+                        self.logger.info(f"  weight_low shape: {quant_weights['weight_low'].shape}")
+                        self.logger.info(f"  scale_low shape: {quant_weights['scale_low'].shape}")
+                    if 'weight_high' in quant_weights:
+                        self.logger.info(f"  weight_high shape: {quant_weights['weight_high'].shape}")
+                        self.logger.info(f"  scale_high shape: {quant_weights['scale_high'].shape}")
+                    # Only print first layer for brevity
+                    if 'layers.0' in name:
+                        continue
+                    else:
+                        break
+        self.logger.info("=" * 60)
+
         for name, module in self.model.named_modules():
             if isinstance(module, LinearResQQuantizer):
                 quant_weights = module.get_quant_weights()

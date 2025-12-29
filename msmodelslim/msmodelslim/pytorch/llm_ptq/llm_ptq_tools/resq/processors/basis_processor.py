@@ -457,8 +457,14 @@ def compute_basis(
         # Swap inputs and outputs for next layer
         inps, outs = outs, [None] * nbatches
 
-    # ========== Step 4: Eigenvalue decomposition ==========
-    logger.info("Performing eigenvalue decomposition...")
+    # ========== Step 4: Eigenvalue decomposition (per-layer mode) ==========
+    logger.info("=" * 60)
+    logger.info("Starting eigenvalue decomposition (per-layer mode)...")
+    logger.info(f"Total layers: {nlayers}")
+    logger.info(f"Matrices per layer: attn [{hidden_dim}x{hidden_dim}], mlp [{hidden_dim}x{hidden_dim}], "
+                f"value [{num_kv_heads}x{head_dim}x{head_dim}], key_pos [{head_dim}x{head_dim}], "
+                f"down_proj [{intermediate_size}x{intermediate_size}]")
+    logger.info("=" * 60)
 
     basis_dict = {}
     eval_dict = {}
@@ -466,96 +472,56 @@ def compute_basis(
     # Normalize covariances
     normalizer = nbatches * seqlen if seqlen > 0 else 1
 
-    rotation_granularity = getattr(config, 'rotation_granularity', 'full_shared')
+    # Per-layer basis computation
+    for i in range(nlayers):
+        logger.info(f"[Layer {i+1}/{nlayers}] Starting eigendecomposition...")
 
-    if 'per_layer' in rotation_granularity.lower():
-        # Per-layer basis
-        for i in tqdm(range(nlayers), desc="Eigendecomp per layer"):
-            # Attention basis
-            eval_attn, evec_attn = perform_eigen_decomp(H_attn[i] / normalizer)
-            basis_dict[f'layer.{i}.self_attn'] = evec_attn
-            eval_dict[f'layer.{i}.self_attn'] = eval_attn
+        # Attention basis
+        logger.info(f"  [Layer {i+1}] Computing attention basis [{hidden_dim}x{hidden_dim}]...")
+        eval_attn, evec_attn = perform_eigen_decomp(H_attn[i] / normalizer)
+        basis_dict[f'layer.{i}.self_attn'] = evec_attn
+        eval_dict[f'layer.{i}.self_attn'] = eval_attn
+        logger.info(f"  [Layer {i+1}] Attention basis done. Eigenvalue range: [{eval_attn.min():.6e}, {eval_attn.max():.6e}]")
 
-            # MLP basis
-            eval_mlp, evec_mlp = perform_eigen_decomp(H_mlp[i] / normalizer)
-            basis_dict[f'layer.{i}.mlp'] = evec_mlp
-            eval_dict[f'layer.{i}.mlp'] = eval_mlp
+        # MLP basis
+        logger.info(f"  [Layer {i+1}] Computing MLP basis [{hidden_dim}x{hidden_dim}]...")
+        eval_mlp, evec_mlp = perform_eigen_decomp(H_mlp[i] / normalizer)
+        basis_dict[f'layer.{i}.mlp'] = evec_mlp
+        eval_dict[f'layer.{i}.mlp'] = eval_mlp
+        logger.info(f"  [Layer {i+1}] MLP basis done. Eigenvalue range: [{eval_mlp.min():.6e}, {eval_mlp.max():.6e}]")
 
-            # Value basis (per head)
-            eval_value, evec_value = perform_eigen_decomp(
-                H_value[i] / normalizer, per_head=True, num_heads=num_kv_heads
-            )
-            basis_dict[f'layer.{i}.self_attn.value'] = evec_value
-            eval_dict[f'layer.{i}.self_attn.value'] = eval_value
+        # Value basis (per head)
+        logger.info(f"  [Layer {i+1}] Computing value basis [{num_kv_heads} heads x {head_dim}x{head_dim}]...")
+        eval_value, evec_value = perform_eigen_decomp(
+            H_value[i] / normalizer, per_head=True, num_heads=num_kv_heads
+        )
+        basis_dict[f'layer.{i}.self_attn.value'] = evec_value
+        eval_dict[f'layer.{i}.self_attn.value'] = eval_value
+        logger.info(f"  [Layer {i+1}] Value basis done.")
 
-            # Key position basis (per head) - for Uc computation
-            eval_key_pos, evec_key_pos = perform_eigen_decomp(
-                H_key_pos[i] / normalizer, per_head=True, num_heads=num_kv_heads
-            )
-            basis_dict[f'layer.{i}.self_attn.key_pos'] = evec_key_pos
-            eval_dict[f'layer.{i}.self_attn.key_pos'] = eval_key_pos
+        # Key position basis (sum across heads) - for Uc computation
+        logger.info(f"  [Layer {i+1}] Computing key_pos basis (for Uc) [{head_dim}x{head_dim}]...")
+        eval_key_pos, evec_key_pos = perform_eigen_decomp(
+            H_key_pos[i].sum(0) / (num_kv_heads * normalizer)
+        )
+        basis_dict[f'layer.{i}.self_attn.key_pos'] = evec_key_pos
+        eval_dict[f'layer.{i}.self_attn.key_pos'] = eval_key_pos
+        logger.info(f"  [Layer {i+1}] Key_pos basis done. Eigenvalue range: [{eval_key_pos.min():.6e}, {eval_key_pos.max():.6e}]")
 
-            # Down_proj basis - for Ud computation
-            eval_down_proj, evec_down_proj = perform_eigen_decomp(H_down_proj[i] / normalizer)
-            basis_dict[f'layer.{i}.mlp.down_proj'] = evec_down_proj
-            eval_dict[f'layer.{i}.mlp.down_proj'] = eval_down_proj
+        # Down_proj basis - for Ud computation
+        logger.info(f"  [Layer {i+1}] Computing down_proj basis (for Ud) [{intermediate_size}x{intermediate_size}]...")
+        eval_down_proj, evec_down_proj = perform_eigen_decomp(H_down_proj[i] / normalizer)
+        basis_dict[f'layer.{i}.mlp.down_proj'] = evec_down_proj
+        eval_dict[f'layer.{i}.mlp.down_proj'] = eval_down_proj
+        logger.info(f"  [Layer {i+1}] Down_proj basis done. Eigenvalue range: [{eval_down_proj.min():.6e}, {eval_down_proj.max():.6e}]")
 
-    elif 'full_shared' in rotation_granularity.lower():
-        # Combined basis for all layers
-        H_combined = (H_attn.sum(0) + H_mlp.sum(0)) / (2 * nlayers * normalizer)
-        eval_combined, evec_combined = perform_eigen_decomp(H_combined)
-        basis_dict['attn_mlp'] = evec_combined
-        eval_dict['attn_mlp'] = eval_combined
+        logger.info(f"[Layer {i+1}/{nlayers}] Complete!")
+        cleanup_memory()
 
-        # Per-layer value, key_pos, and down_proj basis
-        for i in range(nlayers):
-            eval_value, evec_value = perform_eigen_decomp(
-                H_value[i] / normalizer, per_head=True, num_heads=num_kv_heads
-            )
-            basis_dict[f'layer.{i}.self_attn.value'] = evec_value
-            eval_dict[f'layer.{i}.self_attn.value'] = eval_value
-
-            # Key position basis (for Uc computation) - can be shared across heads or per-head
-            # Following original ResQ: sum across heads then decompose
-            eval_key_pos, evec_key_pos = perform_eigen_decomp(
-                H_key_pos[i].sum(0) / (num_kv_heads * normalizer)
-            )
-            basis_dict[f'layer.{i}.self_attn.key_pos'] = evec_key_pos
-            eval_dict[f'layer.{i}.self_attn.key_pos'] = eval_key_pos
-
-            # Down_proj basis - for Ud computation
-            eval_down_proj, evec_down_proj = perform_eigen_decomp(H_down_proj[i] / normalizer)
-            basis_dict[f'layer.{i}.mlp.down_proj'] = evec_down_proj
-            eval_dict[f'layer.{i}.mlp.down_proj'] = eval_down_proj
-
-    else:
-        # Default: one basis per decoder (average all layers)
-        H_combined = (H_attn.sum(0) + H_mlp.sum(0)) / (2 * nlayers * normalizer)
-        eval_combined, evec_combined = perform_eigen_decomp(H_combined)
-        basis_dict['attn_mlp'] = evec_combined
-        eval_dict['attn_mlp'] = eval_combined
-
-        # Per-layer value, key_pos, and down_proj basis
-        for i in range(nlayers):
-            eval_value, evec_value = perform_eigen_decomp(
-                H_value[i] / normalizer, per_head=True, num_heads=num_kv_heads
-            )
-            basis_dict[f'layer.{i}.self_attn.value'] = evec_value
-            eval_dict[f'layer.{i}.self_attn.value'] = eval_value
-
-            # Key position basis
-            eval_key_pos, evec_key_pos = perform_eigen_decomp(
-                H_key_pos[i].sum(0) / (num_kv_heads * normalizer)
-            )
-            basis_dict[f'layer.{i}.self_attn.key_pos'] = evec_key_pos
-            eval_dict[f'layer.{i}.self_attn.key_pos'] = eval_key_pos
-
-            # Down_proj basis - for Ud computation
-            eval_down_proj, evec_down_proj = perform_eigen_decomp(H_down_proj[i] / normalizer)
-            basis_dict[f'layer.{i}.mlp.down_proj'] = evec_down_proj
-            eval_dict[f'layer.{i}.mlp.down_proj'] = eval_down_proj
-
-    logger.info(f"Basis computation complete. Keys: {list(basis_dict.keys())}")
+    logger.info("=" * 60)
+    logger.info(f"Basis computation complete!")
+    logger.info(f"Total basis matrices: {len(basis_dict)}")
+    logger.info(f"Keys: {list(basis_dict.keys())[:10]}... (showing first 10)")
 
     return basis_dict
 

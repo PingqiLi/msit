@@ -18,7 +18,6 @@ class ResQConfig:
         dev_type: str = 'npu',
         dev_id: int = 0,
         rotate_mode: str = 'resq',
-        rotation_granularity: str = 'full_shared',
         **kwargs
     ):
         # General Arguments
@@ -28,10 +27,10 @@ class ResQConfig:
         self.dev_type = dev_type
         self.dev_id = dev_id
 
-        # Rotation mode: 'resq', 'quarot', 'spinquant', 'none'
+        # Rotation mode: 'resq' (only per_layer mode supported)
         self.rotate_mode = rotate_mode
-        # Rotation granularity: 'full_shared', 'per_layer', 'one_per_decoder'
-        self.rotation_granularity = rotation_granularity
+        # Rotation granularity: always 'per_layer' (other modes removed)
+        self.rotation_granularity = 'per_layer'
 
         # Paths for pre-computed rotations and basis
         self.optimized_rotation_path = kwargs.get('optimized_rotation_path', None)
@@ -108,10 +107,8 @@ class ResQConfig:
             strict: If True, require basis_path for ResQ mode.
                    If False, allow simplified mode without basis.
         """
-        assert self.rotate_mode in ['resq', 'quarot', 'spinquant', 'none'], \
-            f"Invalid rotate_mode: {self.rotate_mode}"
-        assert self.rotation_granularity in ['full_shared', 'per_layer', 'one_per_decoder'], \
-            f"Invalid rotation_granularity: {self.rotation_granularity}"
+        assert self.rotate_mode in ['resq', 'none'], \
+            f"Invalid rotate_mode: {self.rotate_mode}. Only 'resq' and 'none' are supported."
         assert 0.0 <= self.high_fraction <= 1.0, "high_fraction must be between 0 and 1"
         assert 0.0 <= self.low_fraction <= 1.0, "low_fraction must be between 0 and 1"
         assert self.high_fraction + self.low_fraction <= 1.0, \
@@ -120,6 +117,3 @@ class ResQConfig:
         if strict and self.rotate_mode == 'resq':
             assert self.optimized_basis_path is not None, \
                 "optimized_basis_path is required for ResQ mode (use strict=False for simplified mode)"
-            if not self.train_rotations:
-                assert self.optimized_rotation_path is not None, \
-                    "optimized_rotation_path is required when not training rotations"

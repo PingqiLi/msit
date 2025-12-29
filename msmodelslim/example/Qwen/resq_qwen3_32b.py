@@ -321,7 +321,6 @@ def main():
         seed=args.seed,
         dev_type=args.dev_type,
         dev_id=args.dev_id,
-        rotation_granularity='full_shared',
     )
 
     # Determine the device for layer-by-layer processing

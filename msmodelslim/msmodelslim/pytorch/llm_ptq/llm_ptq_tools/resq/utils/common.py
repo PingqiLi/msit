@@ -20,10 +20,10 @@ except ImportError:
 
 def get_device(dev_type: str = None, dev_id: int = 0):
     """
-    Get the appropriate device (NPU, CUDA, or CPU).
+    Get the appropriate device (NPU or CPU).
 
     Args:
-        dev_type: Device type ('npu', 'cuda', 'cpu', or None for auto-detect)
+        dev_type: Device type ('npu', 'cpu', or None for auto-detect)
         dev_id: Device ID (default: 0)
 
     Returns:
@@ -34,19 +34,12 @@ def get_device(dev_type: str = None, dev_id: int = 0):
             return torch.device(f"npu:{dev_id}")
         else:
             raise RuntimeError("NPU requested but torch_npu is not available")
-    elif dev_type == 'cuda':
-        if torch.cuda.is_available():
-            return torch.device(f"cuda:{dev_id}")
-        else:
-            raise RuntimeError("CUDA requested but not available")
     elif dev_type == 'cpu':
         return torch.device("cpu")
     else:
-        # Auto-detect
+        # Auto-detect: prefer NPU, fallback to CPU
         if npu_available:
             return torch.device("npu")
-        if torch.cuda.is_available():
-            return torch.device("cuda")
         return torch.device("cpu")
 
 
@@ -54,7 +47,7 @@ DEV = get_device()
 
 
 def cleanup_memory(verbos=True):
-    """Run GC and clear GPU/NPU memory."""
+    """Run GC and clear NPU memory."""
     import inspect
 
     caller_name = ""
@@ -69,11 +62,6 @@ def cleanup_memory(verbos=True):
                 torch.npu.memory_reserved(device=i)
                 for i in range(torch.npu.device_count())
             )
-        elif torch.cuda.is_available():
-            return sum(
-                torch.cuda.memory_reserved(device=i)
-                for i in range(torch.cuda.device_count())
-            )
         return 0
 
     memory_before = total_reserved_mem()
@@ -86,15 +74,6 @@ def cleanup_memory(verbos=True):
         if verbos:
             logging.info(
                 f"NPU memory{caller_name}: {memory_before / (1024 ** 3):.2f} -> "
-                f"{memory_after / (1024 ** 3):.2f} GB "
-                f"({(memory_after - memory_before) / (1024 ** 3):.2f} GB)"
-            )
-    elif torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        memory_after = total_reserved_mem()
-        if verbos:
-            logging.info(
-                f"GPU memory{caller_name}: {memory_before / (1024 ** 3):.2f} -> "
                 f"{memory_after / (1024 ** 3):.2f} GB "
                 f"({(memory_after - memory_before) / (1024 ** 3):.2f} GB)"
             )
@@ -142,7 +121,5 @@ def set_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
     if npu_available:
         torch.npu.manual_seed_all(seed)

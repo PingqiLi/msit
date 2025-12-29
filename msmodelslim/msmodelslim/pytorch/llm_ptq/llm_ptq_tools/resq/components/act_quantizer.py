@@ -530,9 +530,9 @@ class ActQuantWrapper(nn.Module):
             # Import here to avoid circular dependency
             from ..utils import hadamard_utils
             if self.fp32_had:
-                x = hadamard_utils.matmul_hadU_cuda(x.float(), self.had_K, self.K).to(x_dtype)
+                x = hadamard_utils.matmul_hadU_cpu(x.float(), self.had_K, self.K).to(x_dtype)
             else:
-                x = hadamard_utils.matmul_hadU_cuda(x, self.had_K, self.K)
+                x = hadamard_utils.matmul_hadU_cpu(x, self.had_K, self.K)
 
         elif self.online_partial_had:
             if self.fp32_had:

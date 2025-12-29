@@ -38,8 +38,6 @@ def empty_cache():
     """Empty device cache."""
     if npu_available:
         torch.npu.empty_cache()
-    elif torch.cuda.is_available():
-        torch.cuda.empty_cache()
 
 
 def get_device_str(device) -> str:
@@ -51,9 +49,7 @@ def get_device_str(device) -> str:
             return "npu:" + device
         return device
     else:
-        if not device.startswith("cuda"):
-            return "cuda:" + device
-        return device
+        return "cpu"
 
 
 @dataclass
@@ -81,10 +77,6 @@ class ResQTrainingConfig:
             if npu_available:
                 self.traincast = functools.partial(
                     torch.amp.autocast, device_type="npu", dtype=self.dtype
-                )
-            elif torch.cuda.is_available():
-                self.traincast = functools.partial(
-                    torch.amp.autocast, device_type="cuda", dtype=self.dtype
                 )
             else:
                 self.traincast = nullcontext

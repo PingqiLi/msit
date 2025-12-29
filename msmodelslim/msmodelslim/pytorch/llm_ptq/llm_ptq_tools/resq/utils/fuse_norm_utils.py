@@ -15,10 +15,8 @@ from tqdm import tqdm
 
 
 def cleanup_memory():
-    """Clean up GPU/NPU memory."""
+    """Clean up NPU memory."""
     gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
     try:
         import torch_npu
         if torch.npu.is_available():

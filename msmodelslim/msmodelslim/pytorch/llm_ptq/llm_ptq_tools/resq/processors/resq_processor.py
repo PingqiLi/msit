@@ -104,6 +104,10 @@ def rotate_mlp_output(
     """
     Rotate the MLP output (down_proj) weights.
 
+    Following the original ResQ logic:
+    - If dimension is a power of 2 or has Hadamard support, use fast Hadamard transform
+    - Otherwise, use random orthogonal matrix as fallback
+
     Args:
         layer: Decoder layer
         R1: Rotation matrix for hidden dimension
@@ -138,15 +142,15 @@ def rotate_mlp_output(
             W_ = torch.matmul(W_, R4.cpu())
             W.weight.data = W_.reshape(W.weight.data.shape).to(dtype=dtype)
     else:
-        # Apply exact Hadamard on down_proj weights only if dimension is supported
+        # Apply exact Hadamard on down_proj weights
+        # get_hadK now handles all dimensions including non-Hadamard fallback
         in_dim = W.weight.data.shape[-1]  # intermediate_size
-        try:
-            had_K, K = get_hadK(in_dim)
+        had_K, K = get_hadK(in_dim)
+        if had_K is not None or K == 1:
+            # Supported dimension - apply Hadamard transform
             apply_exact_had_to_linear(W, had_dim=-1, output=False)
-        except AssertionError:
-            # Dimension not supported for Hadamard, skip
-            import logging
-            logging.warning(f"Skipping Hadamard on down_proj: intermediate_size={in_dim} not supported")
+        # Note: When K > 1 and had_K is not None, apply_exact_had_to_linear
+        # will use the orthogonal matrix from get_hadK internally
 
     if W.bias is not None:
         b = W.bias.data.to(dtype=torch.float64, device='cpu')

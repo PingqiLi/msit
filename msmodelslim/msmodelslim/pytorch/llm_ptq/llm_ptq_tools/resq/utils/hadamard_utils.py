@@ -265,12 +265,57 @@ def get_had172() -> torch.Tensor:
     return _HADAMARD_CACHE[172].clone()
 
 
+def get_orth50() -> torch.Tensor:
+    """Get orthogonal matrix of order 50 for Qwen3-32B intermediate_size=25600."""
+    if 50 not in _HADAMARD_CACHE:
+        # Hadamard of order 50 does not exist, use random orthogonal
+        torch.manual_seed(42)
+        _HADAMARD_CACHE[50] = random_orthogonal_matrix(50)
+    return _HADAMARD_CACHE[50].clone()
+
+
+def get_orth100() -> torch.Tensor:
+    """Get orthogonal matrix of order 100 for various intermediate sizes."""
+    if 100 not in _HADAMARD_CACHE:
+        # Hadamard of order 100 does not exist, use random orthogonal
+        torch.manual_seed(42)
+        _HADAMARD_CACHE[100] = random_orthogonal_matrix(100)
+    return _HADAMARD_CACHE[100].clone()
+
+
+def get_orth37() -> torch.Tensor:
+    """Get orthogonal matrix of order 37 for Qwen2.5-7B MLP dim."""
+    if 37 not in _HADAMARD_CACHE:
+        torch.manual_seed(42)
+        _HADAMARD_CACHE[37] = random_orthogonal_matrix(37)
+    return _HADAMARD_CACHE[37].clone()
+
+
+def get_orth38() -> torch.Tensor:
+    """Get orthogonal matrix of order 38 for Qwen2.5-0.5B MLP dim."""
+    if 38 not in _HADAMARD_CACHE:
+        torch.manual_seed(42)
+        _HADAMARD_CACHE[38] = random_orthogonal_matrix(38)
+    return _HADAMARD_CACHE[38].clone()
+
+
+def get_orth231() -> torch.Tensor:
+    """Get orthogonal matrix of order 231 for Qwen2.5-72B MLP dim."""
+    if 231 not in _HADAMARD_CACHE:
+        torch.manual_seed(42)
+        _HADAMARD_CACHE[231] = random_orthogonal_matrix(231)
+    return _HADAMARD_CACHE[231].clone()
+
+
 def get_hadK(n: int, transpose: bool = False) -> Tuple[Optional[torch.Tensor], int]:
     """
     Get appropriate Hadamard/orthogonal matrix for dimension n.
 
     Selects the largest factor of n that has a pre-computed matrix,
     and the remaining dimension uses power-of-2 Hadamard.
+
+    When Hadamard matrix is not available (dimension doesn't factor properly),
+    falls back to random orthogonal matrix following the original ResQ logic.
 
     Args:
         n: Dimension size
@@ -300,12 +345,32 @@ def get_hadK(n: int, transpose: bool = False) -> Tuple[Optional[torch.Tensor], i
     elif n % 52 == 0 and is_pow2(n // 52):
         K = 52
         hadK = get_had52().T if transpose else get_had52()
+    elif n % 231 == 0 and is_pow2(n // 231):
+        # Qwen2.5-72B MLP dim - use orthogonal since Hadamard order 231 doesn't exist
+        K = 231
+        hadK = get_orth231().T if transpose else get_orth231()
     elif n % 44 == 0 and is_pow2(n // 44):
         K = 44
         hadK = get_had44().T if transpose else get_had44()
     elif n % 40 == 0 and is_pow2(n // 40):
         K = 40
         hadK = get_had40().T if transpose else get_had40()
+    elif n % 50 == 0 and is_pow2(n // 50):
+        # Qwen3-32B intermediate_size=25600 = 50 * 512
+        K = 50
+        hadK = get_orth50().T if transpose else get_orth50()
+    elif n % 100 == 0 and is_pow2(n // 100):
+        # Alternative for various models (25600 = 100 * 256)
+        K = 100
+        hadK = get_orth100().T if transpose else get_orth100()
+    elif n % 37 == 0 and is_pow2(n // 37):
+        # Qwen2.5-7B MLP dim
+        K = 37
+        hadK = get_orth37().T if transpose else get_orth37()
+    elif n % 38 == 0 and is_pow2(n // 38):
+        # Qwen2.5-0.5B MLP dim
+        K = 38
+        hadK = get_orth38().T if transpose else get_orth38()
     elif n % 36 == 0 and is_pow2(n // 36):
         K = 36
         hadK = get_had36().T if transpose else get_had36()
@@ -318,9 +383,22 @@ def get_hadK(n: int, transpose: bool = False) -> Tuple[Optional[torch.Tensor], i
     elif n % 12 == 0 and is_pow2(n // 12):
         K = 12
         hadK = get_had12().T if transpose else get_had12()
-    else:
-        assert is_pow2(n), f"Dimension {n} not supported"
+    elif is_pow2(n):
+        # Pure power-of-2: use butterfly Hadamard only
         K = 1
+        hadK = None
+    else:
+        # Fallback: use random orthogonal matrix for the entire dimension
+        # This follows ResQ's approach when Hadamard is not available
+        import logging
+        logging.warning(
+            f"Dimension {n} has no suitable Hadamard factorization. "
+            f"Using random orthogonal matrix (K={n}). "
+            f"This may be slower but maintains correctness."
+        )
+        K = n
+        torch.manual_seed(42)  # Reproducibility
+        hadK = random_orthogonal_matrix(n).T if transpose else random_orthogonal_matrix(n)
 
     return hadK, K
 

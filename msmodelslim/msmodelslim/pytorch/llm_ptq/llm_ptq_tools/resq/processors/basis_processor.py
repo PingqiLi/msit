@@ -268,12 +268,21 @@ def compute_basis(
     # ========== Step 2: Initialize covariance matrices ==========
     logger.info(f"Initializing covariance matrices on {cov_device}...")
 
+    # Get intermediate_size for down_proj
+    intermediate_size = model.config.intermediate_size
+
     # Covariance matrices for attention and MLP inputs
     H_attn = torch.zeros((nlayers, hidden_dim, hidden_dim), device=cov_device, dtype=torch.float64)
     H_mlp = torch.zeros((nlayers, hidden_dim, hidden_dim), device=cov_device, dtype=torch.float64)
 
     # Per-head covariance for value projection outputs
     H_value = torch.zeros((nlayers, num_kv_heads, head_dim, head_dim), device=cov_device, dtype=torch.float64)
+
+    # Per-head covariance for key projection outputs after RoPE (for Uc computation)
+    H_key_pos = torch.zeros((nlayers, num_kv_heads, head_dim, head_dim), device=cov_device, dtype=torch.float64)
+
+    # Covariance for down_proj input (for Ud computation)
+    H_down_proj = torch.zeros((nlayers, intermediate_size, intermediate_size), device=cov_device, dtype=torch.float64)
 
     # Prepare output buffer
     outs = [None] * nbatches
@@ -307,6 +316,12 @@ def compute_basis(
                 make_hook_fn('attn_input', capture_input=True)
             ))
 
+        # Hook for key projection output (for key_pos after RoPE)
+        if hasattr(layer, 'self_attn') and hasattr(layer.self_attn, 'k_proj'):
+            hooks.append(layer.self_attn.k_proj.register_forward_hook(
+                make_hook_fn('k_output', capture_input=False)
+            ))
+
         # Hook for value projection output
         if hasattr(layer, 'self_attn') and hasattr(layer.self_attn, 'v_proj'):
             hooks.append(layer.self_attn.v_proj.register_forward_hook(
@@ -317,6 +332,12 @@ def compute_basis(
         if hasattr(layer, 'mlp') and hasattr(layer.mlp, 'up_proj'):
             hooks.append(layer.mlp.up_proj.register_forward_hook(
                 make_hook_fn('mlp_input', capture_input=True)
+            ))
+
+        # Hook for down_proj input (for Ud computation)
+        if hasattr(layer, 'mlp') and hasattr(layer.mlp, 'down_proj'):
+            hooks.append(layer.mlp.down_proj.register_forward_hook(
+                make_hook_fn('down_proj_input', capture_input=True)
             ))
 
         # Process all batches for this layer
@@ -368,6 +389,56 @@ def compute_basis(
                     head_v = v[:, hd, :]  # [batch * seq, head_dim]
                     H_value[layer_idx, hd] += (head_v.T @ head_v).to(cov_device)
 
+            # Compute key_pos covariance (key after RoPE)
+            if 'k_output' in captured and 'v_output' in captured:
+                try:
+                    k_out = captured['k_output']
+                    v_out = captured['v_output']
+                    batch_seq_len = k_out.shape[1]
+
+                    # Reshape key states: [batch, seq, num_kv_heads, head_dim]
+                    key_states = k_out.view(1, batch_seq_len, num_kv_heads, head_dim).transpose(1, 2)
+
+                    # Get position embeddings for RoPE
+                    position_ids = kwargs.get('position_ids')
+                    position_embeddings = kwargs.get('position_embeddings')
+
+                    # Apply RoPE to get key_states_pos
+                    if position_embeddings is not None:
+                        cos, sin = position_embeddings
+                    elif hasattr(layer.self_attn, 'rotary_emb'):
+                        cos, sin = layer.self_attn.rotary_emb(v_out, position_ids)
+                    else:
+                        # Skip if no rotary embedding available
+                        cos, sin = None, None
+
+                    if cos is not None and sin is not None:
+                        # Apply rotary position embedding
+                        # Standard RoPE implementation
+                        def rotate_half(x):
+                            x1 = x[..., : x.shape[-1] // 2]
+                            x2 = x[..., x.shape[-1] // 2 :]
+                            return torch.cat((-x2, x1), dim=-1)
+
+                        key_states_pos = (key_states * cos) + (rotate_half(key_states) * sin)
+
+                        # Accumulate key_pos covariance
+                        k_pos = key_states_pos.view(-1, num_kv_heads, head_dim).to(torch.float64)
+                        for hd in range(num_kv_heads):
+                            head_k = k_pos[:, hd, :]  # [batch * seq, head_dim]
+                            H_key_pos[layer_idx, hd] += (head_k.T @ head_k).to(cov_device)
+                except Exception as e:
+                    logger.warning(f"Layer {layer_idx} batch {batch_idx} key_pos computation failed: {e}")
+
+            # Compute down_proj covariance (for Ud computation)
+            if 'down_proj_input' in captured:
+                try:
+                    dp_input = captured['down_proj_input']
+                    x = dp_input.view(-1, intermediate_size).to(torch.float64)
+                    H_down_proj[layer_idx] += (x.T @ x).to(cov_device)
+                except Exception as e:
+                    logger.warning(f"Layer {layer_idx} batch {batch_idx} down_proj covariance failed: {e}")
+
             # Clear captured values
             captured.clear()
 
@@ -417,6 +488,18 @@ def compute_basis(
             basis_dict[f'layer.{i}.self_attn.value'] = evec_value
             eval_dict[f'layer.{i}.self_attn.value'] = eval_value
 
+            # Key position basis (per head) - for Uc computation
+            eval_key_pos, evec_key_pos = perform_eigen_decomp(
+                H_key_pos[i] / normalizer, per_head=True, num_heads=num_kv_heads
+            )
+            basis_dict[f'layer.{i}.self_attn.key_pos'] = evec_key_pos
+            eval_dict[f'layer.{i}.self_attn.key_pos'] = eval_key_pos
+
+            # Down_proj basis - for Ud computation
+            eval_down_proj, evec_down_proj = perform_eigen_decomp(H_down_proj[i] / normalizer)
+            basis_dict[f'layer.{i}.mlp.down_proj'] = evec_down_proj
+            eval_dict[f'layer.{i}.mlp.down_proj'] = eval_down_proj
+
     elif 'full_shared' in rotation_granularity.lower():
         # Combined basis for all layers
         H_combined = (H_attn.sum(0) + H_mlp.sum(0)) / (2 * nlayers * normalizer)
@@ -424,7 +507,7 @@ def compute_basis(
         basis_dict['attn_mlp'] = evec_combined
         eval_dict['attn_mlp'] = eval_combined
 
-        # Per-layer value basis
+        # Per-layer value, key_pos, and down_proj basis
         for i in range(nlayers):
             eval_value, evec_value = perform_eigen_decomp(
                 H_value[i] / normalizer, per_head=True, num_heads=num_kv_heads
@@ -432,12 +515,45 @@ def compute_basis(
             basis_dict[f'layer.{i}.self_attn.value'] = evec_value
             eval_dict[f'layer.{i}.self_attn.value'] = eval_value
 
+            # Key position basis (for Uc computation) - can be shared across heads or per-head
+            # Following original ResQ: sum across heads then decompose
+            eval_key_pos, evec_key_pos = perform_eigen_decomp(
+                H_key_pos[i].sum(0) / (num_kv_heads * normalizer)
+            )
+            basis_dict[f'layer.{i}.self_attn.key_pos'] = evec_key_pos
+            eval_dict[f'layer.{i}.self_attn.key_pos'] = eval_key_pos
+
+            # Down_proj basis - for Ud computation
+            eval_down_proj, evec_down_proj = perform_eigen_decomp(H_down_proj[i] / normalizer)
+            basis_dict[f'layer.{i}.mlp.down_proj'] = evec_down_proj
+            eval_dict[f'layer.{i}.mlp.down_proj'] = eval_down_proj
+
     else:
         # Default: one basis per decoder (average all layers)
         H_combined = (H_attn.sum(0) + H_mlp.sum(0)) / (2 * nlayers * normalizer)
         eval_combined, evec_combined = perform_eigen_decomp(H_combined)
         basis_dict['attn_mlp'] = evec_combined
         eval_dict['attn_mlp'] = eval_combined
+
+        # Per-layer value, key_pos, and down_proj basis
+        for i in range(nlayers):
+            eval_value, evec_value = perform_eigen_decomp(
+                H_value[i] / normalizer, per_head=True, num_heads=num_kv_heads
+            )
+            basis_dict[f'layer.{i}.self_attn.value'] = evec_value
+            eval_dict[f'layer.{i}.self_attn.value'] = eval_value
+
+            # Key position basis
+            eval_key_pos, evec_key_pos = perform_eigen_decomp(
+                H_key_pos[i].sum(0) / (num_kv_heads * normalizer)
+            )
+            basis_dict[f'layer.{i}.self_attn.key_pos'] = evec_key_pos
+            eval_dict[f'layer.{i}.self_attn.key_pos'] = eval_key_pos
+
+            # Down_proj basis - for Ud computation
+            eval_down_proj, evec_down_proj = perform_eigen_decomp(H_down_proj[i] / normalizer)
+            basis_dict[f'layer.{i}.mlp.down_proj'] = evec_down_proj
+            eval_dict[f'layer.{i}.mlp.down_proj'] = eval_down_proj
 
     logger.info(f"Basis computation complete. Keys: {list(basis_dict.keys())}")
 
@@ -447,6 +563,7 @@ def compute_basis(
 def generate_random_rotations(
     hidden_dim: int,
     head_dim: int,
+    intermediate_dim: int = None,
     high_fraction: float = 0.125,
     low_fraction: float = 0.0,
     seed: int = 42,
@@ -459,6 +576,7 @@ def generate_random_rotations(
     Args:
         hidden_dim: Hidden dimension of the model
         head_dim: Dimension per attention head
+        intermediate_dim: Intermediate dimension for down_proj (MLP)
         high_fraction: Fraction for high precision (8-bit)
         low_fraction: Fraction for low precision (extra low)
         seed: Random seed for reproducibility
@@ -513,6 +631,23 @@ def generate_random_rotations(
     R2_2 = random_orthogonal_matrix(high_head_dim)
     rotation_dict['R2_1'] = R2_1
     rotation_dict['R2_2'] = R2_2
+
+    # Generate block-diagonal Rd for intermediate dimension (down_proj)
+    if intermediate_dim is not None:
+        high_inter_dim = int(high_fraction * intermediate_dim)
+        low_inter_dim = int(low_fraction * intermediate_dim)
+        mid_inter_dim = intermediate_dim - high_inter_dim - low_inter_dim
+
+        if low_inter_dim > 0:
+            Rd_0 = random_orthogonal_matrix(low_inter_dim)
+            rotation_dict['Rd_0'] = Rd_0
+        else:
+            rotation_dict['Rd_0'] = None
+
+        Rd_1 = random_orthogonal_matrix(mid_inter_dim)
+        Rd_2 = random_orthogonal_matrix(high_inter_dim)
+        rotation_dict['Rd_1'] = Rd_1
+        rotation_dict['Rd_2'] = Rd_2
 
     return rotation_dict
 

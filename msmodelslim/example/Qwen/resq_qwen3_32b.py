@@ -6,6 +6,7 @@ This script performs 4/8-bit hybrid quantization using ResQ algorithm:
 - High variance channels: 8-bit precision
 - Low variance channels: 4-bit precision
 - Saves dual weights and dual scales
+- Generates per-layer online projection matrices (Uc, Ud)
 
 Usage:
     # Full ResQ with on-the-fly basis computation (recommended):
@@ -36,6 +37,14 @@ Output format:
     - scale_high: Scale for 8-bit weights
     - offset_low: Offset for 4-bit weights
     - offset_high: Offset for 8-bit weights
+    - resq.layer.{i}.Uc: Per-layer online rotation for K cache (key_pos @ R2)
+    - resq.layer.{i}.Ud: Per-layer online rotation for down_proj (down_proj @ Rd)
+
+ResQ Algorithm (U = P @ R):
+    - P: Eigenvector matrix from eigendecomposition of activation covariance
+    - R: Block-diagonal random orthogonal rotation = block_diag(R_low, R_mid, R_high)
+    - Uc = key_pos_basis @ R2 (for K cache rotation after RoPE)
+    - Ud = down_proj_basis @ Rd (for down_proj input rotation)
 """
 import os
 import sys
@@ -498,6 +507,15 @@ def main():
     print("=" * 60)
     print("ResQ quantization complete!")
     print(f"Output saved to: {save_directory}")
+    print("")
+    print("Output files include:")
+    print("  - quant_model_weight_resq.safetensors (quantized weights)")
+    print("  - quant_model_description_resq.json (quantization metadata)")
+    print("  - resq_basis.pt (if basis was computed)")
+    print("")
+    print("Per-layer online projection matrices (U = P @ R):")
+    print(f"  - resq.layer.{{0..{config.num_hidden_layers-1}}}.Uc: K cache rotation (key_pos @ R2)")
+    print(f"  - resq.layer.{{0..{config.num_hidden_layers-1}}}.Ud: down_proj rotation (down_proj @ Rd)")
     print("=" * 60)
 
 

@@ -405,16 +405,11 @@ def add_resq_quantizers(model: nn.Module, cfg=None, logger=None,
     """
     skip_names = skip_names or []
 
-    # Output projections split along out_features (dim=0)
-    # Input projections split along in_features (dim=1)
-    output_proj_names = ['o_proj', 'down_proj']
-
-    def _is_output_projection(name: str) -> bool:
-        """Check if layer is an output projection (o_proj, down_proj)."""
-        for proj_name in output_proj_names:
-            if proj_name in name:
-                return True
-        return False
+    # All projections split along in_features (dim=1, the last dimension)
+    # This is because ResQ rotations are applied to the INPUT of each linear layer
+    # - q,k,v,up,gate projections: input is hidden_size, split on hidden_size
+    # - o_proj: input is num_heads * head_dim, split on that dimension
+    # - down_proj: input is intermediate_size, split on intermediate_size
 
     def _set_module(ori_mod, submodule_key, module):
         tokens = submodule_key.split('.')
@@ -428,10 +423,9 @@ def add_resq_quantizers(model: nn.Module, cfg=None, logger=None,
         if name in skip_names:
             continue
         if isinstance(mod, nn.Linear):
-            # Determine split dimension based on layer type
-            # Output projections (o_proj, down_proj): split along out_features (dim=0)
-            # Input projections (q_proj, k_proj, v_proj, up_proj, gate_proj): split along in_features (dim=1)
-            split_dim = 0 if _is_output_projection(name) else 1
+            # All projections split along in_features (dim=1, the last dimension)
+            # ResQ rotations are applied to inputs, so we split on input dimension
+            split_dim = 1
 
             quant_mod = LinearResQQuantizer(
                 cfg=cfg,

@@ -116,12 +116,14 @@ class ResQCalibrator:
                         head_dim = v_proj.out_features // num_kv_heads
                     else:
                         head_dim = model.config.hidden_size // model.config.num_attention_heads
-                # Get intermediate_dim for down_proj rotation
-                intermediate_dim = getattr(model.config, 'intermediate_size', None)
+                # Get down_proj_blocksize for Rd rotation (block-wise approach)
+                # This is the blocksize used for down_proj, not the full intermediate_size
+                down_proj_blocksize = self.cfg.down_proj_blocksize
+                self.logger.info(f"Using down_proj_blocksize={down_proj_blocksize} for Rd rotation")
                 self.rotation_dict = generate_random_rotations(
                     hidden_dim=model.config.hidden_size,
                     head_dim=head_dim,
-                    intermediate_dim=intermediate_dim,
+                    intermediate_dim=down_proj_blocksize,  # Use blocksize, not full intermediate_size
                     high_fraction=self.cfg.high_fraction,
                     low_fraction=self.cfg.low_fraction,
                     seed=self.cfg.seed,
@@ -335,8 +337,8 @@ class ResQCalibrator:
                     weight_dict[f"{name}.scale_low"] = quant_weights['scale_low']
                     weight_dict[f"{name}.offset_low"] = quant_weights['offset_low']
                     quant_description[f"{name}.weight_low"] = "RESQ"
-                    quant_description[f"{name}.scale_low"] = "FLOAT"
-                    quant_description[f"{name}.offset_low"] = "FLOAT"
+                    quant_description[f"{name}.scale_low"] = "RESQ"
+                    quant_description[f"{name}.offset_low"] = "RESQ"
 
                 # Save high precision weights and scales
                 if 'weight_high' in quant_weights:
@@ -344,13 +346,13 @@ class ResQCalibrator:
                     weight_dict[f"{name}.scale_high"] = quant_weights['scale_high']
                     weight_dict[f"{name}.offset_high"] = quant_weights['offset_high']
                     quant_description[f"{name}.weight_high"] = "RESQ"
-                    quant_description[f"{name}.scale_high"] = "FLOAT"
-                    quant_description[f"{name}.offset_high"] = "FLOAT"
+                    quant_description[f"{name}.scale_high"] = "RESQ"
+                    quant_description[f"{name}.offset_high"] = "RESQ"
 
                 # Save bias if present
                 if module.bias is not None:
                     weight_dict[f"{name}.bias"] = module.bias.data.cpu()
-                    quant_description[f"{name}.bias"] = "FLOAT"
+                    quant_description[f"{name}.bias"] = "RESQ"
 
             elif isinstance(module, nn.Linear):
                 # Non-quantized linear layers (e.g., lm_head)

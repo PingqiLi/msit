@@ -313,6 +313,11 @@ def compute_basis(
     # Get intermediate_size for down_proj
     intermediate_size = model.config.intermediate_size
 
+    # Get down_proj_blocksize from config (default 256)
+    # Original ResQ uses block-wise approach for down_proj to reduce memory
+    down_proj_blocksize = getattr(config, 'down_proj_blocksize', 256)
+    logger.info(f"Using down_proj_blocksize={down_proj_blocksize} (intermediate_size={intermediate_size})")
+
     # Covariance matrices for attention and MLP inputs
     H_attn = torch.zeros((nlayers, hidden_dim, hidden_dim), device=cov_device, dtype=torch.float64)
     H_mlp = torch.zeros((nlayers, hidden_dim, hidden_dim), device=cov_device, dtype=torch.float64)
@@ -324,7 +329,9 @@ def compute_basis(
     H_key_pos = torch.zeros((nlayers, num_kv_heads, head_dim, head_dim), device=cov_device, dtype=torch.float64)
 
     # Covariance for down_proj input (for Ud computation)
-    H_down_proj = torch.zeros((nlayers, intermediate_size, intermediate_size), device=cov_device, dtype=torch.float64)
+    # Use block-wise approach: split intermediate_size into blocks of down_proj_blocksize
+    # This reduces memory from [intermediate_size, intermediate_size] to [blocksize, blocksize]
+    H_down_proj = torch.zeros((nlayers, down_proj_blocksize, down_proj_blocksize), device=cov_device, dtype=torch.float64)
 
     # Prepare output buffer
     outs = [None] * nbatches
@@ -473,11 +480,16 @@ def compute_basis(
                     logger.warning(f"Layer {layer_idx} batch {batch_idx} key_pos computation failed: {e}")
 
             # Compute down_proj covariance (for Ud computation)
+            # Use block-wise approach: reshape to [batch, num_blocks, blocksize]
+            # Then compute covariance across all blocks
             if 'down_proj_input' in captured:
                 try:
                     dp_input = captured['down_proj_input']
-                    x = dp_input.view(-1, intermediate_size).to(torch.float64)
-                    H_down_proj[layer_idx] += (x.T @ x).to(cov_device)
+                    # Reshape to [batch*seq, num_blocks, blocksize]
+                    # intermediate_size = num_blocks * blocksize
+                    x = dp_input.view(dp_input.shape[0], -1, down_proj_blocksize).to(torch.float64)
+                    # Sum covariance across all blocks: [blocksize, blocksize]
+                    H_down_proj[layer_idx] += torch.sum(x.mT @ x, dim=0).to(cov_device)
                 except Exception as e:
                     logger.warning(f"Layer {layer_idx} batch {batch_idx} down_proj covariance failed: {e}")
 
@@ -512,7 +524,7 @@ def compute_basis(
     logger.info(f"  - mlp:      [{hidden_dim}x{hidden_dim}]")
     logger.info(f"  - value:    [{num_kv_heads} heads x {head_dim}x{head_dim}]")
     logger.info(f"  - key_pos:  [{head_dim}x{head_dim}]")
-    logger.info(f"  - down_proj:[{intermediate_size}x{intermediate_size}] (largest, slowest)")
+    logger.info(f"  - down_proj:[{down_proj_blocksize}x{down_proj_blocksize}] (block-wise, {intermediate_size//down_proj_blocksize} blocks)")
     logger.info("=" * 60)
 
     basis_dict = {}
@@ -524,7 +536,7 @@ def compute_basis(
     # Determine number of parallel workers
     # For CPU: use multiple threads for parallel eigendecomposition
     # For GPU: typically 1 worker is enough as GPU handles parallelism internally
-    max_workers = 4 if eigen_device.type == 'cpu' else 2
+    max_workers = 128 if eigen_device.type == 'cpu' else 2
 
     logger.info(f"Using {max_workers} parallel workers for eigendecomposition")
 
@@ -689,7 +701,8 @@ def generate_random_rotations(
     rotation_dict['R2_1'] = R2_1
     rotation_dict['R2_2'] = R2_2
 
-    # Generate block-diagonal Rd for intermediate dimension (down_proj)
+    # Generate block-diagonal Rd for down_proj (using blocksize, not full intermediate_dim)
+    # The down_proj uses block-wise rotation: each block of size `intermediate_dim` shares the same rotation
     if intermediate_dim is not None:
         high_inter_dim = int(high_fraction * intermediate_dim)
         low_inter_dim = int(low_fraction * intermediate_dim)

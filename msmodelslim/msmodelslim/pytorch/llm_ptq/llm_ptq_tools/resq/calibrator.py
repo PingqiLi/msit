@@ -299,6 +299,17 @@ class ResQCalibrator:
         embed_device = self._input_device
         self.logger.info(f"Moving calibration data to device: {embed_device}")
 
+        # Check sequence length and warn if too long for available memory
+        if self.calib_data and len(self.calib_data) > 0:
+            first_batch = self.calib_data[0]
+            if isinstance(first_batch, (tuple, list)) and len(first_batch) > 0:
+                seq_len = first_batch[0].shape[-1] if hasattr(first_batch[0], 'shape') else 0
+                if seq_len > 1024:
+                    self.logger.warning(
+                        f"Calibration sequence length is {seq_len}. "
+                        f"For large models, consider using --seq_len 512 or 1024 to reduce memory usage."
+                    )
+
         for idx, data in enumerate(tqdm(self.calib_data, desc="Calibrating")):
             if isinstance(data, (tuple, list)):
                 # Move tensors to the correct device
@@ -319,6 +330,10 @@ class ResQCalibrator:
                     self.logger.info(f"[DEBUG] First batch after .to({embed_device}):")
                     self.logger.info(f"[DEBUG] input tensors: {[(k, v.device, v.shape) if isinstance(v, torch.Tensor) else (k, type(v)) for k, v in data.items()]}")
                 self.model(**data)
+
+            # Clear cache periodically to reduce memory fragmentation
+            if (idx + 1) % 8 == 0:
+                cleanup_memory(verbos=False)
 
     def _run_datafree_mode(self) -> None:
         """Run data-free quantization."""

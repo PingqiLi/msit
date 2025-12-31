@@ -258,7 +258,7 @@ def main():
             trust_remote_code=args.trust_remote_code,
             device_map="cpu",  # Load on CPU for layer-by-layer processing
             torch_dtype=torch.bfloat16,
-            attn_implementation='eager'
+            attn_implementation='flash_attention_2'
         )
         model_device = torch.device('cpu')
     else:

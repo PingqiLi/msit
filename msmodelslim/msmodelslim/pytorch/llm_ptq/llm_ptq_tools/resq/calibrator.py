@@ -83,6 +83,17 @@ class ResQCalibrator:
 
     def _prepare_model(self, model: nn.Module) -> nn.Module:
         """Prepare model for ResQ quantization."""
+        # Save original device map before any transformations
+        self._original_device_map = None
+        self._is_multi_device = False
+        if hasattr(model, 'hf_device_map') and model.hf_device_map is not None:
+            self._original_device_map = dict(model.hf_device_map)
+            devices = set(str(d) for d in self._original_device_map.values())
+            if len(devices) > 1:
+                self._is_multi_device = True
+                self.logger.info(f"Model was distributed across multiple devices: {devices}")
+                self.logger.info(f"Original device_map: {self._original_device_map}")
+
         # Fuse layer norms
         self.logger.info("Fusing layer norms...")
         fuse_layer_norms(model)
@@ -157,27 +168,82 @@ class ResQCalibrator:
             skip_names=skip_names,
         )
 
-        # Remove accelerate hooks and move model to single device
-        # The transformations may have moved weights to CPU, and accelerate hooks
-        # can cause device mismatches when model was loaded with device_map="auto"
-        self.logger.info(f"Moving model to device: {self.device}")
+        if self._is_multi_device:
+            # For multi-device models, redistribute using accelerate
+            self.logger.info("Redistributing model across multiple devices...")
+            try:
+                from accelerate import dispatch_model, infer_auto_device_map
+                from accelerate.utils import get_balanced_memory
 
-        # Remove accelerate hooks if present
-        try:
-            from accelerate.hooks import remove_hook_from_module
-            for name, module in model.named_modules():
-                remove_hook_from_module(module, recurse=False)
-            self.logger.info("Removed accelerate hooks from model")
-        except Exception as e:
-            self.logger.info(f"No accelerate hooks to remove or error: {e}")
+                # Remove any stale hooks first
+                try:
+                    from accelerate.hooks import remove_hook_from_module
+                    for name, module in model.named_modules():
+                        remove_hook_from_module(module, recurse=False)
+                except Exception:
+                    pass
 
-        # Clear the device map
-        if hasattr(model, 'hf_device_map'):
-            model.hf_device_map = None
-            self.logger.info("Cleared hf_device_map")
+                # Use accelerate to redistribute the model
+                # First, get available devices from original device map
+                available_devices = list(set(self._original_device_map.values()))
+                self.logger.info(f"Available devices: {available_devices}")
 
-        # Move entire model to target device
-        model = model.to(self.device)
+                # Infer a new device map for the transformed model
+                no_split_classes = ["Qwen2DecoderLayer", "Qwen3DecoderLayer", "LlamaDecoderLayer"]
+                max_memory = get_balanced_memory(
+                    model,
+                    max_memory=None,
+                    no_split_module_classes=no_split_classes,
+                    dtype=model.dtype if hasattr(model, 'dtype') else torch.float16,
+                )
+                device_map = infer_auto_device_map(
+                    model,
+                    max_memory=max_memory,
+                    no_split_module_classes=no_split_classes,
+                    dtype=model.dtype if hasattr(model, 'dtype') else torch.float16,
+                )
+                self.logger.info(f"New device_map: {device_map}")
+
+                # Dispatch the model
+                model = dispatch_model(model, device_map=device_map)
+                self.logger.info("Model redistributed successfully")
+
+                # Set input device
+                if hasattr(model, 'model') and hasattr(model.model, 'embed_tokens'):
+                    self._input_device = model.model.embed_tokens.weight.device
+                else:
+                    # Get first device from device_map
+                    first_device = list(device_map.values())[0]
+                    self._input_device = torch.device(first_device) if isinstance(first_device, str) else first_device
+                self.logger.info(f"Calibration data will be sent to: {self._input_device}")
+
+            except Exception as e:
+                self.logger.warning(f"Failed to redistribute model with accelerate: {e}")
+                self.logger.warning("Falling back to single device mode")
+                self._is_multi_device = False
+                # Fall through to single-device handling
+
+        if not self._is_multi_device:
+            # For single-device models, remove accelerate hooks and move to target device
+            self.logger.info(f"Moving model to device: {self.device}")
+
+            # Remove accelerate hooks if present
+            try:
+                from accelerate.hooks import remove_hook_from_module
+                for name, module in model.named_modules():
+                    remove_hook_from_module(module, recurse=False)
+                self.logger.info("Removed accelerate hooks from model")
+            except Exception as e:
+                self.logger.info(f"No accelerate hooks to remove or error: {e}")
+
+            # Clear the device map
+            if hasattr(model, 'hf_device_map'):
+                model.hf_device_map = None
+                self.logger.info("Cleared hf_device_map")
+
+            # Move entire model to target device
+            model = model.to(self.device)
+            self._input_device = self.device
 
         return model
 
@@ -227,10 +293,10 @@ class ResQCalibrator:
         """Run calibration with data."""
         self.logger.info(f"Running calibration with {len(self.calib_data)} samples...")
 
-        # Use the configured device (self.device) for input tensors
-        # Note: We use self.device instead of detecting from model.embed_tokens
-        # because _prepare_model may have moved layers during transformation
-        embed_device = self.device
+        # Use _input_device which is set based on model configuration
+        # For multi-device models, this is the device of embed_tokens
+        # For single-device models, this is self.device
+        embed_device = self._input_device
         self.logger.info(f"Moving calibration data to device: {embed_device}")
 
         for idx, data in enumerate(tqdm(self.calib_data, desc="Calibrating")):

@@ -388,7 +388,24 @@ class ResQCalibrator:
             "high_bits": self.cfg.high_bits,
             "low_bits": self.cfg.low_bits,
             "high_fraction": self.cfg.high_fraction,
+            "group_size": getattr(self.cfg, 'w_groupsize', -1),
+            "version": "1.0",
         }
+
+        # Save model.embed_tokens.weight (already rotated with Ua)
+        if hasattr(self.model, 'model') and hasattr(self.model.model, 'embed_tokens'):
+            embed_weight = self.model.model.embed_tokens.weight.data.cpu()
+            weight_dict['model.embed_tokens.weight'] = embed_weight
+            quant_description['model.embed_tokens.weight'] = "FLOAT"
+            self.logger.info(f"Saved model.embed_tokens.weight: {embed_weight.shape}")
+
+        # Save model.norm.weight (final layer norm)
+        if hasattr(self.model, 'model') and hasattr(self.model.model, 'norm'):
+            norm_module = self.model.model.norm
+            if hasattr(norm_module, 'weight') and norm_module.weight is not None:
+                weight_dict['model.norm.weight'] = norm_module.weight.data.cpu()
+                quant_description['model.norm.weight'] = "FLOAT"
+                self.logger.info(f"Saved model.norm.weight: {norm_module.weight.shape}")
 
         # Debug: Print shapes of attention and MLP weights
         self.logger.info("=" * 60)
@@ -407,6 +424,38 @@ class ResQCalibrator:
                         self.logger.info(f"  weight_high shape: {quant_weights['weight_high'].shape}")
                         self.logger.info(f"  scale_high shape: {quant_weights['scale_high'].shape}")
         self.logger.info("=" * 60)
+
+        # Save per-layer normalization weights
+        for name, module in self.model.named_modules():
+            # Save input_layernorm weights
+            if 'input_layernorm' in name and hasattr(module, 'weight'):
+                if module.weight is not None:
+                    weight_dict[f"{name}.weight"] = module.weight.data.cpu()
+                    quant_description[f"{name}.weight"] = "FLOAT"
+                if hasattr(module, 'bias') and module.bias is not None:
+                    weight_dict[f"{name}.bias"] = module.bias.data.cpu()
+                    quant_description[f"{name}.bias"] = "FLOAT"
+
+            # Save post_attention_layernorm weights
+            if 'post_attention_layernorm' in name and hasattr(module, 'weight'):
+                if module.weight is not None:
+                    weight_dict[f"{name}.weight"] = module.weight.data.cpu()
+                    quant_description[f"{name}.weight"] = "FLOAT"
+                if hasattr(module, 'bias') and module.bias is not None:
+                    weight_dict[f"{name}.bias"] = module.bias.data.cpu()
+                    quant_description[f"{name}.bias"] = "FLOAT"
+
+            # Save self_attn.q_norm weights (Qwen3 specific)
+            if 'q_norm' in name and hasattr(module, 'weight'):
+                if module.weight is not None:
+                    weight_dict[f"{name}.weight"] = module.weight.data.cpu()
+                    quant_description[f"{name}.weight"] = "FLOAT"
+
+            # Save self_attn.k_norm weights (Qwen3 specific)
+            if 'k_norm' in name and hasattr(module, 'weight'):
+                if module.weight is not None:
+                    weight_dict[f"{name}.weight"] = module.weight.data.cpu()
+                    quant_description[f"{name}.weight"] = "FLOAT"
 
         for name, module in self.model.named_modules():
             if isinstance(module, LinearResQQuantizer):

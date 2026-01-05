@@ -511,20 +511,26 @@ def compute_basis(
         # Swap inputs and outputs for next layer
         inps, outs = outs, [None] * nbatches
 
-    # ========== Step 4: Eigenvalue decomposition (per-layer mode) ==========
+    # ========== Step 4: Eigenvalue decomposition ==========
     eigen_device = get_eigen_device()
     total_eigen_start = time.time()
 
+    # Get rotation granularity from config
+    rotation_granularity = getattr(config, 'rotation_granularity', 'full_shared')
+
     logger.info("=" * 60)
-    logger.info("Starting eigenvalue decomposition (per-layer mode)...")
+    logger.info(f"Starting eigenvalue decomposition (mode: {rotation_granularity})...")
     logger.info(f"Total layers: {nlayers}")
     logger.info(f"Eigen device: {eigen_device}")
-    logger.info(f"Matrices per layer:")
-    logger.info(f"  - attn:     [{hidden_dim}x{hidden_dim}]")
-    logger.info(f"  - mlp:      [{hidden_dim}x{hidden_dim}]")
-    logger.info(f"  - value:    [{num_kv_heads} heads x {head_dim}x{head_dim}]")
-    logger.info(f"  - key_pos:  [{head_dim}x{head_dim}]")
-    logger.info(f"  - down_proj:[{down_proj_blocksize}x{down_proj_blocksize}] (block-wise, {intermediate_size//down_proj_blocksize} blocks)")
+    logger.info(f"Matrices:")
+    if rotation_granularity == 'full_shared':
+        logger.info(f"  - attn_mlp (shared): [{hidden_dim}x{hidden_dim}]")
+    else:
+        logger.info(f"  - attn:     [{hidden_dim}x{hidden_dim}] per layer")
+        logger.info(f"  - mlp:      [{hidden_dim}x{hidden_dim}] per layer")
+    logger.info(f"  - value:    [{num_kv_heads} heads x {head_dim}x{head_dim}] per layer")
+    logger.info(f"  - key_pos:  [{head_dim}x{head_dim}] per layer (shared across heads)")
+    logger.info(f"  - down_proj:[{down_proj_blocksize}x{down_proj_blocksize}] per layer")
     logger.info("=" * 60)
 
     basis_dict = {}
@@ -534,95 +540,206 @@ def compute_basis(
     normalizer = nbatches * seqlen if seqlen > 0 else 1
 
     # Determine number of parallel workers
-    # For CPU: use multiple threads for parallel eigendecomposition
-    # For GPU: typically 1 worker is enough as GPU handles parallelism internally
     max_workers = 128 if eigen_device.type == 'cpu' else 2
-
     logger.info(f"Using {max_workers} parallel workers for eigendecomposition")
 
-    # Per-layer basis computation with parallel processing
-    for i in range(nlayers):
-        layer_start = time.time()
-        logger.info(f"[Layer {i+1}/{nlayers}] Starting eigendecomposition...")
+    if rotation_granularity == 'full_shared':
+        # ===== Full Shared Mode =====
+        # Single shared basis for attn+mlp across all layers
+        logger.info("Computing shared attn_mlp basis (sum across all layers)...")
 
-        # Prepare all eigendecomposition tasks for this layer
-        tasks = [
-            ('attn', H_attn[i] / normalizer, False, 0),
-            ('mlp', H_mlp[i] / normalizer, False, 0),
-            ('value', H_value[i] / normalizer, True, num_kv_heads),
-            ('key_pos', H_key_pos[i].sum(0) / (num_kv_heads * normalizer), False, 0),
-            ('down_proj', H_down_proj[i] / normalizer, False, 0),
-        ]
+        # Sum H_attn and H_mlp across all layers and merge
+        H_attn_mlp_sum = (H_attn.sum(0) + H_mlp.sum(0)) / (2 * nlayers * normalizer)
 
-        results = {}
-        timings = {}
+        # Eigendecomposition for shared attn_mlp
+        eval_attn_mlp, evec_attn_mlp = perform_eigen_decomp(
+            H_attn_mlp_sum, damp_percent=0.01, device=eigen_device
+        )
+        basis_dict['config'] = 'full_shared_rotation'
+        basis_dict['attn_mlp'] = evec_attn_mlp
+        eval_dict['config'] = 'full_shared_rotation'
+        eval_dict['attn_mlp'] = eval_attn_mlp
+        logger.info(f"  Shared attn_mlp basis computed: {evec_attn_mlp.shape}")
 
-        # Run eigendecompositions in parallel using ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {}
-            for task_name, cov_matrix, per_head, n_heads in tasks:
-                future = executor.submit(
-                    perform_eigen_decomp_timed,
-                    task_name,
-                    cov_matrix,
-                    0.01,  # damp_percent
-                    per_head,
-                    n_heads,
-                    eigen_device,
-                )
-                futures[future] = task_name
+        # Per-layer eigendecompositions for value, key_pos, down_proj
+        for i in tqdm(range(nlayers), desc="Per-layer basis (full_shared)"):
+            layer_start = time.time()
 
-            # Collect results as they complete
-            for future in as_completed(futures):
-                task_name = futures[future]
-                try:
-                    name, eigenvalues, eigenvectors, elapsed = future.result()
-                    results[name] = (eigenvalues, eigenvectors)
-                    timings[name] = elapsed
-                except Exception as e:
-                    logger.error(f"  [Layer {i+1}] {task_name} failed: {e}")
-                    raise
+            tasks = [
+                ('value', H_value[i] / normalizer, True, num_kv_heads),
+                ('key_pos', H_key_pos[i].sum(0) / (num_kv_heads * normalizer), False, 0),
+                ('down_proj', H_down_proj[i] / normalizer, False, 0),
+            ]
 
-        # Store results in basis_dict
-        if 'attn' in results:
-            eval_attn, evec_attn = results['attn']
-            basis_dict[f'layer.{i}.self_attn'] = evec_attn
-            eval_dict[f'layer.{i}.self_attn'] = eval_attn
+            results = {}
+            timings = {}
 
-        if 'mlp' in results:
-            eval_mlp, evec_mlp = results['mlp']
-            basis_dict[f'layer.{i}.mlp'] = evec_mlp
-            eval_dict[f'layer.{i}.mlp'] = eval_mlp
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {}
+                for task_name, cov_matrix, per_head, n_heads in tasks:
+                    future = executor.submit(
+                        perform_eigen_decomp_timed,
+                        task_name, cov_matrix, 0.01, per_head, n_heads, eigen_device,
+                    )
+                    futures[future] = task_name
 
-        if 'value' in results:
-            eval_value, evec_value = results['value']
-            basis_dict[f'layer.{i}.self_attn.value'] = evec_value
-            eval_dict[f'layer.{i}.self_attn.value'] = eval_value
+                for future in as_completed(futures):
+                    task_name = futures[future]
+                    try:
+                        name, eigenvalues, eigenvectors, elapsed = future.result()
+                        results[name] = (eigenvalues, eigenvectors)
+                        timings[name] = elapsed
+                    except Exception as e:
+                        logger.error(f"  [Layer {i+1}] {task_name} failed: {e}")
+                        raise
 
-        if 'key_pos' in results:
-            eval_key_pos, evec_key_pos = results['key_pos']
-            basis_dict[f'layer.{i}.self_attn.key_pos'] = evec_key_pos
-            eval_dict[f'layer.{i}.self_attn.key_pos'] = eval_key_pos
+            if 'value' in results:
+                eval_value, evec_value = results['value']
+                basis_dict[f'layer.{i}.self_attn.value'] = evec_value
+                eval_dict[f'layer.{i}.self_attn.value'] = eval_value
 
-        if 'down_proj' in results:
-            eval_down_proj, evec_down_proj = results['down_proj']
-            basis_dict[f'layer.{i}.mlp.down_proj'] = evec_down_proj
-            eval_dict[f'layer.{i}.mlp.down_proj'] = eval_down_proj
+            if 'key_pos' in results:
+                eval_key_pos, evec_key_pos = results['key_pos']
+                basis_dict[f'layer.{i}.self_attn.key_pos'] = evec_key_pos
+                eval_dict[f'layer.{i}.self_attn.key_pos'] = eval_key_pos
 
-        layer_elapsed = time.time() - layer_start
+            if 'down_proj' in results:
+                eval_down_proj, evec_down_proj = results['down_proj']
+                basis_dict[f'layer.{i}.mlp.down_proj'] = evec_down_proj
+                eval_dict[f'layer.{i}.mlp.down_proj'] = eval_down_proj
 
-        # Log timing breakdown
-        timing_str = ", ".join([f"{k}:{v:.2f}s" for k, v in sorted(timings.items(), key=lambda x: -x[1])])
-        logger.info(f"  [Layer {i+1}] Timing: {timing_str}")
-        logger.info(f"[Layer {i+1}/{nlayers}] Complete in {layer_elapsed:.2f}s (parallel)")
+            cleanup_memory()
 
-        cleanup_memory()
+    elif rotation_granularity == 'one_per_decoder':
+        # ===== One Per Decoder Mode =====
+        # Per-layer shared basis for attn+mlp
+        for i in tqdm(range(nlayers), desc="Per-layer basis (one_per_decoder)"):
+            layer_start = time.time()
+
+            # Merge attn and mlp for this layer
+            H_attn_mlp_layer = (H_attn[i] + H_mlp[i]) / (2 * normalizer)
+
+            tasks = [
+                ('attn_mlp', H_attn_mlp_layer, False, 0),
+                ('value', H_value[i] / normalizer, True, num_kv_heads),
+                ('key_pos', H_key_pos[i].sum(0) / (num_kv_heads * normalizer), False, 0),
+                ('down_proj', H_down_proj[i] / normalizer, False, 0),
+            ]
+
+            results = {}
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {}
+                for task_name, cov_matrix, per_head, n_heads in tasks:
+                    future = executor.submit(
+                        perform_eigen_decomp_timed,
+                        task_name, cov_matrix, 0.01, per_head, n_heads, eigen_device,
+                    )
+                    futures[future] = task_name
+
+                for future in as_completed(futures):
+                    task_name = futures[future]
+                    try:
+                        name, eigenvalues, eigenvectors, elapsed = future.result()
+                        results[name] = (eigenvalues, eigenvectors)
+                    except Exception as e:
+                        logger.error(f"  [Layer {i+1}] {task_name} failed: {e}")
+                        raise
+
+            basis_dict['config'] = 'one_per_decoder'
+            if 'attn_mlp' in results:
+                eval_attn_mlp, evec_attn_mlp = results['attn_mlp']
+                basis_dict[f'layer.{i}.self_attn_mlp'] = evec_attn_mlp
+                eval_dict[f'layer.{i}.self_attn_mlp'] = eval_attn_mlp
+
+            if 'value' in results:
+                eval_value, evec_value = results['value']
+                basis_dict[f'layer.{i}.self_attn.value'] = evec_value
+                eval_dict[f'layer.{i}.self_attn.value'] = eval_value
+
+            if 'key_pos' in results:
+                eval_key_pos, evec_key_pos = results['key_pos']
+                basis_dict[f'layer.{i}.self_attn.key_pos'] = evec_key_pos
+                eval_dict[f'layer.{i}.self_attn.key_pos'] = eval_key_pos
+
+            if 'down_proj' in results:
+                eval_down_proj, evec_down_proj = results['down_proj']
+                basis_dict[f'layer.{i}.mlp.down_proj'] = evec_down_proj
+                eval_dict[f'layer.{i}.mlp.down_proj'] = eval_down_proj
+
+            cleanup_memory()
+
+    else:
+        # ===== Per Layer Mode =====
+        # Separate basis for each layer's attn and mlp
+        for i in tqdm(range(nlayers), desc="Per-layer basis"):
+            layer_start = time.time()
+
+            tasks = [
+                ('attn', H_attn[i] / normalizer, False, 0),
+                ('mlp', H_mlp[i] / normalizer, False, 0),
+                ('value', H_value[i] / normalizer, True, num_kv_heads),
+                ('key_pos', H_key_pos[i].sum(0) / (num_kv_heads * normalizer), False, 0),
+                ('down_proj', H_down_proj[i] / normalizer, False, 0),
+            ]
+
+            results = {}
+            timings = {}
+
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {}
+                for task_name, cov_matrix, per_head, n_heads in tasks:
+                    future = executor.submit(
+                        perform_eigen_decomp_timed,
+                        task_name, cov_matrix, 0.01, per_head, n_heads, eigen_device,
+                    )
+                    futures[future] = task_name
+
+                for future in as_completed(futures):
+                    task_name = futures[future]
+                    try:
+                        name, eigenvalues, eigenvectors, elapsed = future.result()
+                        results[name] = (eigenvalues, eigenvectors)
+                        timings[name] = elapsed
+                    except Exception as e:
+                        logger.error(f"  [Layer {i+1}] {task_name} failed: {e}")
+                        raise
+
+            basis_dict['config'] = 'per_layer_rotation'
+            if 'attn' in results:
+                eval_attn, evec_attn = results['attn']
+                basis_dict[f'layer.{i}.self_attn'] = evec_attn
+                eval_dict[f'layer.{i}.self_attn'] = eval_attn
+
+            if 'mlp' in results:
+                eval_mlp, evec_mlp = results['mlp']
+                basis_dict[f'layer.{i}.mlp'] = evec_mlp
+                eval_dict[f'layer.{i}.mlp'] = eval_mlp
+
+            if 'value' in results:
+                eval_value, evec_value = results['value']
+                basis_dict[f'layer.{i}.self_attn.value'] = evec_value
+                eval_dict[f'layer.{i}.self_attn.value'] = eval_value
+
+            if 'key_pos' in results:
+                eval_key_pos, evec_key_pos = results['key_pos']
+                basis_dict[f'layer.{i}.self_attn.key_pos'] = evec_key_pos
+                eval_dict[f'layer.{i}.self_attn.key_pos'] = eval_key_pos
+
+            if 'down_proj' in results:
+                eval_down_proj, evec_down_proj = results['down_proj']
+                basis_dict[f'layer.{i}.mlp.down_proj'] = evec_down_proj
+                eval_dict[f'layer.{i}.mlp.down_proj'] = eval_down_proj
+
+            layer_elapsed = time.time() - layer_start
+            timing_str = ", ".join([f"{k}:{v:.2f}s" for k, v in sorted(timings.items(), key=lambda x: -x[1])])
+            logger.info(f"  [Layer {i+1}] Timing: {timing_str}")
+
+            cleanup_memory()
 
     total_eigen_elapsed = time.time() - total_eigen_start
     logger.info("=" * 60)
     logger.info(f"Eigendecomposition complete!")
     logger.info(f"Total time: {total_eigen_elapsed:.2f}s ({total_eigen_elapsed/60:.1f} min)")
-    logger.info(f"Average per layer: {total_eigen_elapsed/nlayers:.2f}s")
     logger.info(f"Total basis matrices: {len(basis_dict)}")
     logger.info(f"Keys: {list(basis_dict.keys())[:10]}... (showing first 10)")
 

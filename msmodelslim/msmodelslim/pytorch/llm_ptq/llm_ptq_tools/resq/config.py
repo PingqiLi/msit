@@ -27,10 +27,13 @@ class ResQConfig:
         self.dev_type = dev_type
         self.dev_id = dev_id
 
-        # Rotation mode: 'resq' (only per_layer mode supported)
+        # Rotation mode: 'resq' or 'none'
         self.rotate_mode = rotate_mode
-        # Rotation granularity: always 'per_layer' (other modes removed)
-        self.rotation_granularity = 'per_layer'
+        # Rotation granularity: 'full_shared' (default), 'per_layer', or 'one_per_decoder'
+        # - full_shared: single shared basis for attn+mlp across all layers (recommended)
+        # - per_layer: separate basis for each layer's attn and mlp
+        # - one_per_decoder: per-layer shared basis for attn+mlp
+        self.rotation_granularity = kwargs.get('rotation_granularity', 'full_shared')
 
         # Paths for pre-computed rotations and basis
         self.optimized_rotation_path = kwargs.get('optimized_rotation_path', None)

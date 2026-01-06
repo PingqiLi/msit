@@ -315,7 +315,6 @@ def rotate_ov_proj(
 def rearrange_o_proj(
     layer: nn.Module,
     high_bits_length: int,
-    low_bits_length: int,
     head_dim: int,
     training: bool = False,
 ) -> None:
@@ -323,13 +322,12 @@ def rearrange_o_proj(
     Rearrange o_proj columns for mixed-precision layout.
 
     Reorders columns so that:
-    - Low precision dimensions are at the beginning
+    - Mid precision dimensions are at the beginning
     - High precision dimensions are at the end
 
     Args:
         layer: Decoder layer
         high_bits_length: Number of high precision dimensions
-        low_bits_length: Number of low precision dimensions
         head_dim: Dimension per head
         training: Whether in training mode
     """
@@ -338,7 +336,6 @@ def rearrange_o_proj(
     in_dim = o_proj.weight.shape[-1]
     num_replicated_heads = in_dim // head_dim
     high_length_per_head = high_bits_length // num_replicated_heads
-    low_length_per_head = low_bits_length // num_replicated_heads
 
     # Build column indices for rearrangement
     chunk_starts = torch.arange(0, in_dim, head_dim)
@@ -347,19 +344,14 @@ def rearrange_o_proj(
     high_precision_columns = torch.arange(head_dim - high_length_per_head, head_dim)
     columns_to_end = (chunk_starts.unsqueeze(1) + high_precision_columns).flatten()
 
-    # Low precision columns (first in each head)
-    low_precision_columns = torch.arange(0, low_length_per_head)
-    columns_to_beginning = (chunk_starts.unsqueeze(1) + low_precision_columns).flatten()
-
-    # Remaining columns (middle precision)
+    # Remaining columns (mid precision)
     all_columns = torch.arange(in_dim)
     mask = torch.ones(in_dim, dtype=torch.bool)
     mask[columns_to_end] = False
-    mask[columns_to_beginning] = False
     remaining_columns = all_columns[mask]
 
-    # New column order: [low | middle | high]
-    new_column_order = torch.cat([columns_to_beginning, remaining_columns, columns_to_end])
+    # New column order: [mid | high]
+    new_column_order = torch.cat([remaining_columns, columns_to_end])
 
     # Rearrange weights
     if not training:
@@ -401,14 +393,12 @@ def rearrange_columns(
             head_dim = model_dim // num_heads
 
     high_bits_length = int(config.high_fraction * model_dim)
-    low_bits_length = int(config.low_fraction * model_dim)
 
     layers = list(model.model.layers)
     for idx, layer in enumerate(tqdm(layers, desc="Rearranging columns")):
         rearrange_o_proj(
             layer,
             high_bits_length,
-            low_bits_length,
             head_dim,
             training,
         )
@@ -552,21 +542,18 @@ def configure_quantizers(
     head_dim = model_dim // num_heads
 
     high_bits_length = int(config.high_fraction * model_dim)
-    low_bits_length = int(config.low_fraction * model_dim)
     high_bits_length_head = int(config.high_fraction * head_dim)
-    low_bits_length_head = int(config.low_fraction * head_dim)
 
     for name, module in model.named_modules():
         if isinstance(module, ActQuantWrapper):
-            # Configure input quantizer
+            # Configure input quantizer (symmetric quantization)
             module.quantizer.configure(
                 bits=config.a_bits,
                 groupsize=config.a_groupsize,
-                sym=not config.a_asym,
+                sym=True,  # Always symmetric
                 clip_ratio=config.a_clip_ratio,
                 high_bits_length=high_bits_length,
                 high_bits=config.high_bits,
-                low_bits_length=low_bits_length,
                 low_bits=config.low_bits,
             )
 
@@ -575,11 +562,10 @@ def configure_quantizers(
                 module.out_quantizer.configure(
                     bits=config.v_bits if 'v_proj' in name else 16,
                     groupsize=-1,
-                    sym=not config.v_asym,
+                    sym=True,  # Always symmetric
                     clip_ratio=config.v_clip_ratio,
                     high_bits_length=high_bits_length_head * num_heads,
                     high_bits=config.high_bits,
-                    low_bits_length=low_bits_length_head * num_heads,
                     low_bits=config.low_bits,
                 )
 
@@ -627,7 +613,6 @@ def resq_quantize(
             hidden_dim=model.config.hidden_size,
             head_dim=model.config.hidden_size // model.config.num_attention_heads,
             high_fraction=config.high_fraction,
-            low_fraction=config.low_fraction,
             seed=config.seed,
         )
 

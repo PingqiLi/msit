@@ -128,16 +128,18 @@ class ResQCalibrator:
                         head_dim = v_proj.out_features // num_kv_heads
                     else:
                         head_dim = model.config.hidden_size // model.config.num_attention_heads
-                # Get down_proj_blocksize for Rd rotation (block-wise approach)
-                # This is the blocksize used for down_proj, not the full intermediate_size
-                down_proj_blocksize = self.cfg.down_proj_blocksize
-                self.logger.info(f"Using down_proj_blocksize={down_proj_blocksize} for Rd rotation")
+                # Get intermediate_size for H/Rd generation (full dimension)
+                # H and Rd are applied to the full intermediate_size, not blocksize
+                intermediate_size = model.config.intermediate_size
+                ud_rotation_type = self.cfg.ud_rotation_type
+                self.logger.info(f"Generating rotations with ud_rotation_type={ud_rotation_type}, intermediate_size={intermediate_size}")
                 self.rotation_dict = generate_random_rotations(
                     hidden_dim=model.config.hidden_size,
                     head_dim=head_dim,
-                    intermediate_dim=down_proj_blocksize,  # Use blocksize, not full intermediate_size
+                    intermediate_dim=intermediate_size,  # Use full intermediate_size for H/Rd
                     high_fraction=self.cfg.high_fraction,
                     seed=self.cfg.seed,
+                    ud_rotation_type=ud_rotation_type,
                 )
 
             # Apply rotations with basis
@@ -762,7 +764,9 @@ class ResQCalibrator:
         # Save online rotation matrices following original ResQ
         # Per-layer online projections:
         # - Uc: layer.{i}.self_attn.key_pos @ R2 (for K cache rotation after RoPE)
-        # - Ud: layer.{i}.mlp.down_proj @ Rd (for down_proj input rotation)
+        # - Ud: depends on ud_rotation_type:
+        #   - 'hadamard': save Pd per layer + Hd globally (runtime: act @ block_diag(Pd) @ H)
+        #   - 'random': save full Ud = block_diag(Pd) @ Rd per layer (runtime: act @ Ud)
         # Note: All other U matrices (attn_mlp, value, etc.) are merged into weights
         if self.rotation_dict is not None and not self._use_simplified_mode:
             self.logger.info("Saving online rotation matrices (Uc, Ud)...")
@@ -775,15 +779,10 @@ class ResQCalibrator:
             if R2_1 is not None and R2_2 is not None:
                 R2 = torch.block_diag(R2_1.to(torch.float64), R2_2.to(torch.float64))
 
-            # Build full Rd rotation matrix for intermediate dimension (down_proj)
-            Rd_1 = self.rotation_dict.get('Rd_1')
-            Rd_2 = self.rotation_dict.get('Rd_2')
-
-            Rd = None
-            if Rd_1 is not None and Rd_2 is not None:
-                Rd = torch.block_diag(Rd_1.to(torch.float64), Rd_2.to(torch.float64))
-
             nlayers = self.model.config.num_hidden_layers
+            intermediate_size = self.model.config.intermediate_size
+            blocksize = self.cfg.down_proj_blocksize
+            ud_rotation_type = self.cfg.ud_rotation_type
 
             # Per-layer Uc: key_pos @ R2 (for K cache rotation after RoPE)
             if self.basis_dict is not None:
@@ -801,29 +800,72 @@ class ResQCalibrator:
                             quant_description[f'resq.layer.{i}.Uc'] = "FLOAT"
                 self.logger.info(f"  Saved {nlayers} per-layer Uc matrices (key_pos @ R2)")
 
-                # Per-layer Ud: down_proj @ Rd (for down_proj input rotation)
-                for i in range(nlayers):
-                    key = f'layer.{i}.mlp.down_proj'
-                    if key in self.basis_dict:
-                        U_down_proj = self.basis_dict[key].to(torch.float64)
-                        if Rd is not None:
-                            Ud = torch.matmul(U_down_proj, Rd)
-                            weight_dict[f'resq.layer.{i}.Ud'] = Ud.float().cpu()
-                            quant_description[f'resq.layer.{i}.Ud'] = "FLOAT"
-                        else:
-                            weight_dict[f'resq.layer.{i}.Ud'] = U_down_proj.float().cpu()
-                            quant_description[f'resq.layer.{i}.Ud'] = "FLOAT"
-                self.logger.info(f"  Saved {nlayers} per-layer Ud matrices (down_proj @ Rd)")
+                # Per-layer Ud: save based on ud_rotation_type
+                if ud_rotation_type == 'hadamard':
+                    # Hadamard mode: save Pd per layer [blocksize, blocksize] + Hd globally
+                    self.logger.info(f"  Saving Ud in Hadamard mode (Pd per layer + Hd globally)")
+
+                    # Save Pd per layer
+                    for i in range(nlayers):
+                        key = f'layer.{i}.mlp.down_proj'
+                        if key in self.basis_dict:
+                            Pd = self.basis_dict[key].to(torch.float64)
+                            weight_dict[f'resq.layer.{i}.Pd'] = Pd.float().cpu()
+                            quant_description[f'resq.layer.{i}.Pd'] = "FLOAT"
+                    self.logger.info(f"    Saved {nlayers} per-layer Pd matrices [{blocksize}x{blocksize}]")
+
+                    # Save global Hadamard info
+                    hadK = self.rotation_dict.get('Hd')
+                    K = self.rotation_dict.get('Hd_K', 1)
+                    if hadK is not None:
+                        weight_dict['resq.Hd'] = hadK.float().cpu()
+                        quant_description['resq.Hd'] = "FLOAT"
+                        self.logger.info(f"    Saved resq.Hd [{hadK.shape[0]}x{hadK.shape[1]}]")
+                    weight_dict['resq.Hd_K'] = torch.tensor(K, dtype=torch.int64)
+                    quant_description['resq.Hd_K'] = "INT"
+                    self.logger.info(f"    Saved resq.Hd_K = {K}")
+
+                    # Save intermediate_size and blocksize for inference
+                    weight_dict['resq.intermediate_size'] = torch.tensor(intermediate_size, dtype=torch.int64)
+                    weight_dict['resq.down_proj_blocksize'] = torch.tensor(blocksize, dtype=torch.int64)
+                    quant_description['resq.intermediate_size'] = "INT"
+                    quant_description['resq.down_proj_blocksize'] = "INT"
+
+                else:  # 'random' mode
+                    # Random mode: compute and save full Ud = block_diag(Pd) @ Rd per layer
+                    self.logger.info(f"  Saving Ud in random mode (full Ud per layer)")
+
+                    Rd = self.rotation_dict.get('Rd')
+                    if Rd is None:
+                        self.logger.warning("  Rd not found in rotation_dict, skipping Ud saving")
+                    else:
+                        Rd = Rd.to(torch.float64)
+                        num_blocks = intermediate_size // blocksize
+
+                        for i in range(nlayers):
+                            key = f'layer.{i}.mlp.down_proj'
+                            if key in self.basis_dict:
+                                Pd = self.basis_dict[key].to(torch.float64)
+
+                                # Build full Ud = block_diag(Pd) @ Rd
+                                # Efficient: apply Pd block-wise to Rd
+                                Ud = torch.zeros(intermediate_size, intermediate_size, dtype=torch.float64)
+                                for b in range(num_blocks):
+                                    start_idx = b * blocksize
+                                    end_idx = (b + 1) * blocksize
+                                    # Ud[start:end, :] = Pd @ Rd[start:end, :]
+                                    Ud[start_idx:end_idx, :] = torch.matmul(Pd, Rd[start_idx:end_idx, :])
+
+                                weight_dict[f'resq.layer.{i}.Ud'] = Ud.float().cpu()
+                                quant_description[f'resq.layer.{i}.Ud'] = "FLOAT"
+
+                        self.logger.info(f"    Saved {nlayers} per-layer Ud matrices [{intermediate_size}x{intermediate_size}]")
 
             elif R2 is not None:
                 # Simplified mode: save R2 as shared Uc
                 weight_dict['resq.R2'] = R2.float().cpu()
                 quant_description['resq.R2'] = "FLOAT"
                 self.logger.info(f"  R2 shape: {R2.shape} (simplified mode)")
-                if Rd is not None:
-                    weight_dict['resq.Rd'] = Rd.float().cpu()
-                    quant_description['resq.Rd'] = "FLOAT"
-                    self.logger.info(f"  Rd shape: {Rd.shape} (simplified mode)")
 
         # Save using SafeTensors
         if "safe_tensor" in save_type:

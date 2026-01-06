@@ -23,6 +23,8 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 
+from ..utils.hadamard_utils import get_hadK, random_orthogonal_matrix as had_random_orthogonal
+
 logger = logging.getLogger(__name__)
 
 
@@ -752,6 +754,7 @@ def generate_random_rotations(
     intermediate_dim: int = None,
     high_fraction: float = 0.125,
     seed: int = 42,
+    ud_rotation_type: str = 'hadamard',
 ) -> Dict[str, torch.Tensor]:
     """
     Generate random orthogonal rotation matrices for ResQ.
@@ -765,9 +768,12 @@ def generate_random_rotations(
         intermediate_dim: Intermediate dimension for down_proj (MLP)
         high_fraction: Fraction for high precision (8-bit)
         seed: Random seed for reproducibility
+        ud_rotation_type: Type of rotation for Ud (down_proj):
+            - 'hadamard': Use Hadamard matrix for full intermediate_dim
+            - 'random': Use random orthogonal matrix for full intermediate_dim
 
     Returns:
-        Dictionary of rotation matrices (R1_1, R1_2, R2_1, R2_2, Rd_1, Rd_2)
+        Dictionary of rotation matrices (R1_1, R1_2, R2_1, R2_2, and Hd/Hd_K or Rd)
     """
     torch.manual_seed(seed)
 
@@ -803,11 +809,26 @@ def generate_random_rotations(
     rotation_dict['R2_1'] = R2_1
     rotation_dict['R2_2'] = R2_2
 
-    # Generate block-diagonal Rd for down_proj
+    # Generate rotation for down_proj (Ud = block_diag(Pd) @ H or Rd)
+    # H/Rd is applied to full intermediate_dim
     if intermediate_dim is not None:
+        if ud_rotation_type == 'hadamard':
+            # Get Hadamard for full intermediate dimension using get_hadK
+            hadK, K = get_hadK(intermediate_dim)
+            rotation_dict['Hd'] = hadK  # May be None for pure power-of-2
+            rotation_dict['Hd_K'] = K
+            logger.info(f"Generated Hadamard rotation for Ud: intermediate_dim={intermediate_dim}, K={K}")
+        else:  # 'random'
+            # Generate random orthogonal for full intermediate dimension
+            # Use had_random_orthogonal for consistency with hadamard_utils
+            Rd = had_random_orthogonal(intermediate_dim)
+            rotation_dict['Rd'] = Rd
+            logger.info(f"Generated random orthogonal rotation for Ud: intermediate_dim={intermediate_dim}")
+
+        # Also keep block-diagonal Rd for backward compatibility (if needed elsewhere)
+        # These are no longer used for Ud but may be referenced elsewhere
         high_inter_dim = int(high_fraction * intermediate_dim)
         mid_inter_dim = intermediate_dim - high_inter_dim
-
         Rd_1 = random_orthogonal_matrix(mid_inter_dim)
         Rd_2 = random_orthogonal_matrix(high_inter_dim)
         rotation_dict['Rd_1'] = Rd_1

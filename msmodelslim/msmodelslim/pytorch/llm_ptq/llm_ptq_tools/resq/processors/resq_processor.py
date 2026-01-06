@@ -157,6 +157,106 @@ def rotate_mlp_output(
         W.bias.data = torch.matmul(R1.T.cpu(), b).to(dtype=dtype)
 
 
+def rotate_mlp_output_hadamard(
+    layer: nn.Module,
+    Ua: torch.Tensor,
+    Pd: torch.Tensor,
+    hadK: Optional[torch.Tensor],
+    K: int,
+    blocksize: int,
+) -> None:
+    """
+    Rotate the MLP output (down_proj) weights using Hadamard mode.
+
+    Computes: Wd_merged = H.T @ block_diag(Pd).T @ Wd @ Ua
+
+    Args:
+        layer: Decoder layer
+        Ua: Rotation matrix for hidden dimension (output rotation)
+        Pd: Per-layer eigenvector matrix [blocksize, blocksize]
+        hadK: Hadamard block matrix from get_hadK() (may be None for power-of-2)
+        K: Block size for Hadamard factorization
+        blocksize: Block size for Pd (down_proj_blocksize)
+    """
+    W = layer.mlp.down_proj
+    dtype = W.weight.data.dtype
+    dev = W.weight.device
+    W_ = W.weight.data.to(dtype=torch.float64, device='cpu')
+
+    intermediate_size = W_.shape[1]
+    num_blocks = intermediate_size // blocksize
+
+    # Step 1: Apply Ua to output dimension: W1 = Ua.T @ Wd
+    W_ = torch.matmul(Ua.T.cpu().to(torch.float64), W_)
+
+    # Step 2: Apply block_diag(Pd).T to input dimension
+    # Reshape to [hidden_dim, num_blocks, blocksize]
+    W_ = W_.view(W_.shape[0], num_blocks, blocksize)
+    # Apply Pd.T to each block (broadcast across all blocks)
+    W_ = torch.matmul(W_, Pd.T.cpu().to(torch.float64))
+    # Reshape back to [hidden_dim, intermediate_size]
+    W_ = W_.view(W_.shape[0], intermediate_size)
+
+    # Step 3: Apply H.T using fast Hadamard
+    # H.T @ W_.T = (W_ @ H).T, so we compute W_ @ H
+    W_ = matmul_hadU_cpu(W_, hadK, K)
+
+    W.weight.data = W_.to(device=dev, dtype=dtype)
+
+    if W.bias is not None:
+        b = W.bias.data.to(dtype=torch.float64, device='cpu')
+        W.bias.data = torch.matmul(Ua.T.cpu().to(torch.float64), b).to(dtype=dtype)
+
+
+def rotate_mlp_output_random(
+    layer: nn.Module,
+    Ua: torch.Tensor,
+    Pd: torch.Tensor,
+    Rd: torch.Tensor,
+    blocksize: int,
+) -> None:
+    """
+    Rotate the MLP output (down_proj) weights using random rotation mode.
+
+    Computes: Wd_merged = Rd.T @ block_diag(Pd).T @ Wd @ Ua
+
+    Args:
+        layer: Decoder layer
+        Ua: Rotation matrix for hidden dimension (output rotation)
+        Pd: Per-layer eigenvector matrix [blocksize, blocksize]
+        Rd: Random orthogonal matrix [intermediate_size, intermediate_size]
+        blocksize: Block size for Pd (down_proj_blocksize)
+    """
+    W = layer.mlp.down_proj
+    dtype = W.weight.data.dtype
+    dev = W.weight.device
+    W_ = W.weight.data.to(dtype=torch.float64, device='cpu')
+
+    intermediate_size = W_.shape[1]
+    num_blocks = intermediate_size // blocksize
+
+    # Step 1: Apply Ua to output dimension: W1 = Ua.T @ Wd
+    W_ = torch.matmul(Ua.T.cpu().to(torch.float64), W_)
+
+    # Step 2: Apply block_diag(Pd).T to input dimension
+    # Reshape to [hidden_dim, num_blocks, blocksize]
+    W_ = W_.view(W_.shape[0], num_blocks, blocksize)
+    # Apply Pd.T to each block (broadcast across all blocks)
+    W_ = torch.matmul(W_, Pd.T.cpu().to(torch.float64))
+    # Reshape back to [hidden_dim, intermediate_size]
+    W_ = W_.view(W_.shape[0], intermediate_size)
+
+    # Step 3: Apply Rd.T
+    # Rd.T @ W_.T = (W_ @ Rd).T, so we compute W_ @ Rd
+    W_ = torch.matmul(W_, Rd.cpu().to(torch.float64))
+
+    W.weight.data = W_.to(device=dev, dtype=dtype)
+
+    if W.bias is not None:
+        b = W.bias.data.to(dtype=torch.float64, device='cpu')
+        W.bias.data = torch.matmul(Ua.T.cpu().to(torch.float64), b).to(dtype=dtype)
+
+
 def rotate_head(model: nn.Module, R1: torch.Tensor) -> None:
     """
     Rotate the LM head weights.
@@ -349,6 +449,10 @@ def apply_rotations(
             head_dim = model_dim // num_heads
     high_bits_length = int(config.high_fraction * model_dim)
 
+    # Get Ud rotation type and blocksize from config
+    ud_rotation_type = getattr(config, 'ud_rotation_type', 'hadamard')
+    blocksize = getattr(config, 'down_proj_blocksize', 256)
+
     # Build composite rotation matrices
     R1_1 = rotation_dict['R1_1'].to(torch.float64)
     R1_2 = rotation_dict['R1_2'].to(torch.float64)
@@ -374,6 +478,15 @@ def apply_rotations(
     rotate_embeddings(model, U_attn)
     rotate_head(model, U_attn)
     cleanup_memory(verbos=False)
+
+    # Get Ud rotation matrices based on ud_rotation_type
+    if ud_rotation_type == 'hadamard':
+        hadK = rotation_dict.get('Hd')  # May be None for power-of-2
+        K = rotation_dict.get('Hd_K', 1)
+        logger.info(f"Using Hadamard rotation for Ud (K={K})")
+    else:  # 'random'
+        Rd = rotation_dict.get('Rd')
+        logger.info(f"Using random orthogonal rotation for Ud")
 
     # Rotate each layer
     layers = list(model.model.layers)
@@ -402,9 +515,20 @@ def apply_rotations(
         # Rotate attention output
         rotate_attention_output(layer, U_attn)
 
-        # Rotate MLP
+        # Rotate MLP input
         rotate_mlp_input(layer, U_attn)
-        rotate_mlp_output(layer, R1=U_attn, R4=None)
+
+        # Rotate MLP output (down_proj) based on ud_rotation_type
+        pd_key = f'layer.{idx}.mlp.down_proj'
+        if pd_key in basis_dict:
+            Pd = basis_dict[pd_key].to(torch.float64)
+            if ud_rotation_type == 'hadamard':
+                rotate_mlp_output_hadamard(layer, U_attn, Pd, hadK, K, blocksize)
+            else:  # 'random'
+                rotate_mlp_output_random(layer, U_attn, Pd, Rd, blocksize)
+        else:
+            # Fallback to original rotation if Pd not available
+            rotate_mlp_output(layer, R1=U_attn, R4=None)
 
     cleanup_memory(verbos=False)
 

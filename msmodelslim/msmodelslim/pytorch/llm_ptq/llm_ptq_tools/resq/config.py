@@ -81,6 +81,11 @@ class ResQConfig:
         # Down projection block size for rotation
         self.down_proj_blocksize = kwargs.get('down_proj_blocksize', 256)
 
+        # Ud rotation type: 'hadamard' or 'random'
+        # - hadamard: Ud = block_diag(Pd) @ H, save Pd per layer + H globally
+        # - random: Ud = block_diag(Pd) @ Rd, save full Ud per layer
+        self.ud_rotation_type = kwargs.get('ud_rotation_type', 'hadamard')
+
         # Training rotations (for rotation optimization)
         self.train_rotations = kwargs.get('train_rotations', False)
 
@@ -107,6 +112,8 @@ class ResQConfig:
         """
         assert self.rotate_mode in ['resq', 'none'], \
             f"Invalid rotate_mode: {self.rotate_mode}. Only 'resq' and 'none' are supported."
+        assert self.ud_rotation_type in ['hadamard', 'random'], \
+            f"Invalid ud_rotation_type: {self.ud_rotation_type}. Only 'hadamard' and 'random' are supported."
         assert 0.0 <= self.high_fraction <= 1.0, "high_fraction must be between 0 and 1"
 
         if strict and self.rotate_mode == 'resq':

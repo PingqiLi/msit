@@ -137,7 +137,6 @@ class ResQCalibrator:
                     head_dim=head_dim,
                     intermediate_dim=down_proj_blocksize,  # Use blocksize, not full intermediate_size
                     high_fraction=self.cfg.high_fraction,
-                    low_fraction=self.cfg.low_fraction,
                     seed=self.cfg.seed,
                 )
 
@@ -380,7 +379,6 @@ class ResQCalibrator:
 
         # Mixed precision settings
         high_fraction = self.cfg.high_fraction
-        low_fraction = self.cfg.low_fraction
         high_bits = self.cfg.high_bits
         low_bits = self.cfg.low_bits
 
@@ -504,7 +502,6 @@ class ResQCalibrator:
                     # Determine if mixed precision applies
                     mixed_precision = False
                     high_bits_length = 0
-                    low_bits_length = 0
 
                     # Check if this is a down_proj with int8_down_proj
                     if self.cfg.int8_down_proj and "down_proj" in name:
@@ -516,7 +513,6 @@ class ResQCalibrator:
                         # These projections use mixed precision
                         mixed_precision = True
                         high_bits_length = int(high_fraction * weight.shape[1])
-                        low_bits_length = int(low_fraction * weight.shape[1])
                         layer_bits = low_bits
                     else:
                         layer_bits = low_bits
@@ -537,7 +533,6 @@ class ResQCalibrator:
                         wrapper,
                         mixed_precision=mixed_precision,
                         high_bits_length=high_bits_length,
-                        low_bits_length=low_bits_length,
                     )
 
                     # Configure quantizers
@@ -545,8 +540,6 @@ class ResQCalibrator:
 
                     if mixed_precision:
                         gptq[name].high_quantizer = GPTQWeightQuantizer(bits=high_bits, perchannel=True, sym=self.cfg.w_sym)
-                        if low_bits_length > 0:
-                            gptq[name].low_quantizer = GPTQWeightQuantizer(bits=low_bits, perchannel=True, sym=self.cfg.w_sym)
 
                 # Register hooks to accumulate Hessian
                 def make_add_batch(name):
@@ -777,24 +770,18 @@ class ResQCalibrator:
             # Build full R2 rotation matrix for head dimension
             R2_1 = self.rotation_dict.get('R2_1')
             R2_2 = self.rotation_dict.get('R2_2')
-            R2_0 = self.rotation_dict.get('R2_0')
 
             R2 = None
             if R2_1 is not None and R2_2 is not None:
                 R2 = torch.block_diag(R2_1.to(torch.float64), R2_2.to(torch.float64))
-                if R2_0 is not None:
-                    R2 = torch.block_diag(R2_0.to(torch.float64), R2)
 
             # Build full Rd rotation matrix for intermediate dimension (down_proj)
             Rd_1 = self.rotation_dict.get('Rd_1')
             Rd_2 = self.rotation_dict.get('Rd_2')
-            Rd_0 = self.rotation_dict.get('Rd_0')
 
             Rd = None
             if Rd_1 is not None and Rd_2 is not None:
                 Rd = torch.block_diag(Rd_1.to(torch.float64), Rd_2.to(torch.float64))
-                if Rd_0 is not None:
-                    Rd = torch.block_diag(Rd_0.to(torch.float64), Rd)
 
             nlayers = self.model.config.num_hidden_layers
 

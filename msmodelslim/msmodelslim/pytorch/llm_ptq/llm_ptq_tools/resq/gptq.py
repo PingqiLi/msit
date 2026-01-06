@@ -127,7 +127,6 @@ class GPTQ:
         layer: The linear layer to quantize
         mixed_precision: Whether to use mixed-precision quantization
         high_bits_length: Number of columns for high precision (int8)
-        low_bits_length: Number of columns for low precision (extra low, usually 0)
     """
 
     def __init__(
@@ -135,7 +134,6 @@ class GPTQ:
         layer: nn.Linear,
         mixed_precision: bool = False,
         high_bits_length: int = 0,
-        low_bits_length: int = 0,
     ):
         self.layer = layer
         self.dev = layer.weight.device
@@ -143,7 +141,6 @@ class GPTQ:
 
         self.mixed_precision = mixed_precision
         self.high_bits_length = high_bits_length  # high precision (int8)
-        self.low_bits_length = low_bits_length    # extra low precision (usually 0)
 
         self.rows = W.shape[0]
         self.columns = W.shape[1]
@@ -153,7 +150,6 @@ class GPTQ:
         # Quantizers (to be configured before fasterquant)
         self.quantizer = None      # Main quantizer (4-bit for mid region)
         self.high_quantizer = None  # High precision quantizer (8-bit)
-        self.low_quantizer = None   # Low precision quantizer (extra low, usually not used)
 
     def add_batch(self, inp: torch.Tensor, out: torch.Tensor = None) -> None:
         """
@@ -202,23 +198,19 @@ class GPTQ:
         W = W_org.clone()
 
         # Dimension boundaries for mixed precision
-        # Column layout: [low_dim | mid_dim | high_dim]
+        # Column layout: [mid_dim | high_dim]
         high_dim = W_org.shape[-1] - self.high_bits_length
-        low_dim = self.low_bits_length
         mp = self.mixed_precision
 
         # Find quantization parameters
         if mp:
-            W_l = W[:, :low_dim] if low_dim > 0 else None
-            W_m = W[:, low_dim:high_dim]
+            W_m = W[:, :high_dim]
             W_h = W[:, high_dim:] if self.high_bits_length > 0 else None
 
             if not self.quantizer.ready():
                 self.quantizer.find_params(W_m)
             if self.high_quantizer is not None and not self.high_quantizer.ready() and self.high_bits_length > 0:
                 self.high_quantizer.find_params(W_h)
-            if self.low_quantizer is not None and not self.low_quantizer.ready() and low_dim > 0:
-                self.low_quantizer.find_params(W_l)
         else:
             if not self.quantizer.ready():
                 self.quantizer.find_params(W)
@@ -280,9 +272,6 @@ class GPTQ:
                 if mp and col_idx >= high_dim:
                     # High precision region (int8)
                     q = self.high_quantizer.quantize(w.unsqueeze(1)).flatten()
-                elif mp and col_idx < low_dim:
-                    # Extra low precision region (usually not used)
-                    q = self.low_quantizer.quantize(w.unsqueeze(1)).flatten()
                 else:
                     # Mid precision region (int4)
                     q = self.quantizer.quantize(w.unsqueeze(1)).flatten()
@@ -321,7 +310,6 @@ def create_gptq_quantizers(
     high_bits: int = 8,
     low_bits: int = 4,
     high_fraction: float = 0.125,
-    low_fraction: float = 0.0,
     sym: bool = True,
     mse: bool = False,
 ) -> GPTQ:
@@ -331,9 +319,8 @@ def create_gptq_quantizers(
     Args:
         layer: Linear layer to quantize
         high_bits: Bits for high precision region (default: 8)
-        low_bits: Bits for low/mid precision region (default: 4)
+        low_bits: Bits for mid precision region (default: 4)
         high_fraction: Fraction of columns for high precision
-        low_fraction: Fraction of columns for extra low precision (usually 0)
         sym: Whether to use symmetric quantization
         mse: Whether to use MSE optimization for scale
 
@@ -342,25 +329,19 @@ def create_gptq_quantizers(
     """
     in_features = layer.in_features
     high_bits_length = int(high_fraction * in_features)
-    low_bits_length = int(low_fraction * in_features)
-    mixed_precision = high_bits_length > 0 or low_bits_length > 0
+    mixed_precision = high_bits_length > 0
 
     gptq = GPTQ(
         layer,
         mixed_precision=mixed_precision,
         high_bits_length=high_bits_length,
-        low_bits_length=low_bits_length,
     )
 
-    # Main quantizer (for mid region, usually 4-bit)
+    # Main quantizer (for mid region, 4-bit)
     gptq.quantizer = GPTQWeightQuantizer(bits=low_bits, perchannel=True, sym=sym)
 
     if mixed_precision:
         # High precision quantizer (8-bit)
         gptq.high_quantizer = GPTQWeightQuantizer(bits=high_bits, perchannel=True, sym=sym)
-
-        # Low precision quantizer (extra low, usually not used when low_fraction=0)
-        if low_bits_length > 0:
-            gptq.low_quantizer = GPTQWeightQuantizer(bits=low_bits, perchannel=True, sym=sym)
 
     return gptq

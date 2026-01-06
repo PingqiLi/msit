@@ -13,7 +13,6 @@ class ResQConfig:
         high_bits: int = 8,
         low_bits: int = 4,
         high_fraction: float = 0.125,
-        low_fraction: float = 0.0,
         seed: int = 0,
         dev_type: str = 'npu',
         dev_id: int = 0,
@@ -41,13 +40,10 @@ class ResQConfig:
 
         # Mixed precision fractions
         self.high_fraction = high_fraction  # high precision portion (e.g., 0.125 = 1/8)
-        self.low_fraction = low_fraction    # low precision portion
-        self.sparse_fraction = kwargs.get('sparse_fraction', 0.0)
 
         # Activation Quantization Arguments
         self.a_bits = kwargs.get('a_bits', 4)
         self.a_groupsize = kwargs.get('a_groupsize', -1)
-        self.a_asym = kwargs.get('a_asym', False)
         self.a_clip_ratio = kwargs.get('a_clip_ratio', 1.0)
 
         # High/Low precision bits for activations and weights
@@ -57,20 +53,17 @@ class ResQConfig:
         # Weight Quantization Arguments
         self.w_bits = kwargs.get('w_bits', 4)
         self.w_groupsize = kwargs.get('w_groupsize', -1)
-        self.w_asym = kwargs.get('w_asym', False)
         self.w_sym = kwargs.get('w_sym', True)
         self.w_clip = kwargs.get('w_clip', True)
         self.w_rtn = kwargs.get('w_rtn', True)
 
         # Value cache quantization
         self.v_bits = kwargs.get('v_bits', 4)
-        self.v_asym = kwargs.get('v_asym', False)
         self.v_clip_ratio = kwargs.get('v_clip_ratio', 1.0)
 
         # Key cache quantization
         self.k_bits = kwargs.get('k_bits', 4)
         self.k_groupsize = kwargs.get('k_groupsize', -1)
-        self.k_asym = kwargs.get('k_asym', False)
         self.k_clip_ratio = kwargs.get('k_clip_ratio', 1.0)
         self.k_pre_rope = kwargs.get('k_pre_rope', False)
 
@@ -115,9 +108,6 @@ class ResQConfig:
         assert self.rotate_mode in ['resq', 'none'], \
             f"Invalid rotate_mode: {self.rotate_mode}. Only 'resq' and 'none' are supported."
         assert 0.0 <= self.high_fraction <= 1.0, "high_fraction must be between 0 and 1"
-        assert 0.0 <= self.low_fraction <= 1.0, "low_fraction must be between 0 and 1"
-        assert self.high_fraction + self.low_fraction <= 1.0, \
-            "high_fraction + low_fraction must be <= 1"
 
         if strict and self.rotate_mode == 'resq':
             assert self.optimized_basis_path is not None, \

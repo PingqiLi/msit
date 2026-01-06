@@ -751,24 +751,23 @@ def generate_random_rotations(
     head_dim: int,
     intermediate_dim: int = None,
     high_fraction: float = 0.125,
-    low_fraction: float = 0.0,
     seed: int = 42,
 ) -> Dict[str, torch.Tensor]:
     """
     Generate random orthogonal rotation matrices for ResQ.
 
     The rotations are block-diagonal to preserve precision groupings.
+    Only two precision levels: mid (4-bit) and high (8-bit).
 
     Args:
         hidden_dim: Hidden dimension of the model
         head_dim: Dimension per attention head
         intermediate_dim: Intermediate dimension for down_proj (MLP)
         high_fraction: Fraction for high precision (8-bit)
-        low_fraction: Fraction for low precision (extra low)
         seed: Random seed for reproducibility
 
     Returns:
-        Dictionary of rotation matrices
+        Dictionary of rotation matrices (R1_1, R1_2, R2_1, R2_2, Rd_1, Rd_2)
     """
     torch.manual_seed(seed)
 
@@ -784,52 +783,30 @@ def generate_random_rotations(
 
     rotation_dict = {}
 
-    # Compute dimension splits for hidden_dim
+    # Compute dimension splits for hidden_dim (2 regions: mid and high)
     high_dim = int(high_fraction * hidden_dim)
-    low_dim = int(low_fraction * hidden_dim)
-    mid_dim = hidden_dim - high_dim - low_dim
+    mid_dim = hidden_dim - high_dim
 
     # Generate block-diagonal R1 for hidden dimension
-    if low_dim > 0:
-        R1_0 = random_orthogonal_matrix(low_dim)
-        rotation_dict['R1_0'] = R1_0
-    else:
-        rotation_dict['R1_0'] = None
-
     R1_1 = random_orthogonal_matrix(mid_dim)
     R1_2 = random_orthogonal_matrix(high_dim)
     rotation_dict['R1_1'] = R1_1
     rotation_dict['R1_2'] = R1_2
 
-    # Compute dimension splits for head_dim
+    # Compute dimension splits for head_dim (2 regions: mid and high)
     high_head_dim = int(high_fraction * head_dim)
-    low_head_dim = int(low_fraction * head_dim)
-    mid_head_dim = head_dim - high_head_dim - low_head_dim
+    mid_head_dim = head_dim - high_head_dim
 
     # Generate block-diagonal R2 for head dimension
-    if low_head_dim > 0:
-        R2_0 = random_orthogonal_matrix(low_head_dim)
-        rotation_dict['R2_0'] = R2_0
-    else:
-        rotation_dict['R2_0'] = None
-
     R2_1 = random_orthogonal_matrix(mid_head_dim)
     R2_2 = random_orthogonal_matrix(high_head_dim)
     rotation_dict['R2_1'] = R2_1
     rotation_dict['R2_2'] = R2_2
 
-    # Generate block-diagonal Rd for down_proj (using blocksize, not full intermediate_dim)
-    # The down_proj uses block-wise rotation: each block of size `intermediate_dim` shares the same rotation
+    # Generate block-diagonal Rd for down_proj
     if intermediate_dim is not None:
         high_inter_dim = int(high_fraction * intermediate_dim)
-        low_inter_dim = int(low_fraction * intermediate_dim)
-        mid_inter_dim = intermediate_dim - high_inter_dim - low_inter_dim
-
-        if low_inter_dim > 0:
-            Rd_0 = random_orthogonal_matrix(low_inter_dim)
-            rotation_dict['Rd_0'] = Rd_0
-        else:
-            rotation_dict['Rd_0'] = None
+        mid_inter_dim = intermediate_dim - high_inter_dim
 
         Rd_1 = random_orthogonal_matrix(mid_inter_dim)
         Rd_2 = random_orthogonal_matrix(high_inter_dim)

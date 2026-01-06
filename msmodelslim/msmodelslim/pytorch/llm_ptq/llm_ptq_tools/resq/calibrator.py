@@ -818,7 +818,7 @@ class ResQCalibrator:
                     hadK = self.rotation_dict.get('Hd')
                     K = self.rotation_dict.get('Hd_K', 1)
                     if hadK is not None:
-                        weight_dict['resq.Hd'] = hadK.float().cpu()
+                        weight_dict['resq.Hd'] = hadK.float().cpu().contiguous()
                         quant_description['resq.Hd'] = "FLOAT"
                         self.logger.info(f"    Saved resq.Hd [{hadK.shape[0]}x{hadK.shape[1]}]")
                     weight_dict['resq.Hd_K'] = torch.tensor(K, dtype=torch.int64)

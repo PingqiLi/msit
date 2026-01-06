@@ -25,6 +25,7 @@ from .processors.basis_processor import compute_basis, generate_random_rotations
 from .processors.resq_processor import apply_rotations, rearrange_columns
 from .utils.fuse_norm_utils import fuse_layer_norms
 from .utils.common import cleanup_memory, get_device
+from .gptq import GPTQ, create_gptq_quantizers, GPTQWeightQuantizer
 
 
 class ResQCalibrator:
@@ -282,7 +283,13 @@ class ResQCalibrator:
         if not self.calib_data:
             self.logger.info("No calibration data provided, running data-free mode")
             self._run_datafree_mode()
+        elif not self.cfg.w_rtn:
+            # GPTQ mode: column-by-column quantization with Hessian
+            self.logger.info("Running GPTQ mode (w_rtn=False)")
+            self._run_gptq_mode()
         else:
+            # RTN mode: simple round-to-nearest quantization
+            self.logger.info("Running RTN mode (w_rtn=True)")
             self._run_calib_mode()
 
         # Disable calibration mode
@@ -344,6 +351,269 @@ class ResQCalibrator:
                 # Quantize weights immediately
                 module.quant_weight.quantize_weight(module.weight)
                 self.logger.info(f"Quantized layer: {name}")
+
+    def _run_gptq_mode(self) -> None:
+        """
+        Run GPTQ-based weight quantization.
+
+        GPTQ performs column-by-column quantization with error compensation
+        using the Hessian matrix computed from calibration data.
+        """
+        import math
+
+        self.logger.info("=" * 60)
+        self.logger.info("Starting GPTQ quantization...")
+        self.logger.info(f"  nsamples: {self.cfg.nsamples}")
+        self.logger.info(f"  percdamp: {self.cfg.percdamp}")
+        self.logger.info(f"  blocksize: {self.cfg.gptq_blocksize}")
+        self.logger.info(f"  act_order: {self.cfg.act_order}")
+        self.logger.info("=" * 60)
+
+        # Get model layers
+        if hasattr(self.model, 'model') and hasattr(self.model.model, 'layers'):
+            layers = list(self.model.model.layers)
+        else:
+            raise ValueError("Unsupported model architecture for GPTQ")
+
+        nlayers = len(layers)
+        model_dim = self.model.config.hidden_size
+
+        # Mixed precision settings
+        high_fraction = self.cfg.high_fraction
+        low_fraction = self.cfg.low_fraction
+        high_bits = self.cfg.high_bits
+        low_bits = self.cfg.low_bits
+
+        # Move model to CPU first
+        self.model.cpu()
+        cleanup_memory(verbos=False)
+
+        # ========== Step 1: Capture first layer inputs ==========
+        self.logger.info("Capturing first layer inputs...")
+
+        embed_device = self._input_device
+        if hasattr(self.model, 'model'):
+            self.model.model.embed_tokens = self.model.model.embed_tokens.to(embed_device)
+            if hasattr(self.model.model, 'rotary_emb'):
+                self.model.model.rotary_emb = self.model.model.rotary_emb.to(embed_device)
+            if hasattr(self.model.model, 'norm'):
+                self.model.model.norm = self.model.model.norm.to(embed_device)
+
+        layers[0] = layers[0].to(embed_device)
+
+        # Capture inputs using a catcher
+        dtype = next(iter(self.model.parameters())).dtype
+        nsamples = min(len(self.calib_data), self.cfg.nsamples)
+
+        # Determine sequence length from first batch
+        first_batch = self.calib_data[0]
+        if isinstance(first_batch, (tuple, list)):
+            seq_len = first_batch[0].shape[-1] if hasattr(first_batch[0], 'shape') else 2048
+        elif isinstance(first_batch, dict):
+            input_ids = first_batch.get('input_ids', first_batch.get('inputs'))
+            seq_len = input_ids.shape[-1] if input_ids is not None else 2048
+        else:
+            seq_len = 2048
+
+        inps = torch.zeros((nsamples, seq_len, model_dim), dtype=dtype, device=embed_device)
+        cache = {"i": 0, "attention_mask": None, "position_ids": None, "position_embeddings": None}
+
+        class Catcher(nn.Module):
+            def __init__(self, module):
+                super().__init__()
+                self.module = module
+
+            def forward(self, inp, **kwargs):
+                inps[cache["i"]] = inp
+                cache["i"] += 1
+                cache["attention_mask"] = kwargs.get("attention_mask")
+                cache["position_ids"] = kwargs.get("position_ids")
+                cache["position_embeddings"] = kwargs.get("position_embeddings")
+                raise ValueError("Catcher stop")
+
+        # Replace first layer with catcher
+        self.model.model.layers[0] = Catcher(layers[0])
+
+        # Run calibration data to capture inputs
+        for idx, data in enumerate(self.calib_data[:nsamples]):
+            if cache["i"] >= nsamples:
+                break
+            try:
+                if isinstance(data, (tuple, list)):
+                    data = tuple(t.to(embed_device) if isinstance(t, torch.Tensor) else t for t in data)
+                    self.model(*data)
+                elif isinstance(data, dict):
+                    data = {k: v.to(embed_device) if isinstance(v, torch.Tensor) else v for k, v in data.items()}
+                    self.model(**data)
+            except ValueError:
+                pass  # Expected - catcher raises ValueError
+
+        # Restore first layer
+        self.model.model.layers[0] = layers[0]
+
+        self.logger.info(f"Captured {cache['i']} samples")
+
+        # Move embeddings back to CPU
+        if hasattr(self.model, 'model'):
+            self.model.model.embed_tokens = self.model.model.embed_tokens.cpu()
+            if hasattr(self.model.model, 'rotary_emb'):
+                self.model.model.rotary_emb = self.model.model.rotary_emb.cpu()
+
+        layers[0] = layers[0].cpu()
+        cleanup_memory(verbos=False)
+
+        # ========== Step 2: Layer-by-layer GPTQ quantization ==========
+        outs = torch.zeros_like(inps)
+        attention_mask = cache["attention_mask"]
+        position_ids = cache["position_ids"]
+        position_embeddings = cache["position_embeddings"]
+
+        # Define sequential groups of projections to quantize together
+        # Following original ResQ pattern
+        sequential = [
+            ["self_attn.k_proj", "self_attn.v_proj", "self_attn.q_proj"],
+            ["self_attn.o_proj"],
+            ["mlp.up_proj", "mlp.gate_proj"],
+            ["mlp.down_proj"],
+        ]
+
+        for layer_idx in tqdm(range(nlayers), desc="GPTQ quantizing layers"):
+            self.logger.info(f"\nLayer {layer_idx}:")
+            layer = layers[layer_idx].to(embed_device)
+
+            # Find all LinearResQQuantizer modules in this layer
+            full = {}
+            for name, mod in layer.named_modules():
+                if isinstance(mod, LinearResQQuantizer):
+                    full[name] = mod
+
+            # Process each group of projections
+            for names in sequential:
+                subset = {n: full[n] for n in names if n in full}
+                if not subset:
+                    continue
+
+                gptq = {}
+                for name in subset:
+                    self.logger.info(f"  Setting up GPTQ for {name}...", )
+
+                    mod = subset[name]
+                    # Get the underlying weight (LinearResQQuantizer stores weight)
+                    weight = mod.weight
+
+                    # Determine if mixed precision applies
+                    mixed_precision = False
+                    high_bits_length = 0
+                    low_bits_length = 0
+
+                    # Check if this is a down_proj with int8_down_proj
+                    if self.cfg.int8_down_proj and "down_proj" in name:
+                        # down_proj uses int8 only (no mixed precision)
+                        mixed_precision = False
+                        layer_bits = 8
+                    elif "k_proj" in name or "q_proj" in name or "v_proj" in name or \
+                         "up_proj" in name or "gate_proj" in name or "o_proj" in name:
+                        # These projections use mixed precision
+                        mixed_precision = True
+                        high_bits_length = int(high_fraction * weight.shape[1])
+                        low_bits_length = int(low_fraction * weight.shape[1])
+                        layer_bits = low_bits
+                    else:
+                        layer_bits = low_bits
+
+                    # Create a wrapper module for GPTQ (it expects nn.Linear interface)
+                    class LinearWrapper(nn.Module):
+                        def __init__(self, weight, bias):
+                            super().__init__()
+                            self.weight = nn.Parameter(weight.clone())
+                            self.bias = nn.Parameter(bias.clone()) if bias is not None else None
+                            self.in_features = weight.shape[1]
+                            self.out_features = weight.shape[0]
+
+                    wrapper = LinearWrapper(weight.data, mod.bias.data if mod.bias is not None else None)
+                    wrapper = wrapper.to(embed_device)
+
+                    gptq[name] = GPTQ(
+                        wrapper,
+                        mixed_precision=mixed_precision,
+                        high_bits_length=high_bits_length,
+                        low_bits_length=low_bits_length,
+                    )
+
+                    # Configure quantizers
+                    gptq[name].quantizer = GPTQWeightQuantizer(bits=layer_bits, perchannel=True, sym=self.cfg.w_sym)
+
+                    if mixed_precision:
+                        gptq[name].high_quantizer = GPTQWeightQuantizer(bits=high_bits, perchannel=True, sym=self.cfg.w_sym)
+                        if low_bits_length > 0:
+                            gptq[name].low_quantizer = GPTQWeightQuantizer(bits=low_bits, perchannel=True, sym=self.cfg.w_sym)
+
+                # Register hooks to accumulate Hessian
+                def make_add_batch(name):
+                    def add_batch(module, inp, out):
+                        gptq[name].add_batch(inp[0].data, out.data)
+                    return add_batch
+
+                handles = []
+                for name in subset:
+                    handles.append(subset[name].register_forward_hook(make_add_batch(name)))
+
+                # Run forward passes to accumulate Hessian
+                for j in range(nsamples):
+                    kwargs = {}
+                    if attention_mask is not None:
+                        kwargs['attention_mask'] = attention_mask
+                    if position_ids is not None:
+                        kwargs['position_ids'] = position_ids
+                    if position_embeddings is not None:
+                        kwargs['position_embeddings'] = position_embeddings
+
+                    outs[j] = layer(inps[j].unsqueeze(0), **kwargs)[0]
+
+                # Remove hooks
+                for h in handles:
+                    h.remove()
+
+                # Run GPTQ quantization
+                for name in subset:
+                    self.logger.info(f"  Running GPTQ fasterquant for {name}...")
+                    gptq[name].fasterquant(
+                        blocksize=self.cfg.gptq_blocksize,
+                        percdamp=self.cfg.percdamp,
+                        actorder=self.cfg.act_order,
+                    )
+
+                    # Copy quantized weights back to LinearResQQuantizer
+                    mod = subset[name]
+                    mod.weight.data = gptq[name].layer.weight.data.clone()
+
+                    # Trigger quantization to store int8 weights
+                    mod.quant_weight.quantize_weight(mod.weight)
+
+                    gptq[name].free()
+
+            # Run final forward through layer to get outputs for next layer
+            for j in range(nsamples):
+                kwargs = {}
+                if attention_mask is not None:
+                    kwargs['attention_mask'] = attention_mask
+                if position_ids is not None:
+                    kwargs['position_ids'] = position_ids
+                if position_embeddings is not None:
+                    kwargs['position_embeddings'] = position_embeddings
+
+                outs[j] = layer(inps[j].unsqueeze(0), **kwargs)[0]
+
+            # Move layer back to CPU
+            layers[layer_idx] = layer.cpu()
+            cleanup_memory(verbos=False)
+
+            # Swap inputs and outputs for next layer
+            inps, outs = outs, torch.zeros_like(inps)
+
+        self.logger.info("=" * 60)
+        self.logger.info("GPTQ quantization complete!")
+        self.logger.info("=" * 60)
 
     def _disable_calibration(self) -> None:
         """Disable calibration mode on all quantizers."""
@@ -465,19 +735,23 @@ class ResQCalibrator:
                 if 'weight_low' in quant_weights:
                     weight_dict[f"{name}.weight_low"] = quant_weights['weight_low']
                     weight_dict[f"{name}.scale_low"] = quant_weights['scale_low']
-                    weight_dict[f"{name}.offset_low"] = quant_weights['offset_low']
                     quant_description[f"{name}.weight_low"] = "RESQ"
                     quant_description[f"{name}.scale_low"] = "RESQ"
-                    quant_description[f"{name}.offset_low"] = "RESQ"
+                    # offset may be None for symmetric quantization
+                    if 'offset_low' in quant_weights:
+                        weight_dict[f"{name}.offset_low"] = quant_weights['offset_low']
+                        quant_description[f"{name}.offset_low"] = "RESQ"
 
                 # Save high precision weights and scales
                 if 'weight_high' in quant_weights:
                     weight_dict[f"{name}.weight_high"] = quant_weights['weight_high']
                     weight_dict[f"{name}.scale_high"] = quant_weights['scale_high']
-                    weight_dict[f"{name}.offset_high"] = quant_weights['offset_high']
                     quant_description[f"{name}.weight_high"] = "RESQ"
                     quant_description[f"{name}.scale_high"] = "RESQ"
-                    quant_description[f"{name}.offset_high"] = "RESQ"
+                    # offset may be None for symmetric quantization
+                    if 'offset_high' in quant_weights:
+                        weight_dict[f"{name}.offset_high"] = quant_weights['offset_high']
+                        quant_description[f"{name}.offset_high"] = "RESQ"
 
                 # Save bias if present
                 if module.bias is not None:

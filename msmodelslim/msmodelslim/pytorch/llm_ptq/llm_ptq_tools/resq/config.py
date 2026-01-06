@@ -75,9 +75,11 @@ class ResQConfig:
         self.k_pre_rope = kwargs.get('k_pre_rope', False)
 
         # GPTQ settings
+        # w_rtn: True = RTN (Round-to-Nearest), False = GPTQ (column-by-column with Hessian)
         self.percdamp = kwargs.get('percdamp', 0.01)
         self.act_order = kwargs.get('act_order', False)
         self.nsamples = kwargs.get('nsamples', 128)
+        self.gptq_blocksize = kwargs.get('gptq_blocksize', 128)  # Block size for GPTQ column processing
 
         # Hadamard settings
         self.fp32_had = kwargs.get('fp32_had', True)

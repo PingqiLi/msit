@@ -5,6 +5,7 @@ ResQ Linear Quantizer for mixed-precision 4/8-bit quantization.
 This module provides a specialized LinearQuantizer for ResQ that:
 - Separates weights into high-precision (8-bit) and low-precision (4-bit) parts
 - Saves dual weights and dual scales for each precision level
+- Supports real int8 storage (not fake quantization)
 - Supports CPU/NPU kernels without GPU dependency
 """
 
@@ -19,12 +20,55 @@ from msmodelslim.pytorch.llm_ptq.llm_ptq_tools.quant_funcs import (
 )
 
 
+def symmetric_quantize_to_int8(tensor: torch.Tensor, bits: int, quant_dim: int = 1) -> tuple:
+    """
+    Symmetric quantization to int8 storage.
+
+    Args:
+        tensor: Input tensor to quantize
+        bits: Number of bits for quantization (4 or 8)
+        quant_dim: Dimension along which to compute scale (default: 1 for per-row)
+
+    Returns:
+        Tuple of (quantized_int8, scale)
+        - quantized_int8: int8 tensor with values in range [-2^(bits-1), 2^(bits-1)-1]
+        - scale: float32 scale tensor for dequantization
+
+    Note:
+        For 4-bit, values are in range [-8, 7], stored as int8
+        For 8-bit, values are in range [-128, 127], stored as int8
+    """
+    # Compute symmetric range: max absolute value per row
+    n = 2 ** (bits - 1) - 1  # e.g., 127 for 8-bit, 7 for 4-bit
+
+    # Per-row max absolute value
+    abs_max = tensor.abs().max(dim=quant_dim, keepdim=True)[0]
+
+    # Compute scale: scale = max_abs / n
+    # Add small epsilon to avoid division by zero
+    scale = abs_max / n
+    scale = torch.clamp(scale, min=1e-8)
+
+    # Quantize: q = round(x / scale), clamped to [-n-1, n]
+    quant_float = torch.round(tensor / scale)
+    quant_float = torch.clamp(quant_float, -(n + 1), n)
+
+    # Convert to int8 for storage
+    quant_int8 = quant_float.to(torch.int8)
+
+    return quant_int8, scale
+
+
 class ResQWeightQuantizer(nn.Module):
     """
     Mixed-precision weight quantizer for ResQ.
 
     Separates weight tensor into high-precision and low-precision parts,
     quantizing each with different bit-widths.
+
+    Supports two modes:
+    - Real quantization (use_real_quant=True): Store actual int8 tensors
+    - Fake quantization (use_real_quant=False): Store dequantized floats (for training)
     """
 
     def __init__(
@@ -34,6 +78,7 @@ class ResQWeightQuantizer(nn.Module):
         high_fraction: float = 0.125,
         is_sym: bool = True,
         split_dim: int = 1,  # 1 for input projections, 0 for output projections
+        use_real_quant: bool = True,  # True for real int8 storage
         logger=None,
     ):
         super().__init__()
@@ -42,6 +87,7 @@ class ResQWeightQuantizer(nn.Module):
         self.high_fraction = high_fraction
         self.is_sym = is_sym
         self.split_dim = split_dim  # dimension to split: 0 for rows, 1 for columns
+        self.use_real_quant = use_real_quant
         self.logger = logger
 
         # Quantization parameters for each precision level
@@ -50,9 +96,13 @@ class ResQWeightQuantizer(nn.Module):
         self.low_weight_scale = None
         self.low_weight_offset = None
 
-        # Quantized weights
+        # Quantized weights (int8 for real quant, float for fake quant)
         self.high_weight = None
         self.low_weight = None
+
+        # Dequantized weights (for inference with fake quant)
+        self.high_weight_dequant = None
+        self.low_weight_dequant = None
 
         # Dimension info
         self.high_dim = None
@@ -75,7 +125,9 @@ class ResQWeightQuantizer(nn.Module):
             weight: Weight tensor of shape [out_features, in_features]
 
         Returns:
-            Tuple of (quantized_weight, high_weight, low_weight)
+            Tuple of (quantized_weight_for_inference, high_weight, low_weight)
+            - If use_real_quant=True: weights are int8 tensors
+            - If use_real_quant=False: weights are dequantized floats
         """
         # Determine split dimension based on layer type
         # split_dim=1: split along in_features (columns) for input projections (q,k,v,up,gate)
@@ -102,47 +154,70 @@ class ResQWeightQuantizer(nn.Module):
             weight_high = weight[self.low_dim:, :]  # [high_dim, in_features]
             cat_dim = 0
 
-        # Always use per-row quantization (dim=1) for weight quantization
-        # Scale shape will be [num_rows, 1]
+        # Per-row quantization (dim=1)
         quant_dim = 1
 
         # Quantize low precision part (4-bit)
+        weight_low_dequant = None
         if self.low_dim > 0:
-            low_min = weight_low.min(dim=quant_dim, keepdim=True)[0]
-            low_max = weight_low.max(dim=quant_dim, keepdim=True)[0]
-            self.low_weight_scale, self.low_weight_offset = linear_quantization_params(
-                self.low_bits, low_min, low_max,
-                integral_zero_point=True, q_signed=True, sym=self.is_sym
-            )
-
-            _, weight_low_quant = fake_quantize(
-                weight_low, self.low_weight_scale, self.low_weight_offset,
-                self.low_bits, is_signed=True
-            )
-            self.low_weight = weight_low_quant.clone()
+            if self.use_real_quant and self.is_sym:
+                # Real symmetric quantization to int8
+                self.low_weight, self.low_weight_scale = symmetric_quantize_to_int8(
+                    weight_low, self.low_bits, quant_dim
+                )
+                # Compute dequantized version for inference
+                weight_low_dequant = self.low_weight.float() * self.low_weight_scale
+                self.low_weight_dequant = weight_low_dequant
+                self.low_weight_offset = None  # No offset for symmetric
+            else:
+                # Fake quantization (original behavior)
+                low_min = weight_low.min(dim=quant_dim, keepdim=True)[0]
+                low_max = weight_low.max(dim=quant_dim, keepdim=True)[0]
+                self.low_weight_scale, self.low_weight_offset = linear_quantization_params(
+                    self.low_bits, low_min, low_max,
+                    integral_zero_point=True, q_signed=True, sym=self.is_sym
+                )
+                _, weight_low_dequant = fake_quantize(
+                    weight_low, self.low_weight_scale, self.low_weight_offset,
+                    self.low_bits, is_signed=True
+                )
+                self.low_weight = weight_low_dequant.clone()
+                self.low_weight_dequant = weight_low_dequant
 
         # Quantize high precision part (8-bit)
+        weight_high_dequant = None
         if self.high_dim > 0:
-            high_min = weight_high.min(dim=quant_dim, keepdim=True)[0]
-            high_max = weight_high.max(dim=quant_dim, keepdim=True)[0]
-            self.high_weight_scale, self.high_weight_offset = linear_quantization_params(
-                self.high_bits, high_min, high_max,
-                integral_zero_point=True, q_signed=True, sym=self.is_sym
-            )
+            if self.use_real_quant and self.is_sym:
+                # Real symmetric quantization to int8
+                self.high_weight, self.high_weight_scale = symmetric_quantize_to_int8(
+                    weight_high, self.high_bits, quant_dim
+                )
+                # Compute dequantized version for inference
+                weight_high_dequant = self.high_weight.float() * self.high_weight_scale
+                self.high_weight_dequant = weight_high_dequant
+                self.high_weight_offset = None  # No offset for symmetric
+            else:
+                # Fake quantization (original behavior)
+                high_min = weight_high.min(dim=quant_dim, keepdim=True)[0]
+                high_max = weight_high.max(dim=quant_dim, keepdim=True)[0]
+                self.high_weight_scale, self.high_weight_offset = linear_quantization_params(
+                    self.high_bits, high_min, high_max,
+                    integral_zero_point=True, q_signed=True, sym=self.is_sym
+                )
+                _, weight_high_dequant = fake_quantize(
+                    weight_high, self.high_weight_scale, self.high_weight_offset,
+                    self.high_bits, is_signed=True
+                )
+                self.high_weight = weight_high_dequant.clone()
+                self.high_weight_dequant = weight_high_dequant
 
-            _, weight_high_quant = fake_quantize(
-                weight_high, self.high_weight_scale, self.high_weight_offset,
-                self.high_bits, is_signed=True
-            )
-            self.high_weight = weight_high_quant.clone()
-
-        # Combine quantized weights
+        # Combine dequantized weights for inference
         if self.low_dim > 0 and self.high_dim > 0:
-            quantized_weight = torch.cat([weight_low_quant, weight_high_quant], dim=cat_dim)
+            quantized_weight = torch.cat([weight_low_dequant, weight_high_dequant], dim=cat_dim)
         elif self.high_dim > 0:
-            quantized_weight = weight_high_quant
+            quantized_weight = weight_high_dequant
         else:
-            quantized_weight = weight_low_quant
+            quantized_weight = weight_low_dequant
 
         self.has_init_quant_para = True
         return quantized_weight, self.low_weight, self.high_weight
@@ -153,14 +228,21 @@ class ResQWeightQuantizer(nn.Module):
             quantized_weight, _, _ = self.quantize_weight(weight)
             return quantized_weight
 
-        # Use cached quantized weights
+        # Use cached dequantized weights for inference
+        # When use_real_quant=True, low_weight/high_weight are int8,
+        # so we must use the dequantized versions for float computation
         cat_dim = 1 if self.split_dim == 1 else 0
-        if self.low_weight is not None and self.high_weight is not None:
-            return torch.cat([self.low_weight, self.high_weight], dim=cat_dim)
-        elif self.high_weight is not None:
-            return self.high_weight
+
+        # Get dequantized weights (or original weights if not using real quant)
+        low_w = self.low_weight_dequant if self.low_weight_dequant is not None else self.low_weight
+        high_w = self.high_weight_dequant if self.high_weight_dequant is not None else self.high_weight
+
+        if low_w is not None and high_w is not None:
+            return torch.cat([low_w, high_w], dim=cat_dim)
+        elif high_w is not None:
+            return high_w
         else:
-            return self.low_weight
+            return low_w
 
 
 class ResQActQuantizer(nn.Module):
@@ -264,6 +346,7 @@ class LinearResQQuantizer(nn.Module):
     - Separates weights into high-precision (8-bit) and low-precision (4-bit) parts
     - Applies mixed-precision activation quantization
     - Saves dual weights and dual scales for each precision level
+    - Supports real int8 storage (use_real_quant=True) for deployment
     """
 
     def __init__(
@@ -274,6 +357,7 @@ class LinearResQQuantizer(nn.Module):
         low_bits: int = 4,
         high_fraction: float = 0.125,
         split_dim: int = 1,  # 1 for input projections (q,k,v,up,gate), 0 for output projections (o,down)
+        use_real_quant: bool = True,  # True for real int8 storage
     ):
         super().__init__()
         self.cfg = cfg
@@ -282,6 +366,7 @@ class LinearResQQuantizer(nn.Module):
         self.low_bits = low_bits
         self.high_fraction = high_fraction
         self.split_dim = split_dim
+        self.use_real_quant = use_real_quant
 
         # Linear layer parameters
         self.in_features = None
@@ -296,6 +381,7 @@ class LinearResQQuantizer(nn.Module):
             high_fraction=high_fraction,
             is_sym=getattr(cfg, 'w_sym', True) if cfg else True,
             split_dim=split_dim,
+            use_real_quant=use_real_quant,
             logger=logger,
         )
 
@@ -359,12 +445,15 @@ class LinearResQQuantizer(nn.Module):
 
         Returns:
             Dictionary with:
-            - 'weight_low': Low-precision quantized weight (4-bit)
-            - 'weight_high': High-precision quantized weight (8-bit)
+            - 'weight_low': Low-precision quantized weight (4-bit as int8)
+            - 'weight_high': High-precision quantized weight (8-bit as int8)
             - 'scale_low': Scale for low-precision weight
             - 'scale_high': Scale for high-precision weight
-            - 'offset_low': Offset for low-precision weight
-            - 'offset_high': Offset for high-precision weight
+            - 'offset_low': Offset for low-precision weight (None for symmetric)
+            - 'offset_high': Offset for high-precision weight (None for symmetric)
+
+        Note: When use_real_quant=True, weights are stored as actual int8 tensors.
+              When symmetric quantization is used, offsets are None.
         """
         if not self.quant_weight.has_init_quant_para:
             self.quant_weight.quantize_weight(self.weight)
@@ -374,12 +463,16 @@ class LinearResQQuantizer(nn.Module):
         if self.quant_weight.low_weight is not None:
             result['weight_low'] = self.quant_weight.low_weight.cpu()
             result['scale_low'] = self.quant_weight.low_weight_scale.cpu()
-            result['offset_low'] = self.quant_weight.low_weight_offset.cpu()
+            # offset_low may be None for symmetric quantization
+            if self.quant_weight.low_weight_offset is not None:
+                result['offset_low'] = self.quant_weight.low_weight_offset.cpu()
 
         if self.quant_weight.high_weight is not None:
             result['weight_high'] = self.quant_weight.high_weight.cpu()
             result['scale_high'] = self.quant_weight.high_weight_scale.cpu()
-            result['offset_high'] = self.quant_weight.high_weight_offset.cpu()
+            # offset_high may be None for symmetric quantization
+            if self.quant_weight.high_weight_offset is not None:
+                result['offset_high'] = self.quant_weight.high_weight_offset.cpu()
 
         return result
 
@@ -387,7 +480,8 @@ class LinearResQQuantizer(nn.Module):
 def add_resq_quantizers(model: nn.Module, cfg=None, logger=None,
                         high_bits: int = 8, low_bits: int = 4,
                         high_fraction: float = 0.125,
-                        skip_names: list = None) -> nn.Module:
+                        skip_names: list = None,
+                        use_real_quant: bool = True) -> nn.Module:
     """
     Replace linear layers with ResQ quantizers.
 
@@ -399,6 +493,7 @@ def add_resq_quantizers(model: nn.Module, cfg=None, logger=None,
         low_bits: Bits for low precision (default: 4)
         high_fraction: Fraction of dimensions at high precision
         skip_names: Layer names to skip
+        use_real_quant: If True, store actual int8 tensors; if False, store dequantized floats
 
     Returns:
         Model with ResQ quantizers
@@ -434,6 +529,7 @@ def add_resq_quantizers(model: nn.Module, cfg=None, logger=None,
                 low_bits=low_bits,
                 high_fraction=high_fraction,
                 split_dim=split_dim,
+                use_real_quant=use_real_quant,
             )
             quant_mod.set_param(mod)
             _set_module(model, name, quant_mod)

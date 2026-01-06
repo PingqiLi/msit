@@ -152,8 +152,8 @@ class ResQWeightQuantizer(nn.Module):
             self.low_weight, self.low_weight_scale = symmetric_quantize_to_int8(
                 weight_low, self.low_bits, quant_dim
             )
-            # Compute dequantized version for inference
-            weight_low_dequant = self.low_weight.float() * self.low_weight_scale
+            # Compute dequantized version for inference (store as original dtype to save memory)
+            weight_low_dequant = (self.low_weight.float() * self.low_weight_scale).to(weight.dtype)
             self.low_weight_dequant = weight_low_dequant
 
         # Quantize high precision part (8-bit) using symmetric int8 storage
@@ -162,8 +162,8 @@ class ResQWeightQuantizer(nn.Module):
             self.high_weight, self.high_weight_scale = symmetric_quantize_to_int8(
                 weight_high, self.high_bits, quant_dim
             )
-            # Compute dequantized version for inference
-            weight_high_dequant = self.high_weight.float() * self.high_weight_scale
+            # Compute dequantized version for inference (store as original dtype to save memory)
+            weight_high_dequant = (self.high_weight.float() * self.high_weight_scale).to(weight.dtype)
             self.high_weight_dequant = weight_high_dequant
 
         # Combine dequantized weights for inference
@@ -385,6 +385,11 @@ class LinearResQQuantizer(nn.Module):
         # Quantize weight
         if self.is_enable:
             weight = self.quant_weight(self.weight)
+            # After first quantization, delete original weight to save memory
+            # The quantized weights are stored in self.quant_weight
+            if self.quant_weight.has_init_quant_para and self.weight is not None:
+                del self.weight
+                self.weight = None
         else:
             weight = self.weight
 

@@ -424,6 +424,11 @@ def apply_rotations(
         rotation_dict: Dictionary of rotation matrices
         config: ResQ configuration
     """
+    # Check if we should skip fusion (transform-only mode)
+    if getattr(config, 'save_transforms_only', False):
+        logger.info("save_transforms_only=True: Skipping weight fusion")
+        return  # Early return - don't modify model weights
+
     model_config = model.config
     num_heads = model_config.num_attention_heads
     num_kv_heads = getattr(model_config, 'num_key_value_heads', num_heads)

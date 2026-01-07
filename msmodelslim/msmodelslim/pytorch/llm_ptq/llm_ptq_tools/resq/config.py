@@ -102,6 +102,10 @@ class ResQConfig:
         self.is_dynamic = kwargs.get('is_dynamic', True)
         self.a_sym = kwargs.get('a_sym', False)
 
+        # Transform-only mode: save P and R matrices without fusion or quantization
+        # When True: skip weight fusion, skip quantization, only save P and R matrices
+        self.save_transforms_only = kwargs.get('save_transforms_only', False)
+
     def validate(self, strict: bool = False):
         """
         Validate configuration parameters.

@@ -147,10 +147,17 @@ class ResQCalibrator:
             apply_rotations(model, self.basis_dict, self.rotation_dict, self.cfg)
             cleanup_memory(verbos=False)
 
-            # Rearrange columns for mixed-precision layout (only when basis is available)
-            self.logger.info("Rearranging columns for mixed precision...")
-            rearrange_columns(model, self.cfg, training=False)
-            cleanup_memory(verbos=False)
+            # Skip column rearrangement in transform-only mode (we're not modifying weights)
+            if not getattr(self.cfg, 'save_transforms_only', False):
+                # Rearrange columns for mixed-precision layout (only when basis is available)
+                self.logger.info("Rearranging columns for mixed precision...")
+                rearrange_columns(model, self.cfg, training=False)
+                cleanup_memory(verbos=False)
+
+        # Skip quantizer addition in transform-only mode
+        if getattr(self.cfg, 'save_transforms_only', False):
+            self.logger.info("save_transforms_only=True: Skipping quantizer addition")
+            return model
 
         # Replace linear layers with ResQ quantizers
         self.logger.info("Adding ResQ quantizers...")
@@ -252,6 +259,11 @@ class ResQCalibrator:
     @torch.no_grad()
     def run(self) -> None:
         """Run calibration on the model."""
+        # Skip calibration in transform-only mode
+        if getattr(self.cfg, 'save_transforms_only', False):
+            self.logger.info("save_transforms_only=True: Skipping calibration")
+            return
+
         self.logger.info("Starting ResQ calibration...")
         self.model.eval()
 
@@ -617,6 +629,197 @@ class ResQCalibrator:
                 module.disable_calib()
 
     @torch.no_grad()
+    def _save_transform_matrices(self, output_path: str) -> None:
+        """
+        Save P and R transform matrices layer by layer without fusion.
+
+        This saves Ua, Ub, Uc, Ud as separate P (PCA eigenvector) and R (rotation) components:
+        - P_a: PCA eigenvectors for attn/mlp inputs (replicated per layer)
+        - R_a: Block-diagonal rotation for hidden dimension (replicated per layer)
+        - P_b: Per-head value PCA eigenvectors [num_kv_heads, head_dim, head_dim]
+        - R_b: Block-diagonal rotation for head dimension (replicated per layer)
+        - P_c: Key position PCA eigenvectors (post-RoPE) [head_dim, head_dim]
+        - R_c: Same as R_b (replicated per layer)
+        - P_d: Down proj PCA eigenvectors [blocksize, blocksize]
+        - R_d: Hadamard or random rotation for intermediate dimension
+
+        Args:
+            output_path: Output directory for safetensors file
+        """
+        from safetensors.torch import save_file
+        import json
+
+        self.logger.info("=" * 60)
+        self.logger.info("Saving P and R transform matrices (save_transforms_only mode)")
+        self.logger.info("=" * 60)
+
+        transform_dict = {}
+        meta_dict = {}
+
+        # Get model dimensions
+        nlayers = self.model.config.num_hidden_layers
+        hidden_dim = self.model.config.hidden_size
+        intermediate_size = self.model.config.intermediate_size
+        num_heads = self.model.config.num_attention_heads
+        num_kv_heads = getattr(self.model.config, 'num_key_value_heads', num_heads)
+
+        # Get head_dim from config or compute
+        head_dim = getattr(self.model.config, 'head_dim', None)
+        if head_dim is None:
+            if hasattr(self.model, 'model') and hasattr(self.model.model, 'layers') and len(self.model.model.layers) > 0:
+                v_proj = self.model.model.layers[0].self_attn.v_proj
+                head_dim = v_proj.out_features // num_kv_heads
+            else:
+                head_dim = hidden_dim // num_heads
+
+        blocksize = self.cfg.down_proj_blocksize
+        ud_rotation_type = self.cfg.ud_rotation_type
+
+        self.logger.info(f"Model dimensions:")
+        self.logger.info(f"  num_layers: {nlayers}")
+        self.logger.info(f"  hidden_dim: {hidden_dim}")
+        self.logger.info(f"  intermediate_size: {intermediate_size}")
+        self.logger.info(f"  num_heads: {num_heads}")
+        self.logger.info(f"  num_kv_heads: {num_kv_heads}")
+        self.logger.info(f"  head_dim: {head_dim}")
+        self.logger.info(f"  blocksize: {blocksize}")
+        self.logger.info(f"  ud_rotation_type: {ud_rotation_type}")
+
+        # ========== Build shared rotation matrices ==========
+        # R_a = block_diag(R1_1, R1_2) for hidden dimension
+        R1_1 = self.rotation_dict['R1_1'].to(torch.float64)
+        R1_2 = self.rotation_dict['R1_2'].to(torch.float64)
+        R_a = torch.block_diag(R1_1, R1_2).float().cpu()
+
+        # R_b = block_diag(R2_1, R2_2) for head dimension
+        R2_1 = self.rotation_dict['R2_1'].to(torch.float64)
+        R2_2 = self.rotation_dict['R2_2'].to(torch.float64)
+        R_b = torch.block_diag(R2_1, R2_2).float().cpu()
+
+        # Get shared P_a (attn_mlp basis)
+        if 'attn_mlp' in self.basis_dict:
+            P_a_shared = self.basis_dict['attn_mlp'].float().cpu()
+        else:
+            self.logger.warning("No attn_mlp basis found, using identity matrix")
+            P_a_shared = torch.eye(hidden_dim, dtype=torch.float32)
+
+        self.logger.info(f"Shared matrices:")
+        self.logger.info(f"  P_a_shared shape: {P_a_shared.shape}")
+        self.logger.info(f"  R_a shape: {R_a.shape}")
+        self.logger.info(f"  R_b shape: {R_b.shape}")
+
+        # ========== Save per-layer matrices ==========
+        self.logger.info(f"Saving per-layer matrices for {nlayers} layers...")
+
+        for i in range(nlayers):
+            # Ua components (replicate shared P_a per layer)
+            transform_dict[f'resq.layer.{i}.P_a'] = P_a_shared.clone()
+            transform_dict[f'resq.layer.{i}.R_a'] = R_a.clone()
+            meta_dict[f'resq.layer.{i}.P_a'] = f"[{hidden_dim}, {hidden_dim}] - PCA eigenvectors for attn/mlp"
+            meta_dict[f'resq.layer.{i}.R_a'] = f"[{hidden_dim}, {hidden_dim}] - Block-diagonal rotation"
+
+            # Ub components (per-layer, per-head)
+            key_value = f'layer.{i}.self_attn.value'
+            if key_value in self.basis_dict:
+                P_b = self.basis_dict[key_value].float().cpu()
+                transform_dict[f'resq.layer.{i}.P_b'] = P_b
+                meta_dict[f'resq.layer.{i}.P_b'] = f"{list(P_b.shape)} - Per-head value PCA eigenvectors"
+            else:
+                self.logger.warning(f"No value basis found for layer {i}")
+
+            transform_dict[f'resq.layer.{i}.R_b'] = R_b.clone()
+            meta_dict[f'resq.layer.{i}.R_b'] = f"[{head_dim}, {head_dim}] - Block-diagonal rotation for head dim"
+
+            # Uc components (per-layer key_pos)
+            key_pos = f'layer.{i}.self_attn.key_pos'
+            if key_pos in self.basis_dict:
+                P_c = self.basis_dict[key_pos].float().cpu()
+                transform_dict[f'resq.layer.{i}.P_c'] = P_c
+                meta_dict[f'resq.layer.{i}.P_c'] = f"{list(P_c.shape)} - Key position PCA eigenvectors (post-RoPE)"
+            else:
+                self.logger.warning(f"No key_pos basis found for layer {i}")
+
+            transform_dict[f'resq.layer.{i}.R_c'] = R_b.clone()  # Same as R_b
+            meta_dict[f'resq.layer.{i}.R_c'] = f"[{head_dim}, {head_dim}] - Same as R_b"
+
+            # Ud components (per-layer down_proj)
+            key_down_proj = f'layer.{i}.mlp.down_proj'
+            if key_down_proj in self.basis_dict:
+                P_d = self.basis_dict[key_down_proj].float().cpu()
+                transform_dict[f'resq.layer.{i}.P_d'] = P_d
+                meta_dict[f'resq.layer.{i}.P_d'] = f"[{blocksize}, {blocksize}] - Down proj PCA eigenvectors"
+            else:
+                self.logger.warning(f"No down_proj basis found for layer {i}")
+
+            # R_d: Hadamard or random rotation
+            if ud_rotation_type == 'hadamard':
+                # Save Hadamard info (shared across layers but replicated for consistency)
+                hadK = self.rotation_dict.get('Hd')
+                K = self.rotation_dict.get('Hd_K', 1)
+                if hadK is not None:
+                    transform_dict[f'resq.layer.{i}.R_d_hadK'] = hadK.float().cpu()
+                    meta_dict[f'resq.layer.{i}.R_d_hadK'] = f"{list(hadK.shape)} - Hadamard block matrix"
+                transform_dict[f'resq.layer.{i}.R_d_K'] = torch.tensor(K, dtype=torch.int64)
+                meta_dict[f'resq.layer.{i}.R_d_K'] = f"Hadamard K value = {K}"
+                meta_dict[f'resq.layer.{i}.R_d_type'] = "hadamard"
+            else:
+                # Save full random orthogonal R_d
+                Rd = self.rotation_dict.get('Rd')
+                if Rd is not None:
+                    transform_dict[f'resq.layer.{i}.R_d'] = Rd.float().cpu()
+                    meta_dict[f'resq.layer.{i}.R_d'] = f"[{intermediate_size}, {intermediate_size}] - Random orthogonal rotation"
+                else:
+                    self.logger.warning(f"No Rd rotation found for layer {i}")
+                meta_dict[f'resq.layer.{i}.R_d_type'] = "random"
+
+        # ========== Save config metadata ==========
+        transform_dict['resq.config.num_layers'] = torch.tensor(nlayers, dtype=torch.int64)
+        transform_dict['resq.config.hidden_dim'] = torch.tensor(hidden_dim, dtype=torch.int64)
+        transform_dict['resq.config.intermediate_size'] = torch.tensor(intermediate_size, dtype=torch.int64)
+        transform_dict['resq.config.num_heads'] = torch.tensor(num_heads, dtype=torch.int64)
+        transform_dict['resq.config.num_kv_heads'] = torch.tensor(num_kv_heads, dtype=torch.int64)
+        transform_dict['resq.config.head_dim'] = torch.tensor(head_dim, dtype=torch.int64)
+        transform_dict['resq.config.blocksize'] = torch.tensor(blocksize, dtype=torch.int64)
+        transform_dict['resq.config.high_fraction'] = torch.tensor(self.cfg.high_fraction, dtype=torch.float32)
+        # Encode ud_rotation_type as tensor
+        transform_dict['resq.config.ud_rotation_type'] = torch.tensor(
+            [ord(c) for c in ud_rotation_type], dtype=torch.int8
+        )
+
+        meta_dict['resq.config'] = {
+            'num_layers': nlayers,
+            'hidden_dim': hidden_dim,
+            'intermediate_size': intermediate_size,
+            'num_heads': num_heads,
+            'num_kv_heads': num_kv_heads,
+            'head_dim': head_dim,
+            'blocksize': blocksize,
+            'high_fraction': self.cfg.high_fraction,
+            'ud_rotation_type': ud_rotation_type,
+        }
+
+        # ========== Save to files ==========
+        os.makedirs(output_path, exist_ok=True)
+
+        # Save safetensors
+        safetensors_path = os.path.join(output_path, 'resq_transforms.safetensors')
+        save_file(transform_dict, safetensors_path)
+        self.logger.info(f"Saved {len(transform_dict)} tensors to {safetensors_path}")
+
+        # Save metadata JSON
+        meta_path = os.path.join(output_path, 'resq_transforms_meta.json')
+        with open(meta_path, 'w') as f:
+            json.dump(meta_dict, f, indent=2)
+        self.logger.info(f"Saved metadata to {meta_path}")
+
+        self.logger.info("=" * 60)
+        self.logger.info("Transform matrices save complete!")
+        self.logger.info(f"Output files:")
+        self.logger.info(f"  - {safetensors_path}")
+        self.logger.info(f"  - {meta_path}")
+        self.logger.info("=" * 60)
+
+    @torch.no_grad()
     def save(
         self,
         output_path: str,
@@ -636,6 +839,11 @@ class ResQCalibrator:
             part_file_size: Size limit for part files (GB)
         """
         os.makedirs(output_path, exist_ok=True)
+
+        # Check if we're in transform-only mode
+        if getattr(self.cfg, 'save_transforms_only', False):
+            self._save_transform_matrices(output_path)
+            return
 
         if safetensors_name is None:
             safetensors_name = "quant_model_weight_resq.safetensors"

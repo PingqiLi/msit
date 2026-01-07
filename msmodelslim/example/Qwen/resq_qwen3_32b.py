@@ -138,6 +138,10 @@ def parse_args():
     parser.add_argument('--save_basis_path', type=str, default=None,
                         help="Path to save computed basis matrices (optional)")
 
+    # Transform-only mode: save P and R matrices without fusion or quantization
+    parser.add_argument('--save_transforms_only', type=cmd_bool, default=False,
+                        help="Save only P and R transform matrices without fusion or model weights")
+
     return parser.parse_args()
 
 
@@ -181,7 +185,9 @@ def main():
     set_logger_level("info")
 
     # Determine mode
-    if args.basis_path:
+    if args.save_transforms_only:
+        mode = "TRANSFORM-ONLY (save P and R matrices without fusion)"
+    elif args.basis_path:
         mode = "FULL (pre-computed basis)"
     elif args.compute_basis:
         mode = "FULL (on-the-fly basis computation)"
@@ -203,6 +209,8 @@ def main():
         print(f"Will compute basis from calibration data")
         if args.save_basis_path:
             print(f"Will save basis to: {args.save_basis_path}")
+    if args.save_transforms_only:
+        print(f"Transform-only mode: Will save P and R matrices without fusion")
     print("=" * 60)
 
     # Set random seed
@@ -321,6 +329,7 @@ def main():
         seed=args.seed,
         dev_type=args.dev_type,
         dev_id=args.dev_id,
+        save_transforms_only=args.save_transforms_only,
     )
 
     # Determine the device for layer-by-layer processing
@@ -507,14 +516,25 @@ def main():
     print("ResQ quantization complete!")
     print(f"Output saved to: {save_directory}")
     print("")
-    print("Output files include:")
-    print("  - quant_model_weight_resq.safetensors (quantized weights)")
-    print("  - quant_model_description_resq.json (quantization metadata)")
-    print("  - resq_basis.pt (if basis was computed)")
-    print("")
-    print("Per-layer online projection matrices (U = P @ R):")
-    print(f"  - resq.layer.{{0..{config.num_hidden_layers-1}}}.Uc: K cache rotation (key_pos @ R2)")
-    print(f"  - resq.layer.{{0..{config.num_hidden_layers-1}}}.Ud: down_proj rotation (down_proj @ Rd)")
+    if args.save_transforms_only:
+        print("Output files include (transform-only mode):")
+        print("  - resq_transforms.safetensors (P and R matrices)")
+        print("  - resq_transforms_meta.json (metadata)")
+        print("")
+        print(f"Per-layer transform matrices (U = P @ R) for {config.num_hidden_layers} layers:")
+        print(f"  - resq.layer.{{i}}.P_a, R_a: attn/mlp input rotation")
+        print(f"  - resq.layer.{{i}}.P_b, R_b: v_proj output rotation (per-head)")
+        print(f"  - resq.layer.{{i}}.P_c, R_c: q/k_proj output rotation (post-RoPE)")
+        print(f"  - resq.layer.{{i}}.P_d, R_d: down_proj input rotation")
+    else:
+        print("Output files include:")
+        print("  - quant_model_weight_resq.safetensors (quantized weights)")
+        print("  - quant_model_description_resq.json (quantization metadata)")
+        print("  - resq_basis.pt (if basis was computed)")
+        print("")
+        print("Per-layer online projection matrices (U = P @ R):")
+        print(f"  - resq.layer.{{0..{config.num_hidden_layers-1}}}.Uc: K cache rotation (key_pos @ R2)")
+        print(f"  - resq.layer.{{0..{config.num_hidden_layers-1}}}.Ud: down_proj rotation (down_proj @ Rd)")
     print("=" * 60)
 
 

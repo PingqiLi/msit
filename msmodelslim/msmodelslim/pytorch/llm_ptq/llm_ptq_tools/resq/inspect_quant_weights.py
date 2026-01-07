@@ -17,11 +17,26 @@ from safetensors import safe_open
 
 
 def load_safetensors(path: str) -> Dict[str, torch.Tensor]:
-    """Load tensors from safetensors file."""
+    """Load tensors from safetensors file or directory."""
     tensors = {}
-    with safe_open(path, framework="pt", device="cpu") as f:
-        for key in f.keys():
-            tensors[key] = f.get_tensor(key)
+
+    if os.path.isdir(path):
+        # Load all safetensors files in directory
+        files = sorted([f for f in os.listdir(path) if f.endswith('.safetensors')])
+        if not files:
+            raise ValueError(f"No .safetensors files found in directory: {path}")
+
+        for filename in files:
+            filepath = os.path.join(path, filename)
+            with safe_open(filepath, framework="pt", device="cpu") as f:
+                for key in f.keys():
+                    tensors[key] = f.get_tensor(key)
+    else:
+        # Load single file
+        with safe_open(path, framework="pt", device="cpu") as f:
+            for key in f.keys():
+                tensors[key] = f.get_tensor(key)
+
     return tensors
 
 
@@ -319,8 +334,14 @@ def main():
     args = parser.parse_args()
 
     if not os.path.exists(args.quant_path):
-        print(f"Error: Quantized weights file not found: {args.quant_path}")
+        print(f"Error: Path not found: {args.quant_path}")
         return
+
+    if os.path.isdir(args.quant_path):
+        files = [f for f in os.listdir(args.quant_path) if f.endswith('.safetensors')]
+        if not files:
+            print(f"Error: No .safetensors files found in directory: {args.quant_path}")
+            return
 
     inspect_quant_weights(
         quant_path=args.quant_path,

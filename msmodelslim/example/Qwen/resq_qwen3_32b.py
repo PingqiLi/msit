@@ -142,6 +142,10 @@ def parse_args():
     parser.add_argument('--save_transforms_only', type=cmd_bool, default=False,
                         help="Save only P and R transform matrices without fusion or model weights")
 
+    # Save transforms alongside quantized weights (to a separate folder)
+    parser.add_argument('--save_transforms_path', type=str, default=None,
+                        help="Path to save P and R transform matrices (separate from quantized weights)")
+
     return parser.parse_args()
 
 
@@ -330,6 +334,7 @@ def main():
         dev_type=args.dev_type,
         dev_id=args.dev_id,
         save_transforms_only=args.save_transforms_only,
+        save_transforms_path=args.save_transforms_path,
     )
 
     # Determine the device for layer-by-layer processing
@@ -535,6 +540,12 @@ def main():
         print("Per-layer online projection matrices (U = P @ R):")
         print(f"  - resq.layer.{{0..{config.num_hidden_layers-1}}}.Uc: K cache rotation (key_pos @ R2)")
         print(f"  - resq.layer.{{0..{config.num_hidden_layers-1}}}.Ud: down_proj rotation (down_proj @ Rd)")
+        
+        if args.save_transforms_path:
+            print("")
+            print(f"Transform matrices also saved to: {args.save_transforms_path}")
+            print("  - resq_transforms.safetensors (P and R matrices)")
+            print("  - resq_transforms_meta.json (metadata)")
     print("=" * 60)
 
 

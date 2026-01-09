@@ -1090,6 +1090,13 @@ class ResQCalibrator:
             json.dump(quant_description, f, indent=2, default=str)
         self.logger.info(f"Saved description to {json_path}")
 
+        # Also save transform matrices if save_transforms_path is set
+        transforms_path = getattr(self.cfg, 'save_transforms_path', None)
+        if transforms_path:
+            self.logger.info(f"Also saving transform matrices to {transforms_path}")
+            os.makedirs(transforms_path, exist_ok=True)
+            self._save_transform_matrices(transforms_path)
+
         self.logger.info("Save complete!")
 
 

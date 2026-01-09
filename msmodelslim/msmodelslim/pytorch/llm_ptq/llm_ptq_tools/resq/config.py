@@ -105,6 +105,10 @@ class ResQConfig:
         # Transform-only mode: save P and R matrices without fusion or quantization
         # When True: skip weight fusion, skip quantization, only save P and R matrices
         self.save_transforms_only = kwargs.get('save_transforms_only', False)
+        
+        # Path to save transform matrices (P and R) separately from quantized weights
+        # When set, both quantized weights and transform matrices will be saved
+        self.save_transforms_path = kwargs.get('save_transforms_path', None)
 
     def validate(self, strict: bool = False):
         """

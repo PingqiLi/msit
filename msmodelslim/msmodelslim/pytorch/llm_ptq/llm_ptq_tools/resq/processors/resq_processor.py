@@ -392,7 +392,12 @@ def rearrange_columns(
         else:
             head_dim = model_dim // num_heads
 
-    high_bits_length = int(config.high_fraction * model_dim)
+    # For o_proj, use in_features (num_heads * head_dim) instead of hidden_size
+    # This handles models like Qwen3-32B where hidden_size != num_heads * head_dim
+    # The column rearrangement must match the quantization split (calibrator.py uses weight.shape[1])
+    o_proj_in_dim = num_heads * head_dim
+    high_bits_length = int(config.high_fraction * o_proj_in_dim)
+    logger.info(f"[rearrange_columns] o_proj_in_dim={o_proj_in_dim}, high_bits_length={high_bits_length}")
 
     layers = list(model.model.layers)
     for idx, layer in enumerate(tqdm(layers, desc="Rearranging columns")):

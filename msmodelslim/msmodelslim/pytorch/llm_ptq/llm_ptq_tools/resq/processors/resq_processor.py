@@ -199,7 +199,9 @@ def rotate_mlp_output_hadamard(
 
     # Step 3: Apply H.T using fast Hadamard
     # H.T @ W_.T = (W_ @ H).T, so we compute W_ @ H
-    W_ = matmul_hadU_cpu(W_, hadK, K)
+    # Note: Multiply hadK by K to match original paper (project-resq) implementation
+    # Original paper uses: matmul_hadU_cuda(W, K * hadK.T, K) in rotate_mlp_output
+    W_ = matmul_hadU_cpu(W_, K * hadK, K)
 
     W.weight.data = W_.to(device=dev, dtype=dtype)
 

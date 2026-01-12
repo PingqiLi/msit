@@ -19,7 +19,6 @@ from tqdm import tqdm
 from ..utils.common import get_device, cleanup_memory
 from ..utils.fuse_norm_utils import fuse_layer_norms
 from ..utils.hadamard_utils import (
-    apply_exact_had_to_linear,
     matmul_hadU_cpu,
     get_hadK,
     random_orthogonal_matrix,
@@ -98,59 +97,22 @@ def rotate_mlp_input(layer: nn.Module, R1: torch.Tensor) -> None:
 def rotate_mlp_output(
     layer: nn.Module,
     R1: torch.Tensor,
-    R4: Optional[torch.Tensor] = None,
-    no_had: bool = False,
 ) -> None:
     """
-    Rotate the MLP output (down_proj) weights.
+    Rotate the MLP output (down_proj) weights with R1 only (fallback, no basis).
 
-    Following the original ResQ logic:
-    - If dimension is a power of 2 or has Hadamard support, use fast Hadamard transform
-    - Otherwise, use random orthogonal matrix as fallback
+    This is a simplified version used when no Pd basis is available.
+    Only applies R1.T to the output dimension.
 
     Args:
         layer: Decoder layer
         R1: Rotation matrix for hidden dimension
-        R4: Optional Hadamard block rotation
-        no_had: Skip Hadamard transform if True
     """
-    from ..utils.hadamard_utils import get_hadK, matmul_hadU_cpu, apply_exact_had_to_linear
-
     W = layer.mlp.down_proj
     dtype = W.weight.data.dtype
-    dev = W.weight.device
     W_ = W.weight.data.to(dtype=torch.float64, device='cpu')
 
-    if R1 is not None:
-        W.weight.data = torch.matmul(R1.T.cpu(), W_).to(dtype=dtype)
-
-    if R4 is not None:
-        if not no_had:
-            W_ = W.weight.data.float().cpu()
-            had_K, K = get_hadK(W_.shape[-1])
-            if had_K is not None:
-                W_ = matmul_hadU_cpu(
-                    W_,
-                    K * torch.linalg.inv(R4).t(),
-                    K,
-                )
-            W.weight.data = W_.to(device=dev, dtype=dtype)
-        else:
-            n = W.weight.data.shape[-1]
-            K = R4.shape[0]
-            W_ = W.weight.data.view(-1, n // K, K).to(torch.float64).cpu()
-            W_ = torch.matmul(W_, R4.cpu())
-            W.weight.data = W_.reshape(W.weight.data.shape).to(dtype=dtype)
-    else:
-        # Apply exact Hadamard on down_proj weights
-        # get_hadK now handles all dimensions including non-Hadamard fallback
-        in_dim = W.weight.data.shape[-1]  # intermediate_size
-        had_K, K = get_hadK(in_dim)
-        if had_K is not None or K == 1:
-            # Supported dimension - apply Hadamard transform
-            apply_exact_had_to_linear(W, had_dim=-1, output=False)
-        # Note: When K > 1 and had_K is not None, apply_exact_had_to_linear
-        # will use the orthogonal matrix from get_hadK internally
+    W.weight.data = torch.matmul(R1.T.cpu(), W_).to(dtype=dtype)
 
     if W.bias is not None:
         b = W.bias.data.to(dtype=torch.float64, device='cpu')
@@ -275,41 +237,66 @@ def rotate_ov_proj(
     layer: nn.Module,
     num_heads: int,
     head_dim: int,
-    R2: Optional[torch.Tensor] = None,
-    per_head: bool = False,
+    Ub: torch.Tensor,
 ) -> None:
     """
-    Rotate value and output projections.
+    Rotate value and output projections using Ub = P @ R (random rotation).
+
+    Ub is applied to v_proj output and absorbed into o_proj input.
+    No Hadamard matrix is used.
 
     Args:
         layer: Decoder layer
         num_heads: Number of attention heads
         head_dim: Dimension per head
-        R2: Rotation matrix for head dimension
-        per_head: Whether R2 is different per head
+        Ub: Per-head rotation matrix [num_kv_heads, head_dim, head_dim]
     """
     v_proj = layer.self_attn.v_proj
     o_proj = layer.self_attn.o_proj
 
-    # v_proj: output dimension is num_kv_heads * head_dim
-    apply_exact_had_to_linear(v_proj, had_dim=head_dim, output=True, R2=R2, per_head=per_head)
+    dtype = v_proj.weight.dtype
+    dev = v_proj.weight.device
 
-    # o_proj: input dimension is num_attention_heads * head_dim (not num_kv_heads!)
-    # For GQA, we need to replicate rotation matrices for Q heads sharing the same KV head
-    if R2 is not None and per_head:
-        num_kv_heads = R2.shape[0]
-        o_proj_in_dim = o_proj.weight.shape[1]  # [out, in] -> in_features
-        num_attention_heads = o_proj_in_dim // head_dim
-        if num_attention_heads > num_kv_heads:
-            # GQA case: replicate R2 for each Q head group
-            num_q_per_kv = num_attention_heads // num_kv_heads
-            # Repeat each rotation matrix num_q_per_kv times
-            R2_expanded = R2.repeat_interleave(num_q_per_kv, dim=0)
-            apply_exact_had_to_linear(o_proj, had_dim=head_dim, output=False, R2=R2_expanded, per_head=per_head)
-        else:
-            apply_exact_had_to_linear(o_proj, had_dim=head_dim, output=False, R2=R2, per_head=per_head)
+    # Get dimensions
+    num_kv_heads = Ub.shape[0]
+    o_proj_in_dim = o_proj.weight.shape[1]
+    num_attention_heads = o_proj_in_dim // head_dim
+
+    # v_proj: apply Ub to output dimension
+    # v_proj weight shape: [num_kv_heads * head_dim, hidden_dim]
+    # y_new = y @ Ub, so W_new = Ub.T @ W
+    W_v = v_proj.weight.data.to(torch.float64, device='cpu')
+    W_v = W_v.view(num_kv_heads, head_dim, -1)
+    for hd in range(num_kv_heads):
+        W_v[hd] = torch.matmul(Ub[hd].T.cpu().to(torch.float64), W_v[hd])
+    v_proj.weight.data = W_v.view(-1, W_v.shape[-1]).to(dtype=dtype, device=dev)
+
+    if v_proj.bias is not None:
+        b_v = v_proj.bias.data.to(torch.float64, device='cpu')
+        b_v = b_v.view(num_kv_heads, head_dim)
+        for hd in range(num_kv_heads):
+            b_v[hd] = torch.matmul(Ub[hd].T.cpu().to(torch.float64), b_v[hd])
+        v_proj.bias.data = b_v.view(-1).to(dtype=dtype, device=dev)
+
+    # o_proj: absorb Ub^(-1) into input dimension
+    # o_proj weight shape: [hidden_dim, num_attention_heads * head_dim]
+    # x_new = x @ Ub, so we need W_new = W @ Ub^(-1).T
+    W_o = o_proj.weight.data.to(torch.float64, device='cpu')
+    W_o = W_o.view(W_o.shape[0], num_attention_heads, head_dim)
+
+    # For GQA: replicate Ub inverse for Q heads sharing the same KV head
+    if num_attention_heads > num_kv_heads:
+        num_q_per_kv = num_attention_heads // num_kv_heads
+        for hd in range(num_attention_heads):
+            kv_hd = hd // num_q_per_kv
+            Ub_inv_T = torch.linalg.inv(Ub[kv_hd]).T.cpu().to(torch.float64)
+            W_o[:, hd, :] = torch.matmul(W_o[:, hd, :], Ub_inv_T)
     else:
-        apply_exact_had_to_linear(o_proj, had_dim=head_dim, output=False, R2=R2, per_head=per_head)
+        for hd in range(num_attention_heads):
+            Ub_inv_T = torch.linalg.inv(Ub[hd]).T.cpu().to(torch.float64)
+            W_o[:, hd, :] = torch.matmul(W_o[:, hd, :], Ub_inv_T)
+
+    o_proj.weight.data = W_o.view(W_o.shape[0], -1).to(dtype=dtype, device=dev)
 
 
 def rearrange_o_proj(
@@ -519,10 +506,10 @@ def apply_rotations(
             if R2_0 is not None:
                 R2 = torch.block_diag(R2_0.to(torch.float64), R2)
 
-            U_value = torch.matmul(U_value, R2)
-            rotate_ov_proj(layer, num_heads, head_dim, R2=U_value, per_head=True)
-        else:
-            rotate_ov_proj(layer, num_heads, head_dim, R2=None, per_head=False)
+            # Compute Ub = P @ R (basis @ rotation)
+            Ub = torch.matmul(U_value, R2)
+            rotate_ov_proj(layer, num_heads, head_dim, Ub=Ub)
+        # else: No rotation applied when no basis available
 
         # Rotate attention output
         rotate_attention_output(layer, U_attn)
@@ -540,7 +527,7 @@ def apply_rotations(
                 rotate_mlp_output_random(layer, U_attn, Pd, Rd, blocksize)
         else:
             # Fallback to original rotation if Pd not available
-            rotate_mlp_output(layer, R1=U_attn, R4=None)
+            rotate_mlp_output(layer, R1=U_attn)
 
     cleanup_memory(verbos=False)
 

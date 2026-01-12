@@ -429,8 +429,8 @@ def apply_rotations(
         config: ResQ configuration
     """
     # Check if we should skip fusion (transform-only mode)
-    if getattr(config, 'save_transforms_only', False):
-        logger.info("save_transforms_only=True: Skipping weight fusion")
+    if getattr(config, 'should_skip_fusion', False):
+        logger.info(f"output_mode='{config.output_mode}': Skipping weight fusion")
         return  # Early return - don't modify model weights
 
     model_config = model.config

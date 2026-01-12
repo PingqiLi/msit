@@ -148,15 +148,15 @@ class ResQCalibrator:
             cleanup_memory(verbos=False)
 
             # Skip column rearrangement in transform-only mode (we're not modifying weights)
-            if not getattr(self.cfg, 'save_transforms_only', False):
+            if not self.cfg.should_skip_fusion:
                 # Rearrange columns for mixed-precision layout (only when basis is available)
                 self.logger.info("Rearranging columns for mixed precision...")
                 rearrange_columns(model, self.cfg, training=False)
                 cleanup_memory(verbos=False)
 
         # Skip quantizer addition in transform-only mode
-        if getattr(self.cfg, 'save_transforms_only', False):
-            self.logger.info("save_transforms_only=True: Skipping quantizer addition")
+        if self.cfg.should_skip_fusion:
+            self.logger.info(f"output_mode='{self.cfg.output_mode}': Skipping quantizer addition")
             return model
 
         # Replace linear layers with ResQ quantizers
@@ -260,8 +260,8 @@ class ResQCalibrator:
     def run(self) -> None:
         """Run calibration on the model."""
         # Skip calibration in transform-only mode
-        if getattr(self.cfg, 'save_transforms_only', False):
-            self.logger.info("save_transforms_only=True: Skipping calibration")
+        if self.cfg.should_skip_fusion:
+            self.logger.info(f"output_mode='{self.cfg.output_mode}': Skipping calibration")
             return
 
         self.logger.info("Starting ResQ calibration...")
@@ -840,9 +840,20 @@ class ResQCalibrator:
         """
         os.makedirs(output_path, exist_ok=True)
 
-        # Check if we're in transform-only mode
-        if getattr(self.cfg, 'save_transforms_only', False):
+        # Determine what to save based on output_mode
+        save_transforms = self.cfg.should_save_transforms
+        save_fused = self.cfg.should_save_fused_weights
+
+        self.logger.info(f"Output mode: {self.cfg.output_mode}")
+        self.logger.info(f"  - Save fused weights: {save_fused}")
+        self.logger.info(f"  - Save decomposed transforms: {save_transforms}")
+
+        # Save decomposed P/R transform matrices if needed (transforms_only or debug mode)
+        if save_transforms:
             self._save_transform_matrices(output_path)
+
+        # Skip fused weight saving if transforms_only mode
+        if not save_fused:
             return
 
         if safetensors_name is None:

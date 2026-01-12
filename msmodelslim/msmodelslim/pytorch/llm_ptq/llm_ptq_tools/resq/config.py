@@ -102,9 +102,41 @@ class ResQConfig:
         self.is_dynamic = kwargs.get('is_dynamic', True)
         self.a_sym = kwargs.get('a_sym', False)
 
-        # Transform-only mode: save P and R matrices without fusion or quantization
-        # When True: skip weight fusion, skip quantization, only save P and R matrices
-        self.save_transforms_only = kwargs.get('save_transforms_only', False)
+        # Output mode: determines what to save
+        # - 'fused': Save fused weights + online transforms (default, production use)
+        # - 'transforms_only': Save only decomposed P and R matrices (no fusion)
+        # - 'debug': Save both fused weights and decomposed P/R matrices
+        output_mode = kwargs.get('output_mode', 'fused')
+
+        # Backward compatibility: convert boolean save_transforms_only to output_mode
+        if 'save_transforms_only' in kwargs and kwargs['save_transforms_only'] is not None:
+            import warnings
+            warnings.warn(
+                "save_transforms_only is deprecated, use output_mode='transforms_only' instead",
+                DeprecationWarning,
+                stacklevel=2
+            )
+            if kwargs['save_transforms_only']:
+                output_mode = 'transforms_only'
+            else:
+                output_mode = 'fused'
+
+        self.output_mode = output_mode
+
+    @property
+    def should_skip_fusion(self) -> bool:
+        """Return True if weight fusion should be skipped (transforms_only mode)."""
+        return self.output_mode == 'transforms_only'
+
+    @property
+    def should_save_transforms(self) -> bool:
+        """Return True if decomposed P/R transform matrices should be saved."""
+        return self.output_mode in ['transforms_only', 'debug']
+
+    @property
+    def should_save_fused_weights(self) -> bool:
+        """Return True if fused weights and online transforms should be saved."""
+        return self.output_mode in ['fused', 'debug']
 
     def validate(self, strict: bool = False):
         """
@@ -118,6 +150,8 @@ class ResQConfig:
             f"Invalid rotate_mode: {self.rotate_mode}. Only 'resq' and 'none' are supported."
         assert self.ud_rotation_type in ['hadamard', 'random'], \
             f"Invalid ud_rotation_type: {self.ud_rotation_type}. Only 'hadamard' and 'random' are supported."
+        assert self.output_mode in ['fused', 'transforms_only', 'debug'], \
+            f"Invalid output_mode: {self.output_mode}. Valid options: 'fused', 'transforms_only', 'debug'"
         assert 0.0 <= self.high_fraction <= 1.0, "high_fraction must be between 0 and 1"
 
         if strict and self.rotate_mode == 'resq':

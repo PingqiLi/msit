@@ -314,7 +314,7 @@ def rotate_ov_proj(
 
 def rearrange_o_proj(
     layer: nn.Module,
-    high_bits_length: int,
+    high_fraction: float,
     head_dim: int,
     training: bool = False,
 ) -> None:
@@ -327,7 +327,7 @@ def rearrange_o_proj(
 
     Args:
         layer: Decoder layer
-        high_bits_length: Number of high precision dimensions
+        high_fraction: Fraction of dimensions at high precision (e.g., 0.125)
         head_dim: Dimension per head
         training: Whether in training mode
     """
@@ -335,7 +335,16 @@ def rearrange_o_proj(
 
     in_dim = o_proj.weight.shape[-1]
     num_replicated_heads = in_dim // head_dim
+
+    # Compute high_bits_length based on actual o_proj input dimension
+    # This is critical for models where hidden_size != num_attention_heads * head_dim
+    # Example: Qwen3-32B has hidden_size=5120, but o_proj input is 8192 (64 heads × 128 head_dim)
+    high_bits_length = int(high_fraction * in_dim)
     high_length_per_head = high_bits_length // num_replicated_heads
+
+    logger.debug(f"rearrange_o_proj: in_dim={in_dim}, num_replicated_heads={num_replicated_heads}, "
+                 f"high_fraction={high_fraction}, high_bits_length={high_bits_length}, "
+                 f"high_length_per_head={high_length_per_head}, head_dim={head_dim}")
 
     # Build column indices for rearrangement
     chunk_starts = torch.arange(0, in_dim, head_dim)
@@ -392,13 +401,21 @@ def rearrange_columns(
         else:
             head_dim = model_dim // num_heads
 
-    high_bits_length = int(config.high_fraction * model_dim)
+    # Note: high_bits_length for hidden_dim is kept for reference/logging only
+    # The actual o_proj high_bits_length is computed inside rearrange_o_proj
+    # based on o_proj input dimension (num_attention_heads * head_dim)
+    high_bits_length_hidden = int(config.high_fraction * model_dim)
+
+    logger.debug(f"rearrange_columns: model_dim={model_dim}, head_dim={head_dim}, "
+                 f"num_heads={num_heads}, num_kv_heads={num_kv_heads}, "
+                 f"high_fraction={config.high_fraction}, "
+                 f"high_bits_length_hidden={high_bits_length_hidden}")
 
     layers = list(model.model.layers)
     for idx, layer in enumerate(tqdm(layers, desc="Rearranging columns")):
         rearrange_o_proj(
             layer,
-            high_bits_length,
+            config.high_fraction,  # Pass fraction instead of absolute length
             head_dim,
             training,
         )

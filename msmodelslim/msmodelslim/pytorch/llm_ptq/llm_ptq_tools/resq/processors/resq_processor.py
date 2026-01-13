@@ -155,7 +155,7 @@ def rotate_mlp_output_hadamard(
     # Reshape to [hidden_dim, num_blocks, blocksize]
     W_ = W_.view(W_.shape[0], num_blocks, blocksize)
     # Apply Pd.T to each block (broadcast across all blocks)
-    W_ = torch.matmul(W_, Pd.T.cpu().to(torch.float64))
+    W_ = torch.matmul(W_, Pd.cpu().to(torch.float64))
     # Reshape back to [hidden_dim, intermediate_size]
     W_ = W_.view(W_.shape[0], intermediate_size)
 
@@ -204,7 +204,7 @@ def rotate_mlp_output_random(
     # Reshape to [hidden_dim, num_blocks, blocksize]
     W_ = W_.view(W_.shape[0], num_blocks, blocksize)
     # Apply Pd.T to each block (broadcast across all blocks)
-    W_ = torch.matmul(W_, Pd.T.cpu().to(torch.float64))
+    W_ = torch.matmul(W_, Pd.cpu().to(torch.float64))
     # Reshape back to [hidden_dim, intermediate_size]
     W_ = W_.view(W_.shape[0], intermediate_size)
 

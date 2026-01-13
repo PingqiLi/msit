@@ -43,7 +43,7 @@ def rotate_embeddings(model: nn.Module, R1: torch.Tensor) -> None:
     """
     for W in [model.model.embed_tokens]:
         dtype = W.weight.data.dtype
-        W_ = W.weight.data.to(dtype=torch.float64, device='cpu')
+        W_ = W.weight.data.cpu().to(torch.float64)
         W.weight.data = torch.matmul(W_, R1.cpu()).to(dtype=dtype)
 
 
@@ -57,7 +57,7 @@ def rotate_attention_inputs(layer: nn.Module, R1: torch.Tensor) -> None:
     """
     for W in [layer.self_attn.q_proj, layer.self_attn.k_proj, layer.self_attn.v_proj]:
         dtype = W.weight.dtype
-        W_ = W.weight.to(dtype=torch.float64, device='cpu')
+        W_ = W.weight.cpu().to(torch.float64)
         W.weight.data = torch.matmul(W_, R1.cpu()).to(dtype=dtype)
 
 
@@ -71,11 +71,11 @@ def rotate_attention_output(layer: nn.Module, R1: torch.Tensor) -> None:
     """
     W = layer.self_attn.o_proj
     dtype = W.weight.data.dtype
-    W_ = W.weight.data.to(dtype=torch.float64, device='cpu')
+    W_ = W.weight.data.cpu().to(torch.float64)
     W.weight.data = torch.matmul(R1.T.cpu(), W_).to(dtype=dtype)
 
     if W.bias is not None:
-        b = W.bias.data.to(dtype=torch.float64, device='cpu')
+        b = W.bias.data.cpu().to(torch.float64)
         W.bias.data = torch.matmul(R1.T.cpu(), b).to(dtype=dtype)
 
 
@@ -90,7 +90,7 @@ def rotate_mlp_input(layer: nn.Module, R1: torch.Tensor) -> None:
     mlp_inputs = [layer.mlp.up_proj, layer.mlp.gate_proj]
     for W in mlp_inputs:
         dtype = W.weight.dtype
-        W_ = W.weight.data.to(dtype=torch.float64, device='cpu')
+        W_ = W.weight.data.cpu().to(torch.float64)
         W.weight.data = torch.matmul(W_, R1.cpu()).to(dtype=dtype)
 
 
@@ -110,12 +110,12 @@ def rotate_mlp_output(
     """
     W = layer.mlp.down_proj
     dtype = W.weight.data.dtype
-    W_ = W.weight.data.to(dtype=torch.float64, device='cpu')
+    W_ = W.weight.data.cpu().to(torch.float64)
 
     W.weight.data = torch.matmul(R1.T.cpu(), W_).to(dtype=dtype)
 
     if W.bias is not None:
-        b = W.bias.data.to(dtype=torch.float64, device='cpu')
+        b = W.bias.data.cpu().to(torch.float64)
         W.bias.data = torch.matmul(R1.T.cpu(), b).to(dtype=dtype)
 
 
@@ -143,7 +143,7 @@ def rotate_mlp_output_hadamard(
     W = layer.mlp.down_proj
     dtype = W.weight.data.dtype
     dev = W.weight.device
-    W_ = W.weight.data.to(dtype=torch.float64, device='cpu')
+    W_ = W.weight.data.cpu().to(torch.float64)
 
     intermediate_size = W_.shape[1]
     num_blocks = intermediate_size // blocksize
@@ -163,10 +163,10 @@ def rotate_mlp_output_hadamard(
     # H.T @ W_.T = (W_ @ H).T, so we compute W_ @ H
     W_ = matmul_hadU_cpu(W_, hadK, K)
 
-    W.weight.data = W_.to(device=dev, dtype=dtype)
+    W.weight.data = W_.to(dtype=dtype).to(device=dev)
 
     if W.bias is not None:
-        b = W.bias.data.to(dtype=torch.float64, device='cpu')
+        b = W.bias.data.cpu().to(torch.float64)
         W.bias.data = torch.matmul(Ua.T.cpu().to(torch.float64), b).to(dtype=dtype)
 
 
@@ -192,7 +192,7 @@ def rotate_mlp_output_random(
     W = layer.mlp.down_proj
     dtype = W.weight.data.dtype
     dev = W.weight.device
-    W_ = W.weight.data.to(dtype=torch.float64, device='cpu')
+    W_ = W.weight.data.cpu().to(torch.float64)
 
     intermediate_size = W_.shape[1]
     num_blocks = intermediate_size // blocksize
@@ -212,10 +212,10 @@ def rotate_mlp_output_random(
     # Rd.T @ W_.T = (W_ @ Rd).T, so we compute W_ @ Rd
     W_ = torch.matmul(W_, Rd.cpu().to(torch.float64))
 
-    W.weight.data = W_.to(device=dev, dtype=dtype)
+    W.weight.data = W_.to(dtype=dtype).to(device=dev)
 
     if W.bias is not None:
-        b = W.bias.data.to(dtype=torch.float64, device='cpu')
+        b = W.bias.data.cpu().to(torch.float64)
         W.bias.data = torch.matmul(Ua.T.cpu().to(torch.float64), b).to(dtype=dtype)
 
 
@@ -229,7 +229,7 @@ def rotate_head(model: nn.Module, R1: torch.Tensor) -> None:
     """
     W = model.lm_head
     dtype = W.weight.data.dtype
-    W_ = W.weight.data.to(dtype=torch.float64, device='cpu')
+    W_ = W.weight.data.cpu().to(torch.float64)
     W.weight.data = torch.matmul(W_, R1.cpu()).to(dtype=dtype)
 
 
@@ -265,14 +265,14 @@ def rotate_ov_proj(
     # v_proj: apply Ub to output dimension
     # v_proj weight shape: [num_kv_heads * head_dim, hidden_dim]
     # y_new = y @ Ub, so W_new = Ub.T @ W
-    W_v = v_proj.weight.data.to(torch.float64, device='cpu')
+    W_v = v_proj.weight.data.cpu().to(torch.float64)
     W_v = W_v.view(num_kv_heads, head_dim, -1)
     for hd in range(num_kv_heads):
         W_v[hd] = torch.matmul(Ub[hd].T.cpu().to(torch.float64), W_v[hd])
     v_proj.weight.data = W_v.view(-1, W_v.shape[-1]).to(dtype=dtype, device=dev)
 
     if v_proj.bias is not None:
-        b_v = v_proj.bias.data.to(torch.float64, device='cpu')
+        b_v = v_proj.bias.data.cpu().to(torch.float64)
         b_v = b_v.view(num_kv_heads, head_dim)
         for hd in range(num_kv_heads):
             b_v[hd] = torch.matmul(Ub[hd].T.cpu().to(torch.float64), b_v[hd])
@@ -281,7 +281,7 @@ def rotate_ov_proj(
     # o_proj: absorb Ub^(-1) into input dimension
     # o_proj weight shape: [hidden_dim, num_attention_heads * head_dim]
     # x_new = x @ Ub, so we need W_new = W @ Ub^(-1).T
-    W_o = o_proj.weight.data.to(torch.float64, device='cpu')
+    W_o = o_proj.weight.data.cpu().to(torch.float64)
     W_o = W_o.view(W_o.shape[0], num_attention_heads, head_dim)
 
     # For GQA: replicate Ub inverse for Q heads sharing the same KV head

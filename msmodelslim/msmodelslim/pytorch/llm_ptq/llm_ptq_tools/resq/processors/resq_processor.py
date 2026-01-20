@@ -130,7 +130,7 @@ def rotate_mlp_output_hadamard(
     """
     Rotate the MLP output (down_proj) weights using Hadamard mode.
 
-    Computes: Wd_merged = H.T @ block_diag(Pd).T @ Wd @ Ua
+    Computes: Wd_merged = Ua.T @ Wd @ block_diag(Pd) @ H
 
     Args:
         layer: Decoder layer
@@ -151,16 +151,15 @@ def rotate_mlp_output_hadamard(
     # Step 1: Apply Ua to output dimension: W1 = Ua.T @ Wd
     W_ = torch.matmul(Ua.T.cpu().to(torch.float64), W_)
 
-    # Step 2: Apply block_diag(Pd).T to input dimension
+    # Step 2: Apply block_diag(Pd) to input dimension
     # Reshape to [hidden_dim, num_blocks, blocksize]
     W_ = W_.view(W_.shape[0], num_blocks, blocksize)
-    # Apply Pd.T to each block (broadcast across all blocks)
+    # Apply Pd to each block (broadcast across all blocks)
     W_ = torch.matmul(W_, Pd.cpu().to(torch.float64))
     # Reshape back to [hidden_dim, intermediate_size]
     W_ = W_.view(W_.shape[0], intermediate_size)
 
-    # Step 3: Apply H.T using fast Hadamard
-    # H.T @ W_.T = (W_ @ H).T, so we compute W_ @ H
+    # Step 3: Apply H using fast Hadamard (W_ @ H)
     W_ = matmul_hadU_cpu(W_, hadK, K)
 
     W.weight.data = W_.to(dtype=dtype).to(device=dev)
@@ -180,7 +179,7 @@ def rotate_mlp_output_random(
     """
     Rotate the MLP output (down_proj) weights using random rotation mode.
 
-    Computes: Wd_merged = Rd.T @ block_diag(Pd).T @ Wd @ Ua
+    Computes: Wd_merged = Ua.T @ Wd @ block_diag(Pd) @ Rd
 
     Args:
         layer: Decoder layer
@@ -200,16 +199,15 @@ def rotate_mlp_output_random(
     # Step 1: Apply Ua to output dimension: W1 = Ua.T @ Wd
     W_ = torch.matmul(Ua.T.cpu().to(torch.float64), W_)
 
-    # Step 2: Apply block_diag(Pd).T to input dimension
+    # Step 2: Apply block_diag(Pd) to input dimension
     # Reshape to [hidden_dim, num_blocks, blocksize]
     W_ = W_.view(W_.shape[0], num_blocks, blocksize)
-    # Apply Pd.T to each block (broadcast across all blocks)
+    # Apply Pd to each block (broadcast across all blocks)
     W_ = torch.matmul(W_, Pd.cpu().to(torch.float64))
     # Reshape back to [hidden_dim, intermediate_size]
     W_ = W_.view(W_.shape[0], intermediate_size)
 
-    # Step 3: Apply Rd.T
-    # Rd.T @ W_.T = (W_ @ Rd).T, so we compute W_ @ Rd
+    # Step 3: Apply Rd (W_ @ Rd)
     W_ = torch.matmul(W_, Rd.cpu().to(torch.float64))
 
     W.weight.data = W_.to(dtype=dtype).to(device=dev)

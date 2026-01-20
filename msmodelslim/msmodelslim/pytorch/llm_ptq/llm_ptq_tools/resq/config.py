@@ -16,7 +16,6 @@ class ResQConfig:
         seed: int = 0,
         dev_type: str = 'npu',
         dev_id: int = 0,
-        rotate_mode: str = 'resq',
         **kwargs
     ):
         # General Arguments
@@ -25,14 +24,6 @@ class ResQConfig:
         # Device settings
         self.dev_type = dev_type
         self.dev_id = dev_id
-
-        # Rotation mode: 'resq' or 'none'
-        self.rotate_mode = rotate_mode
-        # Rotation granularity: 'full_shared' (default), 'per_layer', or 'one_per_decoder'
-        # - full_shared: single shared basis for attn+mlp across all layers (recommended)
-        # - per_layer: separate basis for each layer's attn and mlp
-        # - one_per_decoder: per-layer shared basis for attn+mlp
-        self.rotation_granularity = kwargs.get('rotation_granularity', 'full_shared')
 
         # Paths for pre-computed rotations and basis
         self.optimized_rotation_path = kwargs.get('optimized_rotation_path', None)
@@ -146,14 +137,12 @@ class ResQConfig:
             strict: If True, require basis_path for ResQ mode.
                    If False, allow simplified mode without basis.
         """
-        assert self.rotate_mode in ['resq', 'none'], \
-            f"Invalid rotate_mode: {self.rotate_mode}. Only 'resq' and 'none' are supported."
         assert self.ud_rotation_type in ['hadamard', 'random'], \
             f"Invalid ud_rotation_type: {self.ud_rotation_type}. Only 'hadamard' and 'random' are supported."
         assert self.output_mode in ['fused', 'transforms_only', 'debug'], \
             f"Invalid output_mode: {self.output_mode}. Valid options: 'fused', 'transforms_only', 'debug'"
         assert 0.0 <= self.high_fraction <= 1.0, "high_fraction must be between 0 and 1"
 
-        if strict and self.rotate_mode == 'resq':
+        if strict:
             assert self.optimized_basis_path is not None, \
                 "optimized_basis_path is required for ResQ mode (use strict=False for simplified mode)"

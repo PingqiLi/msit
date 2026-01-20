@@ -53,11 +53,13 @@ def get_calib_dataset_batch(model_tokenizer, calib_list, batch_size, seq_len, de
 
 **Location:** [basis_processor.py](msmodelslim/pytorch/llm_ptq/llm_ptq_tools/resq/processors/basis_processor.py)
 
-**Main Function:** `compute_basis()` (lines 201-630)
+**Main Function:** `compute_basis()`
+
+**Basis Mode:** Full shared mode - computes a single shared basis for attention+MLP across all layers, which provides the best balance of quality and efficiency.
 
 **How Activations Are Collected:**
 
-1. **InputCatcher Class** (lines 148-197) - Captures first layer inputs:
+1. **InputCatcher Class** - Captures first layer inputs:
 ```python
 class InputCatcher(nn.Module):
     def forward(self, inp, **kwargs):
@@ -67,7 +69,7 @@ class InputCatcher(nn.Module):
         raise ValueError("Catcher stop")  # Stop forward pass
 ```
 
-2. **Covariance Matrix Initialization** (lines 322-334):
+2. **Covariance Matrix Initialization**:
 ```python
 H_attn = torch.zeros((nlayers, hidden_dim, hidden_dim), dtype=torch.float64)   # Attention input
 H_mlp = torch.zeros((nlayers, hidden_dim, hidden_dim), dtype=torch.float64)    # MLP input
@@ -76,11 +78,11 @@ H_key_pos = torch.zeros((nlayers, num_kv_heads, head_dim, head_dim), ...)      #
 H_down_proj = torch.zeros((nlayers, down_proj_blocksize, down_proj_blocksize)) # down_proj input
 ```
 
-3. **Hook-Based Collection** (lines 339-625):
+3. **Hook-Based Collection**:
    - Uses `register_forward_hook()` to capture activations at specific layers
    - Accumulates outer products: `H += X.T @ X` (covariance estimation)
 
-**Script Invocation** (lines 362-372):
+**Script Invocation:**
 ```python
 basis_dict = compute_basis(
     model=model,
@@ -97,7 +99,7 @@ basis_dict = compute_basis(
 
 **Location:** [basis_processor.py](msmodelslim/pytorch/llm_ptq/llm_ptq_tools/resq/processors/basis_processor.py)
 
-**Function:** `perform_eigen_decomp()` (lines 64-123)
+**Function:** `perform_eigen_decomp()`
 
 ```python
 def perform_eigen_decomp(
@@ -133,7 +135,7 @@ def perform_eigen_decomp(
 
 **Location:** [basis_processor.py](msmodelslim/pytorch/llm_ptq/llm_ptq_tools/resq/processors/basis_processor.py)
 
-**Function:** `generate_random_rotations()` (lines 632-722)
+**Function:** `generate_random_rotations()`
 
 ```python
 # Block-diagonal random orthogonal matrices:
@@ -151,8 +153,8 @@ Rd = block_diag(Rd_0, Rd_1, Rd_2)  # Intermediate dimension (MLP)
 **Location:** [resq_processor.py](msmodelslim/pytorch/llm_ptq/llm_ptq_tools/resq/processors/resq_processor.py)
 
 **Functions:**
-- `rearrange_columns()` (lines 277-316) - Main entry point
-- `rearrange_o_proj()` (lines 215-274) - O projection specific
+- `rearrange_columns()` - Main entry point
+- `rearrange_o_proj()` - O projection specific
 
 ```python
 def rearrange_o_proj(layer, high_bits_length, low_bits_length, head_dim, ...):
@@ -185,7 +187,7 @@ def rearrange_o_proj(layer, high_bits_length, low_bits_length, head_dim, ...):
 
 **Location:** [resq_processor.py](msmodelslim/pytorch/llm_ptq/llm_ptq_tools/resq/processors/resq_processor.py)
 
-**Function:** `apply_rotations()` (lines 319-409)
+**Function:** `apply_rotations()`
 
 The composite rotation `U = P @ R` (basis @ random rotation) is fused into model weights:
 
@@ -208,9 +210,9 @@ def apply_rotations(model, basis_dict, rotation_dict, config):
 ```
 
 **Sub-functions:**
-- `rotate_embeddings()` (lines 37-48) - `embed_tokens.weight @ U.T`
-- `rotate_attention_inputs()` (lines 51-62) - `qkv_proj.weight = U @ W`
-- `rotate_mlp_output()` (lines 98-157) - Includes Hadamard transform
+- `rotate_embeddings()` - `embed_tokens.weight @ U.T`
+- `rotate_attention_inputs()` - `qkv_proj.weight = U @ W`
+- `rotate_mlp_output()` - Includes Hadamard transform
 
 **Hadamard Transform** (optional, for outlier suppression):
 ```python
@@ -224,7 +226,7 @@ def rotate_mlp_output(layer, R1, R4, no_had=False):
 
 ### Step 8: ResQ Calibrator Initialization and Run
 
-**Location:** Main script lines 467-480
+**Location:** Main script
 
 ```python
 # Create calibrator
@@ -241,9 +243,9 @@ calibrator = ResQCalibrator(
 calibrator.run()
 ```
 
-**ResQCalibrator Class:** [calibrator.py](msmodelslim/pytorch/llm_ptq/llm_ptq_tools/resq/calibrator.py) (lines 30-622)
+**ResQCalibrator Class:** [calibrator.py](msmodelslim/pytorch/llm_ptq/llm_ptq_tools/resq/calibrator.py)
 
-The `run()` method (line 251) orchestrates:
+The `run()` method orchestrates:
 1. Model preparation (`_prepare_model()`)
 2. Layer norm fusion
 3. Rotation application
@@ -256,9 +258,9 @@ The `run()` method (line 251) orchestrates:
 
 ### Step 9: Weight Saving with Specific Names
 
-**Location:** [calibrator.py](msmodelslim/pytorch/llm_ptq/llm_ptq_tools/resq/calibrator.py) - `save()` method (lines 354-582)
+**Location:** [calibrator.py](msmodelslim/pytorch/llm_ptq/llm_ptq_tools/resq/calibrator.py) - `save()` method
 
-**Script Invocation** (lines 483-489):
+**Script Invocation:**
 ```python
 calibrator.save(
     output_path=save_directory,
@@ -274,7 +276,7 @@ calibrator.save(
    - `model.embed_tokens.weight` (rotated)
    - `model.norm.weight` (final layer norm)
 
-2. **Dual quantized weights per linear layer** (lines 460-493):
+2. **Dual quantized weights per linear layer**:
 ```python
 weight_dict[f"{name}.weight_low"] = quant_weights['weight_low']   # 4-bit
 weight_dict[f"{name}.scale_low"] = quant_weights['scale_low']
@@ -285,7 +287,7 @@ weight_dict[f"{name}.scale_high"] = quant_weights['scale_high']
 weight_dict[f"{name}.offset_high"] = quant_weights['offset_high']
 ```
 
-3. **Per-layer online rotation matrices** (lines 495-565):
+3. **Per-layer online rotation matrices**:
 ```python
 # Uc: K cache rotation (applied after RoPE during inference)
 weight_dict[f'resq.layer.{i}.Uc'] = Uc.float().cpu()
@@ -294,7 +296,7 @@ weight_dict[f'resq.layer.{i}.Uc'] = Uc.float().cpu()
 weight_dict[f'resq.layer.{i}.Ud'] = Ud.float().cpu()
 ```
 
-**Description JSON** (lines 386-393):
+**Description JSON:**
 ```python
 quant_description = {
     "model_quant_type": "W4A8_ResQ",

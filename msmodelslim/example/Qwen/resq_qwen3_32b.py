@@ -9,13 +9,44 @@ This script performs 4/8-bit hybrid quantization using ResQ algorithm:
 - Generates per-layer online projection matrices (Uc, Ud)
 
 Usage:
-    # Full ResQ with on-the-fly basis computation (recommended):
+    # Mode 1: Fixed ratio (current behavior, backward compatible)
     python resq_qwen3_32b.py \
         --model_path /path/to/Qwen3-32B \
         --save_directory /path/to/output \
-        --calib_file ../common/wiki.jsonl \
+        --high_fraction 0.125 \
+        --compute_basis
+
+    # Mode 2: Hybrid adaptive (recommended for best quality)
+    python resq_qwen3_32b.py \
+        --model_path /path/to/Qwen3-32B \
+        --save_directory /path/to/output \
+        --adaptive_ratio_mode hybrid \
         --compute_basis \
-        --save_basis_path /path/to/basis.pt
+        --compute_kurtosis
+
+    # Mode 3: Single algorithm (e.g., CEV only)
+    python resq_qwen3_32b.py \
+        --model_path /path/to/Qwen3-32B \
+        --save_directory /path/to/output \
+        --adaptive_ratio_mode cev \
+        --cev_target_variance 0.95 \
+        --compute_basis
+
+    # Mode 4: Per-transform algorithm override
+    python resq_qwen3_32b.py \
+        --model_path /path/to/Qwen3-32B \
+        --save_directory /path/to/output \
+        --adaptive_ratio_mode hybrid \
+        --transform_algorithms '{"Ua": "cev", "Ub": "kurtosis", "Ud": "hessian"}' \
+        --compute_basis \
+        --compute_kurtosis
+
+    # Mode 5: Use pre-computed ratios
+    python resq_qwen3_32b.py \
+        --model_path /path/to/Qwen3-32B \
+        --save_directory /path/to/output \
+        --adaptive_ratio_path /path/to/resq_adaptive_ratios.json \
+        --basis_path /path/to/basis.pt
 
     # Using pre-computed basis:
     python resq_qwen3_32b.py \
@@ -154,6 +185,28 @@ def parse_args():
                              "When enabled, V_proj uses only Rb rotation (no basis/permutation), "
                              "and rearrange_o_proj is skipped.")
 
+    # Adaptive ratio parameters
+    parser.add_argument('--adaptive_ratio_mode', type=str, default='fixed',
+                        choices=['fixed', 'hessian', 'kurtosis', 'cev', 'hybrid'],
+                        help="Ratio mode: 'fixed' uses high_fraction, others compute adaptively")
+    parser.add_argument('--adaptive_min_ratio', type=float, default=0.0625,
+                        help="Minimum ratio bound for adaptive mode (default: 1/16)")
+    parser.add_argument('--adaptive_max_ratio', type=float, default=0.25,
+                        help="Maximum ratio bound for adaptive mode (default: 1/4)")
+    parser.add_argument('--cev_target_variance', type=float, default=0.95,
+                        help="Target variance for CEV algorithm (default: 0.95)")
+    parser.add_argument('--adaptive_alignment', type=int, default=512,
+                        help="Hardware alignment boundary (default: 512)")
+    parser.add_argument('--transform_algorithms', type=str, default=None,
+                        help="Per-transform algorithm override as JSON, e.g., '{\"Ua\": \"cev\"}'")
+    parser.add_argument('--ub_head_aggregation', type=str, default='max',
+                        choices=['max', 'mean'],
+                        help="Aggregation method for Ub across heads (default: 'max')")
+    parser.add_argument('--adaptive_ratio_path', type=str, default=None,
+                        help="Path to pre-computed adaptive ratios JSON")
+    parser.add_argument('--compute_kurtosis', type=cmd_bool, default=False,
+                        help="Compute kurtosis during basis computation (enables kurtosis algorithm)")
+
     return parser.parse_args()
 
 
@@ -224,9 +277,28 @@ def main():
     print(f"Mode: {mode}")
     print(f"Model path: {args.model_path}")
     print(f"Save directory: {args.save_directory}")
-    print(f"High bits: {args.high_bits}, Low bits: {args.low_bits}")
-    print(f"High fraction: {args.high_fraction}")
-    print(f"Device: {args.dev_type}:{args.dev_id}")
+    print("")
+    print("Precision Configuration:")
+    print(f"  High bits: {args.high_bits}, Low bits: {args.low_bits}")
+    if args.adaptive_ratio_mode != 'fixed':
+        print(f"  Ratio mode: {args.adaptive_ratio_mode} (adaptive)")
+        print(f"  Min ratio: {args.adaptive_min_ratio}, Max ratio: {args.adaptive_max_ratio}")
+        print(f"  Alignment: {args.adaptive_alignment}")
+        # Determine per-transform algorithms display
+        if args.transform_algorithms:
+            print(f"  Per-transform algorithms: {args.transform_algorithms}")
+        else:
+            alg = args.adaptive_ratio_mode
+            print(f"  Per-transform algorithms: Ua={alg}, Ub={alg}, Uc={alg}, Ud={alg}")
+        print(f"  Ub head aggregation: {args.ub_head_aggregation}")
+        if args.compute_kurtosis:
+            print(f"  Kurtosis computation: enabled")
+        if args.adaptive_ratio_path:
+            print(f"  Pre-computed ratios: {args.adaptive_ratio_path}")
+    else:
+        print(f"  High fraction: {args.high_fraction} (fixed)")
+    print(f"  Device: {args.dev_type}:{args.dev_id}")
+    print("")
     if args.basis_path:
         print(f"Basis path: {args.basis_path}")
     if args.compute_basis:
@@ -348,6 +420,11 @@ def main():
         tokenizer, calib_prompt, args.batch_size, args.seq_len, calib_device
     )
 
+    # Parse transform_algorithms JSON if provided
+    transform_algorithms = {}
+    if args.transform_algorithms:
+        transform_algorithms = json.loads(args.transform_algorithms)
+
     # Create ResQ configuration
     resq_config = ResQConfig(
         high_bits=args.high_bits,
@@ -359,6 +436,17 @@ def main():
         dev_id=args.dev_id,
         output_mode=args.output_mode,
         remove_ub=args.remove_ub,
+        # Adaptive ratio configuration
+        adaptive_ratio=(args.adaptive_ratio_mode != 'fixed'),
+        adaptive_algorithm=args.adaptive_ratio_mode if args.adaptive_ratio_mode != 'fixed' else 'hybrid',
+        adaptive_min_ratio=args.adaptive_min_ratio,
+        adaptive_max_ratio=args.adaptive_max_ratio,
+        cev_target_variance=args.cev_target_variance,
+        adaptive_alignment=args.adaptive_alignment,
+        transform_algorithms=transform_algorithms,
+        ub_head_aggregation=args.ub_head_aggregation,
+        adaptive_ratio_path=args.adaptive_ratio_path,
+        compute_kurtosis=args.compute_kurtosis,
     )
 
     # Determine the device for layer-by-layer processing
@@ -371,6 +459,10 @@ def main():
 
     # Compute basis if requested
     basis_path = args.basis_path
+    # Initialize adaptive ratio data (will be populated if compute_kurtosis is enabled)
+    eval_dict = None
+    kurtosis_dict = None
+
     if args.compute_basis and not args.basis_path:
         print("=" * 60)
         print("Computing eigenvalue basis from calibration data...")
@@ -401,13 +493,22 @@ def main():
             # Compute basis with layer-by-layer processing
             # - device: where to run layer forward passes (NPU/GPU)
             # - cov_device: where to store covariance matrices (CPU to save memory)
-            basis_dict = compute_basis(
+            # - compute_kurtosis: enables kurtosis computation for adaptive ratio
+            basis_result = compute_basis(
                 model=model,
                 dataloader=basis_dataloader,
                 config=resq_config,
                 device=process_device,
                 cov_device='cpu',  # Store covariance matrices on CPU to save NPU memory
+                compute_kurtosis=args.compute_kurtosis,
             )
+
+            # Handle return value based on compute_kurtosis
+            if args.compute_kurtosis:
+                basis_dict, eval_dict, kurtosis_dict = basis_result
+                print(f"Kurtosis computation complete: {len(kurtosis_dict)} entries")
+            else:
+                basis_dict = basis_result
 
             # Save basis if path provided
             if args.save_basis_path:
@@ -512,6 +613,16 @@ def main():
         basis_path=basis_path,  # Use computed or provided basis_path
         rotation_path=args.rotation_path,
     )
+
+    # Set eval_dict and kurtosis_dict if computed during basis computation
+    # These are used by the calibrator's adaptive ratio computation
+    if args.compute_kurtosis and args.compute_basis and not args.basis_path:
+        if eval_dict is not None:
+            calibrator.eval_dict = eval_dict
+            print(f"Set eval_dict with {len(eval_dict)} entries")
+        if kurtosis_dict is not None:
+            calibrator.kurtosis_dict = kurtosis_dict
+            print(f"Set kurtosis_dict with {len(kurtosis_dict)} entries")
 
     # Run calibration
     print("Running ResQ calibration...")

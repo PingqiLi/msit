@@ -427,7 +427,8 @@ class LinearResQQuantizer(nn.Module):
 def add_resq_quantizers(model: nn.Module, cfg=None, logger=None,
                         high_bits: int = 8, low_bits: int = 4,
                         high_fraction: float = 0.125,
-                        skip_names: list = None) -> nn.Module:
+                        skip_names: list = None,
+                        ratio_dict: dict = None) -> nn.Module:
     """
     Replace linear layers with ResQ quantizers.
 
@@ -437,8 +438,11 @@ def add_resq_quantizers(model: nn.Module, cfg=None, logger=None,
         logger: Logger instance
         high_bits: Bits for high precision (default: 8)
         low_bits: Bits for low precision (default: 4)
-        high_fraction: Fraction of dimensions at high precision
+        high_fraction: Default fraction of dimensions at high precision
         skip_names: Layer names to skip
+        ratio_dict: Optional dictionary of per-layer/per-transform ratios.
+                   Keys are in format: 'Ua', 'layer.{i}.Ub', 'layer.{i}.Uc', 'layer.{i}.Ud'
+                   If None or key not found, uses high_fraction.
 
     Returns:
         Model with ResQ quantizers
@@ -467,12 +471,37 @@ def add_resq_quantizers(model: nn.Module, cfg=None, logger=None,
             # ResQ rotations are applied to inputs, so we split on input dimension
             split_dim = 1
 
+            # Determine per-layer ratio based on layer type
+            layer_fraction = high_fraction  # Default
+            if ratio_dict is not None:
+                # Parse layer index from name (e.g., "model.layers.0.self_attn.q_proj")
+                import re
+                layer_match = re.search(r'layers\.(\d+)\.', name)
+                layer_idx = int(layer_match.group(1)) if layer_match else None
+
+                if layer_idx is not None:
+                    # Map projection type to transform type
+                    if any(proj in name for proj in ['q_proj', 'k_proj', 'v_proj', 'gate_proj', 'up_proj']):
+                        # Uses Ua ratio (shared) or fallback to default
+                        ratio_key = 'Ua'
+                    elif 'o_proj' in name:
+                        # Uses Ub ratio (per-layer)
+                        ratio_key = f'layer.{layer_idx}.Ub'
+                    elif 'down_proj' in name:
+                        # Uses Ud ratio (per-layer)
+                        ratio_key = f'layer.{layer_idx}.Ud'
+                    else:
+                        ratio_key = 'Ua'  # Default to Ua
+
+                    if ratio_key in ratio_dict:
+                        layer_fraction = ratio_dict[ratio_key]
+
             quant_mod = LinearResQQuantizer(
                 cfg=cfg,
                 logger=logger,
                 high_bits=high_bits,
                 low_bits=low_bits,
-                high_fraction=high_fraction,
+                high_fraction=layer_fraction,
                 split_dim=split_dim,
             )
             quant_mod.set_param(mod)

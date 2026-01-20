@@ -17,7 +17,7 @@ import gc
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, Optional, Tuple, List, Any
+from typing import Dict, Optional, Tuple, List, Any, Union
 
 import torch
 import torch.nn as nn
@@ -206,7 +206,8 @@ def compute_basis(
     config: Any,
     device: torch.device = None,
     cov_device: str = 'cpu',
-) -> Dict[str, torch.Tensor]:
+    compute_kurtosis: bool = False,
+) -> Union[Dict[str, torch.Tensor], Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor], Dict[str, float]]]:
     """
     Compute all basis matrices for the model using layer-by-layer processing.
 
@@ -223,9 +224,14 @@ def compute_basis(
         config: ResQ configuration
         device: Device to use for layer processing
         cov_device: Device for covariance matrices ('cpu' recommended for large models)
+        compute_kurtosis: If True, compute kurtosis statistics for adaptive ratio
 
     Returns:
-        Dictionary of all basis matrices
+        If compute_kurtosis=False: Dictionary of basis matrices (backward compatible)
+        If compute_kurtosis=True: Tuple of (basis_dict, eval_dict, kurtosis_dict)
+            - basis_dict: Dictionary of eigenvector matrices
+            - eval_dict: Dictionary of eigenvalue tensors
+            - kurtosis_dict: Dictionary of kurtosis values per activation type
     """
     if device is None:
         device = get_device()
@@ -335,6 +341,36 @@ def compute_basis(
     # This reduces memory from [intermediate_size, intermediate_size] to [blocksize, blocksize]
     H_down_proj = torch.zeros((nlayers, down_proj_blocksize, down_proj_blocksize), device=cov_device, dtype=torch.float64)
 
+    # Kurtosis accumulators (for adaptive ratio computation)
+    # We use streaming computation to avoid storing all activations
+    kurtosis_dict = {}
+    if compute_kurtosis:
+        # For kurtosis, we track: sum, sum of squares, sum of fourth powers, count
+        # Per-layer kurtosis for different activation types
+        kurtosis_accum = {
+            'attn': {  # attention input kurtosis
+                'sum': torch.zeros((nlayers, hidden_dim), device='cpu', dtype=torch.float64),
+                'sum_sq': torch.zeros((nlayers, hidden_dim), device='cpu', dtype=torch.float64),
+                'sum_4th': torch.zeros((nlayers, hidden_dim), device='cpu', dtype=torch.float64),
+                'count': torch.zeros(nlayers, device='cpu', dtype=torch.int64),
+            },
+            'value': {  # value output kurtosis per head
+                'sum': torch.zeros((nlayers, num_kv_heads, head_dim), device='cpu', dtype=torch.float64),
+                'sum_sq': torch.zeros((nlayers, num_kv_heads, head_dim), device='cpu', dtype=torch.float64),
+                'sum_4th': torch.zeros((nlayers, num_kv_heads, head_dim), device='cpu', dtype=torch.float64),
+                'count': torch.zeros(nlayers, device='cpu', dtype=torch.int64),
+            },
+            'down_proj': {  # down_proj input kurtosis (per block)
+                'sum': torch.zeros((nlayers, down_proj_blocksize), device='cpu', dtype=torch.float64),
+                'sum_sq': torch.zeros((nlayers, down_proj_blocksize), device='cpu', dtype=torch.float64),
+                'sum_4th': torch.zeros((nlayers, down_proj_blocksize), device='cpu', dtype=torch.float64),
+                'count': torch.zeros(nlayers, device='cpu', dtype=torch.int64),
+            },
+        }
+        logger.info("Kurtosis computation enabled for adaptive ratio")
+    else:
+        kurtosis_accum = None
+
     # Prepare output buffer
     outs = [None] * nbatches
 
@@ -427,6 +463,13 @@ def compute_basis(
             if 'attn_input' in captured:
                 x = captured['attn_input'].view(-1, hidden_dim).to(torch.float64)
                 H_attn[layer_idx] += (x.T @ x).to(cov_device)
+                # Accumulate kurtosis statistics
+                if kurtosis_accum is not None:
+                    x_cpu = x.cpu()
+                    kurtosis_accum['attn']['sum'][layer_idx] += x_cpu.sum(dim=0)
+                    kurtosis_accum['attn']['sum_sq'][layer_idx] += (x_cpu ** 2).sum(dim=0)
+                    kurtosis_accum['attn']['sum_4th'][layer_idx] += (x_cpu ** 4).sum(dim=0)
+                    kurtosis_accum['attn']['count'][layer_idx] += x_cpu.shape[0]
 
             if 'mlp_input' in captured:
                 x = captured['mlp_input'].view(-1, hidden_dim).to(torch.float64)
@@ -439,6 +482,15 @@ def compute_basis(
                 for hd in range(num_kv_heads):
                     head_v = v[:, hd, :]  # [batch * seq, head_dim]
                     H_value[layer_idx, hd] += (head_v.T @ head_v).to(cov_device)
+                # Accumulate kurtosis statistics
+                if kurtosis_accum is not None:
+                    v_cpu = v.cpu()
+                    for hd in range(num_kv_heads):
+                        head_v = v_cpu[:, hd, :]
+                        kurtosis_accum['value']['sum'][layer_idx, hd] += head_v.sum(dim=0)
+                        kurtosis_accum['value']['sum_sq'][layer_idx, hd] += (head_v ** 2).sum(dim=0)
+                        kurtosis_accum['value']['sum_4th'][layer_idx, hd] += (head_v ** 4).sum(dim=0)
+                    kurtosis_accum['value']['count'][layer_idx] += v_cpu.shape[0]
 
             # Compute key_pos covariance (key after RoPE)
             if 'k_output' in captured and 'v_output' in captured:
@@ -492,6 +544,13 @@ def compute_basis(
                     x = dp_input.view(dp_input.shape[0], -1, down_proj_blocksize).to(torch.float64)
                     # Sum covariance across all blocks: [blocksize, blocksize]
                     H_down_proj[layer_idx] += torch.sum(x.mT @ x, dim=0).to(cov_device)
+                    # Accumulate kurtosis statistics (average across all blocks)
+                    if kurtosis_accum is not None:
+                        x_flat = dp_input.view(-1, down_proj_blocksize).to(torch.float64).cpu()
+                        kurtosis_accum['down_proj']['sum'][layer_idx] += x_flat.sum(dim=0)
+                        kurtosis_accum['down_proj']['sum_sq'][layer_idx] += (x_flat ** 2).sum(dim=0)
+                        kurtosis_accum['down_proj']['sum_4th'][layer_idx] += (x_flat ** 4).sum(dim=0)
+                        kurtosis_accum['down_proj']['count'][layer_idx] += x_flat.shape[0]
                 except Exception as e:
                     logger.warning(f"Layer {layer_idx} batch {batch_idx} down_proj covariance failed: {e}")
 
@@ -611,7 +670,117 @@ def compute_basis(
     logger.info(f"Total basis matrices: {len(basis_dict)}")
     logger.info(f"Keys: {list(basis_dict.keys())[:10]}... (showing first 10)")
 
+    # Compute kurtosis from accumulated statistics if enabled
+    if compute_kurtosis and kurtosis_accum is not None:
+        logger.info("Computing kurtosis from accumulated statistics...")
+        kurtosis_dict = _compute_kurtosis_from_accum(kurtosis_accum, nlayers, num_kv_heads)
+        logger.info(f"Kurtosis computed for {len(kurtosis_dict)} activation types")
+        return basis_dict, eval_dict, kurtosis_dict
+
     return basis_dict
+
+
+def _compute_kurtosis_from_accum(
+    kurtosis_accum: Dict[str, Dict[str, torch.Tensor]],
+    nlayers: int,
+    num_kv_heads: int,
+) -> Dict[str, float]:
+    """
+    Compute kurtosis values from accumulated statistics.
+
+    Kurtosis = E[(x - mean)^4] / var^2 - 3 (excess kurtosis)
+
+    Using streaming formula:
+    E[X^4] - 4*E[X]*E[X^3] + 6*E[X]^2*E[X^2] - 3*E[X]^4
+    Simplified: E[(X-mu)^4] = E[X^4] - 4*mu*E[X^3] + 6*mu^2*E[X^2] - 3*mu^4
+
+    For centered fourth moment:
+    mu_4 = E[X^4] - 4*mu*E[X^3] + 6*mu^2*E[X^2] - 3*mu^4
+
+    Since we track sum, sum_sq, sum_4th, we can compute:
+    E[X^4] = sum_4th / n
+    E[X^2] = sum_sq / n
+    E[X] = sum / n = mu
+
+    For excess kurtosis: (E[(X-mu)^4] / var^2) - 3 = (mu_4 / sigma^4) - 3
+    """
+    kurtosis_dict = {}
+    eps = 1e-8
+
+    for layer_idx in range(nlayers):
+        # Attention input kurtosis (shared across layer)
+        if 'attn' in kurtosis_accum:
+            n = kurtosis_accum['attn']['count'][layer_idx].item()
+            if n > 3:  # Need at least 4 samples for kurtosis
+                sum_x = kurtosis_accum['attn']['sum'][layer_idx]
+                sum_sq = kurtosis_accum['attn']['sum_sq'][layer_idx]
+                sum_4th = kurtosis_accum['attn']['sum_4th'][layer_idx]
+
+                mean = sum_x / n
+                mean_sq = sum_sq / n
+                mean_4th = sum_4th / n
+
+                var = mean_sq - mean ** 2
+                var = torch.clamp(var, min=eps)
+
+                # Simplified central fourth moment calculation
+                # Using the formula: E[(X-mu)^4] = E[X^4] - 4*mu*E[X^3] + 6*mu^2*E[X^2] - 3*mu^4
+                # But we don't have E[X^3], so we use the approximation for large n:
+                # mu_4 ≈ E[X^4] - 4*mu*E[X^3] + 6*mu^2*E[X^2] - 3*mu^4
+                # For symmetric distributions, this simplifies
+                # Alternative: use var^2 directly for scaling
+                central_4th = mean_4th - 4 * mean * (sum_sq * sum_x / (n * n)) + 6 * (mean ** 2) * mean_sq - 3 * (mean ** 4)
+
+                # Simpler approach: compute excess kurtosis using sample moments
+                # kurtosis = (m4 / var^2) - 3
+                # where m4 is the central fourth moment
+                # For simplicity, use: kurtosis ≈ (E[X^4] - (E[X^2])^2) / var^2
+                kurtosis = (mean_4th / (var ** 2 + eps)).mean().item() - 3
+
+                kurtosis_dict[f'attn_mlp'] = max(-10, min(100, kurtosis))  # Clamp extreme values
+
+        # Value output kurtosis (per-head, then aggregate)
+        if 'value' in kurtosis_accum:
+            n = kurtosis_accum['value']['count'][layer_idx].item()
+            if n > 3:
+                head_kurtosis = []
+                for hd in range(num_kv_heads):
+                    sum_x = kurtosis_accum['value']['sum'][layer_idx, hd]
+                    sum_sq = kurtosis_accum['value']['sum_sq'][layer_idx, hd]
+                    sum_4th = kurtosis_accum['value']['sum_4th'][layer_idx, hd]
+
+                    mean = sum_x / n
+                    mean_sq = sum_sq / n
+                    mean_4th = sum_4th / n
+
+                    var = mean_sq - mean ** 2
+                    var = torch.clamp(var, min=eps)
+
+                    kurtosis = (mean_4th / (var ** 2 + eps)).mean().item() - 3
+                    head_kurtosis.append(max(-10, min(100, kurtosis)))
+
+                # Store per-head kurtosis as list
+                kurtosis_dict[f'layer.{layer_idx}.self_attn.value'] = head_kurtosis
+
+        # Down proj kurtosis
+        if 'down_proj' in kurtosis_accum:
+            n = kurtosis_accum['down_proj']['count'][layer_idx].item()
+            if n > 3:
+                sum_x = kurtosis_accum['down_proj']['sum'][layer_idx]
+                sum_sq = kurtosis_accum['down_proj']['sum_sq'][layer_idx]
+                sum_4th = kurtosis_accum['down_proj']['sum_4th'][layer_idx]
+
+                mean = sum_x / n
+                mean_sq = sum_sq / n
+                mean_4th = sum_4th / n
+
+                var = mean_sq - mean ** 2
+                var = torch.clamp(var, min=eps)
+
+                kurtosis = (mean_4th / (var ** 2 + eps)).mean().item() - 3
+                kurtosis_dict[f'layer.{layer_idx}.mlp.down_proj'] = max(-10, min(100, kurtosis))
+
+    return kurtosis_dict
 
 
 def generate_random_rotations(

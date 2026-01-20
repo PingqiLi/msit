@@ -23,6 +23,13 @@ from .config import ResQConfig
 from .quant_modules import LinearResQQuantizer, add_resq_quantizers
 from .processors.basis_processor import compute_basis, generate_random_rotations, load_basis
 from .processors.resq_processor import apply_rotations, rearrange_columns
+from .processors.adaptive_ratio import (
+    AdaptiveRatioConfig,
+    AdaptiveRatioComputer,
+    AdaptiveRatioResult,
+    save_adaptive_ratios,
+    load_adaptive_ratios,
+)
 from .utils.fuse_norm_utils import fuse_layer_norms
 from .utils.common import cleanup_memory, get_device
 from .gptq import GPTQ, create_gptq_quantizers, GPTQWeightQuantizer
@@ -69,6 +76,10 @@ class ResQCalibrator:
         # Load or compute basis and rotations
         self.basis_dict = None
         self.rotation_dict = None
+        self.eval_dict = None  # Eigenvalues for adaptive ratio
+        self.kurtosis_dict = None  # Kurtosis for adaptive ratio
+        self.ratio_dict = None  # Per-layer/per-transform ratios
+        self.adaptive_ratio_result = None  # Full adaptive ratio result
 
         if basis_path:
             self.logger.info(f"Loading basis from {basis_path}")
@@ -116,6 +127,10 @@ class ResQCalibrator:
         else:
             self._use_simplified_mode = False
 
+            # Compute adaptive ratios if enabled
+            if self.cfg.adaptive_ratio:
+                self._compute_adaptive_ratios(model)
+
             # Generate rotations if not provided
             if self.rotation_dict is None:
                 self.logger.info("Generating random rotations...")
@@ -144,14 +159,14 @@ class ResQCalibrator:
 
             # Apply rotations with basis
             self.logger.info("Applying rotations to model...")
-            apply_rotations(model, self.basis_dict, self.rotation_dict, self.cfg)
+            apply_rotations(model, self.basis_dict, self.rotation_dict, self.cfg, self.ratio_dict)
             cleanup_memory(verbos=False)
 
             # Skip column rearrangement in transform-only mode (we're not modifying weights)
             if not self.cfg.should_skip_fusion:
                 # Rearrange columns for mixed-precision layout (only when basis is available)
                 self.logger.info("Rearranging columns for mixed precision...")
-                rearrange_columns(model, self.cfg, training=False)
+                rearrange_columns(model, self.cfg, training=False, ratio_dict=self.ratio_dict)
                 cleanup_memory(verbos=False)
 
         # Skip quantizer addition in transform-only mode
@@ -175,6 +190,7 @@ class ResQCalibrator:
             low_bits=self.cfg.low_bits,
             high_fraction=self.cfg.high_fraction,
             skip_names=skip_names,
+            ratio_dict=self.ratio_dict,  # Per-layer/per-transform ratios (None if not adaptive)
         )
 
         if self._is_multi_device:
@@ -255,6 +271,81 @@ class ResQCalibrator:
             self._input_device = self.device
 
         return model
+
+    def _compute_adaptive_ratios(self, model: nn.Module) -> None:
+        """
+        Compute adaptive precision ratios for each layer and transformation.
+
+        This method computes per-layer ratios based on eigenvalues and optional
+        kurtosis statistics, replacing the fixed high_fraction.
+
+        Args:
+            model: The transformer model
+        """
+        self.logger.info("=" * 60)
+        self.logger.info("Computing adaptive precision ratios...")
+        self.logger.info(f"  Algorithm: {self.cfg.adaptive_algorithm}")
+        self.logger.info(f"  Min ratio: {self.cfg.adaptive_min_ratio}")
+        self.logger.info(f"  Max ratio: {self.cfg.adaptive_max_ratio}")
+        self.logger.info(f"  Alignment: {self.cfg.adaptive_alignment}")
+        self.logger.info("=" * 60)
+
+        # Check if pre-computed ratios are available
+        if self.cfg.adaptive_ratio_path:
+            try:
+                self.logger.info(f"Loading pre-computed ratios from {self.cfg.adaptive_ratio_path}")
+                self.ratio_dict = load_adaptive_ratios(self.cfg.adaptive_ratio_path)
+                self.logger.info(f"Loaded {len(self.ratio_dict)} ratios")
+                return
+            except Exception as e:
+                self.logger.warning(f"Failed to load adaptive ratios: {e}")
+                self.logger.warning("Computing ratios from basis...")
+
+        # Need to load eigenvalues from basis_dict
+        # The basis_dict contains eigenvectors, we need to reload with eigenvalues
+        # Check if we have eval_dict (eigenvalues) available
+        if self.eval_dict is None:
+            # Need to compute eigenvalues - they're not stored in the standard basis file
+            # For now, use the eigenvalues from the basis computation if available
+            # Otherwise, we need to recompute or load from a separate file
+            self.logger.warning(
+                "Eigenvalues (eval_dict) not available. "
+                "Adaptive ratio requires eigenvalues from basis computation. "
+                "Falling back to fixed ratio."
+            )
+            return
+
+        # Create adaptive ratio config
+        adaptive_config = AdaptiveRatioConfig(
+            enabled=True,
+            algorithm=self.cfg.adaptive_algorithm,
+            min_ratio=self.cfg.adaptive_min_ratio,
+            max_ratio=self.cfg.adaptive_max_ratio,
+            cev_target_variance=self.cfg.cev_target_variance,
+            alignment=self.cfg.adaptive_alignment,
+            transform_algorithms=self.cfg.transform_algorithms,
+            ub_head_aggregation=self.cfg.ub_head_aggregation,
+        )
+
+        # Create computer and compute ratios
+        computer = AdaptiveRatioComputer(adaptive_config)
+        self.adaptive_ratio_result = computer.compute_all_ratios(
+            eval_dict=self.eval_dict,
+            kurtosis_dict=self.kurtosis_dict,
+            model_config=model.config,
+        )
+
+        # Extract ratio_dict for use by other components
+        self.ratio_dict = self.adaptive_ratio_result.ratios
+
+        # Log computed ratios
+        self.logger.info("Computed adaptive ratios:")
+        for key, ratio in sorted(self.ratio_dict.items())[:10]:  # Show first 10
+            self.logger.info(f"  {key}: {ratio:.4f}")
+        if len(self.ratio_dict) > 10:
+            self.logger.info(f"  ... ({len(self.ratio_dict) - 10} more)")
+
+        self.logger.info("=" * 60)
 
     @torch.no_grad()
     def run(self) -> None:
@@ -1100,6 +1191,12 @@ class ResQCalibrator:
         with open(json_path, 'w') as f:
             json.dump(quant_description, f, indent=2, default=str)
         self.logger.info(f"Saved description to {json_path}")
+
+        # Save adaptive ratio results if computed
+        if self.adaptive_ratio_result is not None:
+            adaptive_ratio_path = os.path.join(output_path, 'resq_adaptive_ratios.json')
+            save_adaptive_ratios(self.adaptive_ratio_result, adaptive_ratio_path)
+            self.logger.info(f"Saved adaptive ratios to {adaptive_ratio_path}")
 
         self.logger.info("Save complete!")
 

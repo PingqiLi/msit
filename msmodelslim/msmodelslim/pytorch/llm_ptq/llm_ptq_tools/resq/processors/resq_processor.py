@@ -364,6 +364,7 @@ def rearrange_columns(
     model: nn.Module,
     config: Any,
     training: bool = False,
+    ratio_dict: Optional[Dict[str, float]] = None,
 ) -> None:
     """
     Rearrange columns in all layers for mixed-precision layout.
@@ -372,6 +373,8 @@ def rearrange_columns(
         model: The transformer model
         config: ResQ configuration
         training: Whether in training mode
+        ratio_dict: Optional dictionary of per-layer/per-transform ratios.
+                   If None, uses config.high_fraction for all layers.
     """
     model_config = model.config
     num_heads = model_config.num_attention_heads
@@ -398,9 +401,17 @@ def rearrange_columns(
 
     layers = list(model.model.layers)
     for idx, layer in enumerate(tqdm(layers, desc="Rearranging columns")):
+        # Get per-layer ratio for Ub (value/o_proj) if available
+        layer_fraction = config.high_fraction
+        if ratio_dict is not None:
+            ub_key = f'layer.{idx}.Ub'
+            if ub_key in ratio_dict:
+                layer_fraction = ratio_dict[ub_key]
+                logger.debug(f"Layer {idx}: using adaptive ratio {layer_fraction:.4f}")
+
         rearrange_o_proj(
             layer,
-            config.high_fraction,  # Pass fraction instead of absolute length
+            layer_fraction,  # Pass fraction (may be per-layer)
             head_dim,
             training,
         )
@@ -413,6 +424,7 @@ def apply_rotations(
     basis_dict: Dict[str, torch.Tensor],
     rotation_dict: Dict[str, torch.Tensor],
     config: Any,
+    ratio_dict: Optional[Dict[str, float]] = None,
 ) -> None:
     """
     Apply basis and rotation matrices to model weights.
@@ -425,6 +437,8 @@ def apply_rotations(
         basis_dict: Dictionary of basis matrices from compute_basis
         rotation_dict: Dictionary of rotation matrices
         config: ResQ configuration
+        ratio_dict: Optional dictionary of per-layer/per-transform ratios.
+                   If None, uses config.high_fraction for all layers.
     """
     # Check if we should skip fusion (transform-only mode)
     if getattr(config, 'should_skip_fusion', False):

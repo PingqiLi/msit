@@ -32,6 +32,24 @@ class ResQConfig:
         # Mixed precision fractions
         self.high_fraction = high_fraction  # high precision portion (e.g., 0.125 = 1/8)
 
+        # Adaptive ratio configuration
+        # When enabled, high_fraction is determined per-layer based on quantization difficulty
+        self.adaptive_ratio = kwargs.get('adaptive_ratio', False)
+        self.adaptive_algorithm = kwargs.get('adaptive_algorithm', 'hybrid')  # 'hessian', 'kurtosis', 'cev', 'hybrid'
+        self.adaptive_min_ratio = kwargs.get('adaptive_min_ratio', 0.0625)  # 1/16
+        self.adaptive_max_ratio = kwargs.get('adaptive_max_ratio', 0.25)    # 1/4
+        self.cev_target_variance = kwargs.get('cev_target_variance', 0.95)
+        self.adaptive_alignment = kwargs.get('adaptive_alignment', 512)
+        # Per-transform algorithm override (optional)
+        # e.g., {'Ua': 'cev', 'Ub': 'kurtosis'}
+        self.transform_algorithms = kwargs.get('transform_algorithms', {})
+        # Ub aggregation across heads: 'max' (conservative) or 'mean'
+        self.ub_head_aggregation = kwargs.get('ub_head_aggregation', 'max')
+        # Path to pre-computed adaptive ratios
+        self.adaptive_ratio_path = kwargs.get('adaptive_ratio_path', None)
+        # Compute kurtosis during basis computation (requires extra memory)
+        self.compute_kurtosis = kwargs.get('compute_kurtosis', False)
+
         # Activation Quantization Arguments
         self.a_bits = kwargs.get('a_bits', 4)
         self.a_groupsize = kwargs.get('a_groupsize', -1)
@@ -142,6 +160,30 @@ class ResQConfig:
         assert self.output_mode in ['fused', 'transforms_only', 'debug'], \
             f"Invalid output_mode: {self.output_mode}. Valid options: 'fused', 'transforms_only', 'debug'"
         assert 0.0 <= self.high_fraction <= 1.0, "high_fraction must be between 0 and 1"
+
+        # Validate adaptive ratio configuration
+        if self.adaptive_ratio:
+            valid_algorithms = ['hessian', 'kurtosis', 'cev', 'hybrid']
+            assert self.adaptive_algorithm in valid_algorithms, \
+                f"Invalid adaptive_algorithm: {self.adaptive_algorithm}. Valid options: {valid_algorithms}"
+            assert 0.0 <= self.adaptive_min_ratio <= 1.0, \
+                "adaptive_min_ratio must be between 0 and 1"
+            assert 0.0 <= self.adaptive_max_ratio <= 1.0, \
+                "adaptive_max_ratio must be between 0 and 1"
+            assert self.adaptive_min_ratio <= self.adaptive_max_ratio, \
+                "adaptive_min_ratio must be <= adaptive_max_ratio"
+            assert 0.0 < self.cev_target_variance <= 1.0, \
+                "cev_target_variance must be in (0, 1]"
+            assert self.adaptive_alignment > 0, \
+                "adaptive_alignment must be positive"
+            assert self.ub_head_aggregation in ['max', 'mean'], \
+                f"Invalid ub_head_aggregation: {self.ub_head_aggregation}. Valid options: 'max', 'mean'"
+            # Validate per-transform algorithm overrides
+            for transform, alg in self.transform_algorithms.items():
+                assert transform in ['Ua', 'Ub', 'Uc', 'Ud'], \
+                    f"Invalid transform key: {transform}. Valid keys: 'Ua', 'Ub', 'Uc', 'Ud'"
+                assert alg in valid_algorithms, \
+                    f"Invalid algorithm for {transform}: {alg}. Valid options: {valid_algorithms}"
 
         if strict:
             assert self.optimized_basis_path is not None, \

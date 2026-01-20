@@ -53,6 +53,14 @@ __all__ = [
     # Processors
     'apply_rotations',
     'rearrange_columns',
+    # Adaptive ratio
+    'AdaptiveRatioConfig',
+    'AdaptiveRatioComputer',
+    'AdaptiveRatioResult',
+    'create_algorithm',
+    'align_dimension_split',
+    'save_adaptive_ratios',
+    'load_adaptive_ratios',
     # Quantizer modules
     'LinearResQQuantizer',
     'ResQWeightQuantizer',
@@ -69,6 +77,15 @@ from .config import ResQConfig
 from .calibrator import ResQCalibrator, resq_calibrate
 from .processors.resq_processor import resq_quantize, apply_rotations, rearrange_columns
 from .processors.basis_processor import compute_basis
+from .processors.adaptive_ratio import (
+    AdaptiveRatioConfig,
+    AdaptiveRatioComputer,
+    AdaptiveRatioResult,
+    create_algorithm,
+    align_dimension_split,
+    save_adaptive_ratios,
+    load_adaptive_ratios,
+)
 from .trainer import resq_train
 from .quant_modules import (
     LinearResQQuantizer,

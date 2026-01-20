@@ -297,6 +297,70 @@ def rotate_ov_proj(
     o_proj.weight.data = W_o.view(W_o.shape[0], -1).to(dtype=dtype, device=dev)
 
 
+def rotate_ov_proj_rotation_only(
+    layer: nn.Module,
+    num_heads: int,
+    head_dim: int,
+    Rb: torch.Tensor,
+) -> None:
+    """
+    Rotate value and output projections using only Rb (rotation matrix).
+
+    Unlike rotate_ov_proj which uses Ub = Pb @ Rb, this function:
+    - Applies only Rb to v_proj output (no eigenvector basis)
+    - Absorbs only Rb^(-1) into o_proj input (no permutation)
+
+    This is the "Remove Ub" mode where V is only rotated, not rearranged.
+
+    Args:
+        layer: Decoder layer
+        num_heads: Number of attention heads
+        head_dim: Dimension per head
+        Rb: Rotation matrix [head_dim, head_dim] (shared across all heads)
+    """
+    v_proj = layer.self_attn.v_proj
+    o_proj = layer.self_attn.o_proj
+
+    dtype = v_proj.weight.dtype
+    dev = v_proj.weight.device
+
+    # Get dimensions
+    num_kv_heads = v_proj.out_features // head_dim
+    o_proj_in_dim = o_proj.weight.shape[1]
+    num_attention_heads = o_proj_in_dim // head_dim
+
+    # v_proj: apply Rb to output dimension
+    # v_proj weight shape: [num_kv_heads * head_dim, hidden_dim]
+    # y_new = y @ Rb, so W_new = Rb.T @ W
+    W_v = v_proj.weight.data.cpu().to(torch.float64)
+    W_v = W_v.view(num_kv_heads, head_dim, -1)
+    Rb_cpu = Rb.cpu().to(torch.float64)
+    for hd in range(num_kv_heads):
+        W_v[hd] = torch.matmul(Rb_cpu.T, W_v[hd])
+    v_proj.weight.data = W_v.view(-1, W_v.shape[-1]).to(dtype=dtype, device=dev)
+
+    if v_proj.bias is not None:
+        b_v = v_proj.bias.data.cpu().to(torch.float64)
+        b_v = b_v.view(num_kv_heads, head_dim)
+        for hd in range(num_kv_heads):
+            b_v[hd] = torch.matmul(Rb_cpu.T, b_v[hd])
+        v_proj.bias.data = b_v.view(-1).to(dtype=dtype, device=dev)
+
+    # o_proj: absorb Rb^(-1) into input dimension
+    # o_proj weight shape: [hidden_dim, num_attention_heads * head_dim]
+    # x_new = x @ Rb, so we need W_new = W @ Rb^(-1).T
+    W_o = o_proj.weight.data.cpu().to(torch.float64)
+    W_o = W_o.view(W_o.shape[0], num_attention_heads, head_dim)
+
+    # Rb is orthogonal, so Rb^(-1) = Rb.T, and Rb^(-1).T = Rb
+    Rb_inv_T = Rb_cpu  # Rb^(-1).T = (Rb.T).T = Rb
+
+    for hd in range(num_attention_heads):
+        W_o[:, hd, :] = torch.matmul(W_o[:, hd, :], Rb_inv_T)
+
+    o_proj.weight.data = W_o.view(W_o.shape[0], -1).to(dtype=dtype, device=dev)
+
+
 def rearrange_o_proj(
     layer: nn.Module,
     high_fraction: float,
@@ -376,6 +440,12 @@ def rearrange_columns(
         ratio_dict: Optional dictionary of per-layer/per-transform ratios.
                    If None, uses config.high_fraction for all layers.
     """
+    # Check if remove_ub mode is enabled - skip rearrangement
+    remove_ub = getattr(config, 'remove_ub', False)
+    if remove_ub:
+        logger.info("remove_ub=True: Skipping o_proj column rearrangement")
+        return
+
     model_config = model.config
     num_heads = model_config.num_attention_heads
     num_kv_heads = getattr(model_config, 'num_key_value_heads', num_heads)
@@ -508,9 +578,7 @@ def apply_rotations(
         # Rotate value projection with per-head basis
         key = f'layer.{idx}.self_attn.value'
         if key in basis_dict:
-            U_value = basis_dict[key].to(torch.float64)
-
-            # Build per-head R2
+            # Build per-head R2 rotation matrix
             R2_1 = rotation_dict['R2_1'].to(torch.float64)
             R2_2 = rotation_dict['R2_2'].to(torch.float64)
             R2 = torch.block_diag(R2_1, R2_2)
@@ -518,9 +586,18 @@ def apply_rotations(
             if R2_0 is not None:
                 R2 = torch.block_diag(R2_0.to(torch.float64), R2)
 
-            # Compute Ub = P @ R (basis @ rotation)
-            Ub = torch.matmul(U_value, R2)
-            rotate_ov_proj(layer, num_heads, head_dim, Ub=Ub)
+            # Check if remove_ub mode is enabled
+            remove_ub = getattr(config, 'remove_ub', False)
+
+            if remove_ub:
+                # Remove Ub mode: apply only Rb (rotation) without Pb (basis)
+                # V_proj and O_proj are rotated with Rb only
+                rotate_ov_proj_rotation_only(layer, num_heads, head_dim, Rb=R2)
+            else:
+                # Standard mode: apply Ub = Pb @ Rb
+                U_value = basis_dict[key].to(torch.float64)
+                Ub = torch.matmul(U_value, R2)
+                rotate_ov_proj(layer, num_heads, head_dim, Ub=Ub)
         # else: No rotation applied when no basis available
 
         # Rotate attention output

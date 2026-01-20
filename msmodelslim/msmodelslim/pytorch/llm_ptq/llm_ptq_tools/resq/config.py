@@ -50,6 +50,13 @@ class ResQConfig:
         # Compute kurtosis during basis computation (requires extra memory)
         self.compute_kurtosis = kwargs.get('compute_kurtosis', False)
 
+        # Remove Ub (basis) mode - use rotation only for value projection
+        # When enabled:
+        # - V_proj output is rotated with Rb only (no Pb basis)
+        # - O_proj absorbs Rb^(-1) only (no Pb^(-1))
+        # - rearrange_o_proj() is skipped (no column reordering)
+        self.remove_ub = kwargs.get('remove_ub', False)
+
         # Activation Quantization Arguments
         self.a_bits = kwargs.get('a_bits', 4)
         self.a_groupsize = kwargs.get('a_groupsize', -1)
@@ -184,6 +191,10 @@ class ResQConfig:
                     f"Invalid transform key: {transform}. Valid keys: 'Ua', 'Ub', 'Uc', 'Ud'"
                 assert alg in valid_algorithms, \
                     f"Invalid algorithm for {transform}: {alg}. Valid options: {valid_algorithms}"
+
+        # Validate remove_ub configuration
+        assert isinstance(self.remove_ub, bool), \
+            f"remove_ub must be a boolean, got {type(self.remove_ub)}"
 
         if strict:
             assert self.optimized_basis_path is not None, \

@@ -148,6 +148,12 @@ def parse_args():
     parser.add_argument('--save_transforms_only', type=cmd_bool, default=None,
                         help="[DEPRECATED] Use --output_mode='transforms_only' instead")
 
+    # Remove Ub mode - use rotation only for value projection
+    parser.add_argument('--remove_ub', type=cmd_bool, default=False,
+                        help="Remove Ub (eigenvector basis) for V_proj transformation. "
+                             "When enabled, V_proj uses only Rb rotation (no basis/permutation), "
+                             "and rearrange_o_proj is skipped.")
+
     return parser.parse_args()
 
 
@@ -231,6 +237,8 @@ def main():
         print(f"Transform-only mode: Will save decomposed P/R matrices without fusion")
     elif args.output_mode == 'debug':
         print(f"Debug mode: Will save both fused weights and decomposed P/R transforms")
+    if args.remove_ub:
+        print(f"Remove Ub mode: V_proj uses Rb rotation only (no Pb basis)")
     print("=" * 60)
 
     # Set random seed
@@ -350,6 +358,7 @@ def main():
         dev_type=args.dev_type,
         dev_id=args.dev_id,
         output_mode=args.output_mode,
+        remove_ub=args.remove_ub,
     )
 
     # Determine the device for layer-by-layer processing

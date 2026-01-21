@@ -624,16 +624,18 @@ def main():
         disable_names=disable_names,
         basis_path=basis_path,  # Use computed or provided basis_path
         rotation_path=args.rotation_path,
+        eval_dict = eval_dict,
+        kurtosis_dict = kurtosis_dict
     )
 
     # Set eval_dict and kurtosis_dict if computed during basis computation
     # These are used by the calibrator's adaptive ratio computation
-    if args.compute_kurtosis and args.compute_basis and not args.basis_path:
+    if args.adaptive_ratio_mode != 'fixed' and args.compute_basis and not args.basis_path:
         if eval_dict is not None:
-            calibrator.eval_dict = eval_dict
+            # calibrator.eval_dict = eval_dict
             print(f"Set eval_dict with {len(eval_dict)} entries")
         if kurtosis_dict is not None:
-            calibrator.kurtosis_dict = kurtosis_dict
+            # calibrator.kurtosis_dict = kurtosis_dict
             print(f"Set kurtosis_dict with {len(kurtosis_dict)} entries")
 
     # Run calibration

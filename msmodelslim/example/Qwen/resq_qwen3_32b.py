@@ -425,6 +425,12 @@ def main():
     if args.transform_algorithms:
         transform_algorithms = json.loads(args.transform_algorithms)
 
+    # Auto-enable compute_kurtosis for algorithms that need it
+    needs_kurtosis = args.adaptive_ratio_mode in ['kurtosis', 'hybrid']
+    if needs_kurtosis and not args.compute_kurtosis:
+        print(f"Note: Auto-enabling kurtosis computation for {args.adaptive_ratio_mode} mode")
+        args.compute_kurtosis = True
+
     # Create ResQ configuration
     resq_config = ResQConfig(
         high_bits=args.high_bits,
@@ -503,10 +509,16 @@ def main():
                 compute_kurtosis=args.compute_kurtosis,
             )
 
-            # Handle return value based on compute_kurtosis
+            # Handle return value based on adaptive mode and compute_kurtosis
+            # - compute_kurtosis=True: returns (basis_dict, eval_dict, kurtosis_dict)
+            # - adaptive_ratio in [hessian, cev], compute_kurtosis=False: returns (basis_dict, eval_dict)
+            # - adaptive_ratio=False, compute_kurtosis=False: returns basis_dict
             if args.compute_kurtosis:
                 basis_dict, eval_dict, kurtosis_dict = basis_result
                 print(f"Kurtosis computation complete: {len(kurtosis_dict)} entries")
+            elif args.adaptive_ratio_mode in ['hessian', 'cev']:
+                basis_dict, eval_dict = basis_result
+                kurtosis_dict = None
             else:
                 basis_dict = basis_result
 

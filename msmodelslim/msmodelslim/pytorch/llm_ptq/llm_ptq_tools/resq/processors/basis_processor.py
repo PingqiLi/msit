@@ -207,7 +207,11 @@ def compute_basis(
     device: torch.device = None,
     cov_device: str = 'cpu',
     compute_kurtosis: bool = False,
-) -> Union[Dict[str, torch.Tensor], Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor], Dict[str, float]]]:
+) -> Union[
+    Dict[str, torch.Tensor],
+    Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]],
+    Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor], Dict[str, float]]
+]:
     """
     Compute all basis matrices for the model using layer-by-layer processing.
 
@@ -227,8 +231,11 @@ def compute_basis(
         compute_kurtosis: If True, compute kurtosis statistics for adaptive ratio
 
     Returns:
-        If compute_kurtosis=False: Dictionary of basis matrices (backward compatible)
-        If compute_kurtosis=True: Tuple of (basis_dict, eval_dict, kurtosis_dict)
+        - If no adaptive ratio needed: basis_dict (backward compatible)
+        - If adaptive_algorithm in ['hessian', 'cev']: (basis_dict, eval_dict)
+        - If compute_kurtosis=True (required for 'kurtosis', 'hybrid'): (basis_dict, eval_dict, kurtosis_dict)
+
+        Where:
             - basis_dict: Dictionary of eigenvector matrices
             - eval_dict: Dictionary of eigenvalue tensors
             - kurtosis_dict: Dictionary of kurtosis values per activation type
@@ -670,6 +677,10 @@ def compute_basis(
     logger.info(f"Total basis matrices: {len(basis_dict)}")
     logger.info(f"Keys: {list(basis_dict.keys())[:10]}... (showing first 10)")
 
+    # Determine return format based on config
+    adaptive_algorithm = getattr(config, 'adaptive_algorithm', None)
+    needs_eval_dict = adaptive_algorithm in ['hessian', 'cev', 'hybrid', 'kurtosis']
+
     # Compute kurtosis from accumulated statistics if enabled
     if compute_kurtosis and kurtosis_accum is not None:
         logger.info("Computing kurtosis from accumulated statistics...")
@@ -677,6 +688,11 @@ def compute_basis(
         logger.info(f"Kurtosis computed for {len(kurtosis_dict)} activation types")
         return basis_dict, eval_dict, kurtosis_dict
 
+    # Return eval_dict when hessian/cev need it (kurtosis/hybrid auto-enable compute_kurtosis)
+    if needs_eval_dict:
+        return basis_dict, eval_dict
+
+    # Backward compatible: return just basis_dict
     return basis_dict
 
 

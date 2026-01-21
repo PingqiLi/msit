@@ -78,8 +78,8 @@ class ResQCalibrator:
         # Load or compute basis and rotations
         self.basis_dict = None
         self.rotation_dict = None
-        # self.eval_dict = None  # Eigenvalues for adaptive ratio
-        # self.kurtosis_dict = None  # Kurtosis for adaptive ratio
+        self.eval_dict = eval_dict  # Eigenvalues for adaptive ratio
+        self.kurtosis_dict = kurtosis_dict  # Kurtosis for adaptive ratio
         self.ratio_dict = None  # Per-layer/per-transform ratios
         self.adaptive_ratio_result = None  # Full adaptive ratio result
 

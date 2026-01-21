@@ -55,6 +55,8 @@ class ResQCalibrator:
         disable_names: List[str] = None,
         basis_path: str = None,
         rotation_path: str = None,
+        eval_dict: dict = None,
+        kurtosis_dict: dict = None,
     ):
         """
         Initialize the ResQ calibrator.

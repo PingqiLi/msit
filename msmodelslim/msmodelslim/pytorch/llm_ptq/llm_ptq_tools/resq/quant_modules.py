@@ -74,6 +74,7 @@ class ResQWeightQuantizer(nn.Module):
         high_fraction: float = 0.125,
         split_dim: int = 1,  # 1 for input projections, 0 for output projections
         logger=None,
+        high_dim_override: int = None,
     ):
         super().__init__()
         self.high_bits = high_bits
@@ -81,6 +82,7 @@ class ResQWeightQuantizer(nn.Module):
         self.high_fraction = high_fraction
         self.split_dim = split_dim  # dimension to split: 0 for rows, 1 for columns
         self.logger = logger
+        self.high_dim_override = high_dim_override
 
         # Quantization parameters for each precision level (symmetric - no offset needed)
         self.high_weight_scale = None
@@ -126,7 +128,10 @@ class ResQWeightQuantizer(nn.Module):
             # Split along in_features (columns)
             out_features, in_features = weight.shape
             self.total_dim = in_features
-            self.high_dim = int(self.high_fraction * in_features)
+            if self.high_dim_override is not None:
+                self.high_dim = self.high_dim_override
+            else:
+                self.high_dim = int(self.high_fraction * in_features)
             self.low_dim = in_features - self.high_dim
 
             weight_low = weight[:, :self.low_dim]   # [out_features, low_dim]
@@ -136,7 +141,10 @@ class ResQWeightQuantizer(nn.Module):
             # Split along out_features (rows)
             out_features, in_features = weight.shape
             self.total_dim = out_features
-            self.high_dim = int(self.high_fraction * out_features)
+            if self.high_dim_override is not None:
+                self.high_dim = self.high_dim_override
+            else:
+                self.high_dim = int(self.high_fraction * out_features)
             self.low_dim = out_features - self.high_dim
 
             weight_low = weight[:self.low_dim, :]   # [low_dim, in_features]
@@ -312,6 +320,7 @@ class LinearResQQuantizer(nn.Module):
         low_bits: int = 4,
         high_fraction: float = 0.125,
         split_dim: int = 1,  # 1 for input projections (q,k,v,up,gate), 0 for output projections (o,down)
+        high_dim_override: int = None,
     ):
         super().__init__()
         self.cfg = cfg
@@ -320,6 +329,7 @@ class LinearResQQuantizer(nn.Module):
         self.low_bits = low_bits
         self.high_fraction = high_fraction
         self.split_dim = split_dim
+        self.high_dim_override = high_dim_override
 
         # Linear layer parameters
         self.in_features = None
@@ -334,6 +344,7 @@ class LinearResQQuantizer(nn.Module):
             high_fraction=high_fraction,
             split_dim=split_dim,
             logger=logger,
+            high_dim_override=high_dim_override,
         )
 
         self.quant_input = ResQActQuantizer(
@@ -428,7 +439,8 @@ def add_resq_quantizers(model: nn.Module, cfg=None, logger=None,
                         high_bits: int = 8, low_bits: int = 4,
                         high_fraction: float = 0.125,
                         skip_names: list = None,
-                        ratio_dict: dict = None) -> nn.Module:
+                        ratio_dict: dict = None,
+                        splits_dict: dict = None) -> nn.Module:
     """
     Replace linear layers with ResQ quantizers.
 
@@ -443,6 +455,9 @@ def add_resq_quantizers(model: nn.Module, cfg=None, logger=None,
         ratio_dict: Optional dictionary of per-layer/per-transform ratios.
                    Keys are in format: 'Ua', 'layer.{i}.Ub', 'layer.{i}.Uc', 'layer.{i}.Ud'
                    If None or key not found, uses high_fraction.
+        splits_dict: Optional dictionary of scaled dimension splits for actual weight dimensions.
+                    Keys are same format as ratio_dict, values are (low_dim, high_dim) tuples.
+                    If provided, overrides ratio-based dimension calculation for alignment.
 
     Returns:
         Model with ResQ quantizers
@@ -471,30 +486,38 @@ def add_resq_quantizers(model: nn.Module, cfg=None, logger=None,
             # ResQ rotations are applied to inputs, so we split on input dimension
             split_dim = 1
 
-            # Determine per-layer ratio based on layer type
+            # Determine per-layer ratio and high_dim_override based on layer type
             layer_fraction = high_fraction  # Default
-            if ratio_dict is not None:
-                # Parse layer index from name (e.g., "model.layers.0.self_attn.q_proj")
-                import re
-                layer_match = re.search(r'layers\.(\d+)\.', name)
-                layer_idx = int(layer_match.group(1)) if layer_match else None
+            high_dim_override = None
+            ratio_key = None
 
-                if layer_idx is not None:
-                    # Map projection type to transform type
-                    if any(proj in name for proj in ['q_proj', 'k_proj', 'v_proj', 'gate_proj', 'up_proj']):
-                        # Uses Ua ratio (shared) or fallback to default
-                        ratio_key = 'Ua'
-                    elif 'o_proj' in name:
-                        # Uses Ub ratio (per-layer)
-                        ratio_key = f'layer.{layer_idx}.Ub'
-                    elif 'down_proj' in name:
-                        # Uses Ud ratio (per-layer)
-                        ratio_key = f'layer.{layer_idx}.Ud'
-                    else:
-                        ratio_key = 'Ua'  # Default to Ua
+            # Parse layer index from name (e.g., "model.layers.0.self_attn.q_proj")
+            import re
+            layer_match = re.search(r'layers\.(\d+)\.', name)
+            layer_idx = int(layer_match.group(1)) if layer_match else None
 
-                    if ratio_key in ratio_dict:
-                        layer_fraction = ratio_dict[ratio_key]
+            if layer_idx is not None:
+                # Map projection type to transform type
+                if any(proj in name for proj in ['q_proj', 'k_proj', 'v_proj', 'gate_proj', 'up_proj']):
+                    # Uses Ua ratio (shared) or fallback to default
+                    ratio_key = 'Ua'
+                elif 'o_proj' in name:
+                    # Uses Ub ratio (per-layer)
+                    ratio_key = f'layer.{layer_idx}.Ub'
+                elif 'down_proj' in name:
+                    # Uses Ud ratio (per-layer)
+                    ratio_key = f'layer.{layer_idx}.Ud'
+                else:
+                    ratio_key = 'Ua'  # Default to Ua
+
+            # Get ratio from ratio_dict if available
+            if ratio_dict is not None and ratio_key is not None and ratio_key in ratio_dict:
+                layer_fraction = ratio_dict[ratio_key]
+
+            # Get aligned high_dim from splits_dict if available
+            if splits_dict is not None and ratio_key is not None and ratio_key in splits_dict:
+                _, high_dim = splits_dict[ratio_key]  # (low_dim, high_dim)
+                high_dim_override = high_dim
 
             quant_mod = LinearResQQuantizer(
                 cfg=cfg,
@@ -503,6 +526,7 @@ def add_resq_quantizers(model: nn.Module, cfg=None, logger=None,
                 low_bits=low_bits,
                 high_fraction=layer_fraction,
                 split_dim=split_dim,
+                high_dim_override=high_dim_override,
             )
             quant_mod.set_param(mod)
             _set_module(model, name, quant_mod)

@@ -81,6 +81,8 @@ class ResQCalibrator:
         self.eval_dict = eval_dict  # Eigenvalues for adaptive ratio
         self.kurtosis_dict = kurtosis_dict  # Kurtosis for adaptive ratio
         self.ratio_dict = None  # Per-layer/per-transform ratios
+        self.splits_dict = None  # Per-layer/per-transform dimension splits
+        self.scaled_splits_dict = None  # Scaled splits for actual weight dimensions
         self.adaptive_ratio_result = None  # Full adaptive ratio result
 
         if basis_path:
@@ -193,6 +195,7 @@ class ResQCalibrator:
             high_fraction=self.cfg.high_fraction,
             skip_names=skip_names,
             ratio_dict=self.ratio_dict,  # Per-layer/per-transform ratios (None if not adaptive)
+            splits_dict=self.scaled_splits_dict,  # Scaled splits for actual weight dimensions
         )
 
         if self._is_multi_device:
@@ -339,6 +342,10 @@ class ResQCalibrator:
 
         # Extract ratio_dict for use by other components
         self.ratio_dict = self.adaptive_ratio_result.ratios
+        self.splits_dict = self.adaptive_ratio_result.splits
+
+        # Compute scaled splits for actual weight dimensions
+        self.scaled_splits_dict = self._compute_scaled_splits(model)
 
         # Log computed ratios
         self.logger.info("Computed adaptive ratios:")
@@ -348,6 +355,56 @@ class ResQCalibrator:
             self.logger.info(f"  ... ({len(self.ratio_dict) - 10} more)")
 
         self.logger.info("=" * 60)
+
+    def _compute_scaled_splits(self, model: nn.Module) -> Dict[str, tuple]:
+        """
+        Compute scaled dimension splits for actual weight dimensions.
+
+        The adaptive ratio computation works on transform dimensions (head_dim, blocksize),
+        but the actual weights have different dimensions that need proper scaling:
+        - Ua: hidden_dim → hidden_dim (1:1, direct mapping)
+        - Ub: head_dim → num_heads × head_dim (scale by num_heads)
+        - Uc: head_dim → num_kv_heads × head_dim (scale by num_kv_heads)
+        - Ud: blocksize → intermediate_size (scale by num_blocks)
+
+        Args:
+            model: The transformer model
+
+        Returns:
+            Dictionary mapping transform keys to (low_dim, high_dim) tuples
+            for actual weight dimensions
+        """
+        if self.splits_dict is None:
+            return None
+
+        config = model.config
+        hidden_size = config.hidden_size
+        num_heads = config.num_attention_heads
+        num_kv_heads = getattr(config, 'num_key_value_heads', num_heads)
+        head_dim = getattr(config, 'head_dim', hidden_size // num_heads)
+        intermediate_size = config.intermediate_size
+        blocksize = getattr(self.cfg, 'down_proj_blocksize', 256)
+
+        scaled_splits = {}
+
+        for key, (low_dim, high_dim) in self.splits_dict.items():
+            if key == 'Ua':
+                # Direct mapping (hidden_dim → hidden_dim)
+                scaled_splits[key] = (low_dim, high_dim)
+            elif key.endswith('.Ub'):
+                # Scale by num_heads (head_dim → num_heads * head_dim)
+                # Note: o_proj input is num_attention_heads * head_dim
+                scale_factor = num_heads  # For o_proj input dimension
+                scaled_splits[key] = (low_dim * scale_factor, high_dim * scale_factor)
+            elif key.endswith('.Uc'):
+                # Uc is for key position - scales by num_kv_heads for k_proj output
+                scaled_splits[key] = (low_dim * num_kv_heads, high_dim * num_kv_heads)
+            elif key.endswith('.Ud'):
+                # Scale by num_blocks (blocksize → intermediate_size)
+                num_blocks = intermediate_size // blocksize
+                scaled_splits[key] = (low_dim * num_blocks, high_dim * num_blocks)
+
+        return scaled_splits
 
     @torch.no_grad()
     def run(self) -> None:

@@ -413,9 +413,8 @@ class ResQCalibrator:
                 # Uc is for key position - scales by num_kv_heads for k_proj output
                 scaled_splits[key] = (low_dim * num_kv_heads, high_dim * num_kv_heads)
             elif key.endswith('.Ud'):
-                # Scale by num_blocks (blocksize → intermediate_size)
-                num_blocks = intermediate_size // blocksize
-                scaled_splits[key] = (low_dim * num_blocks, high_dim * num_blocks)
+                # Ud splits are already computed at intermediate_size level, no scaling needed
+                scaled_splits[key] = (low_dim, high_dim)
 
         return scaled_splits
 

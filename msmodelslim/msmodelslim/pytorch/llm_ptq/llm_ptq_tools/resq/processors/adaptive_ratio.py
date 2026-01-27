@@ -465,12 +465,14 @@ class AdaptiveRatioComputer:
                                    model_config.num_attention_heads)
             head_dim = getattr(model_config, 'head_dim',
                               hidden_dim // model_config.num_attention_heads)
+            intermediate_size = getattr(model_config, 'intermediate_size', None)
             # Infer number of layers from eval_dict
             nlayers = sum(1 for k in eval_dict.keys() if k.startswith('layer.') and 'value' in k)
         else:
             hidden_dim = None
             num_kv_heads = None
             head_dim = None
+            intermediate_size = None
             nlayers = 0
 
         # Compute Ua ratio (shared attn_mlp basis)
@@ -533,6 +535,11 @@ class AdaptiveRatioComputer:
                 result.algorithms_used[f'layer.{i}.Ud'] = self.config.transform_algorithms.get(
                     'Ud', self.config.algorithm
                 )
+                # Compute aligned split at full intermediate_size level (NOT blocksize)
+                if intermediate_size:
+                    result.splits[f'layer.{i}.Ud'] = align_dimension_split(
+                        intermediate_size, ud_ratio, self.config.alignment
+                    )
 
         return result
 

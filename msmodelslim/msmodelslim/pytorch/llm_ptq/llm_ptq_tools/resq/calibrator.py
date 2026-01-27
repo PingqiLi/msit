@@ -340,12 +340,17 @@ class ResQCalibrator:
             model_config=model.config,
         )
 
-        # Extract ratio_dict for use by other components
+        # Extract ratio_dict and splits_dict for use by other components
         self.ratio_dict = self.adaptive_ratio_result.ratios
-        self.splits_dict = self.adaptive_ratio_result.splits
+        self.splits_dict = self.adaptive_ratio_result.splits if hasattr(self.adaptive_ratio_result, 'splits') else None
 
         # Compute scaled splits for actual weight dimensions
-        self.scaled_splits_dict = self._compute_scaled_splits(model)
+        if self.splits_dict:
+            self.scaled_splits_dict = self._compute_scaled_splits(model)
+            self.logger.info(f"Computed {len(self.scaled_splits_dict)} scaled splits for weight dimensions")
+        else:
+            self.scaled_splits_dict = None
+            self.logger.info("No splits available from adaptive ratio, using ratio-based dimensions")
 
         # Log computed ratios
         self.logger.info("Computed adaptive ratios:")
@@ -353,6 +358,14 @@ class ResQCalibrator:
             self.logger.info(f"  {key}: {ratio:.4f}")
         if len(self.ratio_dict) > 10:
             self.logger.info(f"  ... ({len(self.ratio_dict) - 10} more)")
+
+        # Log scaled splits if available
+        if self.scaled_splits_dict:
+            self.logger.info("Scaled dimension splits (low_dim, high_dim):")
+            for key, (low_dim, high_dim) in sorted(self.scaled_splits_dict.items())[:10]:
+                self.logger.info(f"  {key}: ({low_dim}, {high_dim})")
+            if len(self.scaled_splits_dict) > 10:
+                self.logger.info(f"  ... ({len(self.scaled_splits_dict) - 10} more)")
 
         self.logger.info("=" * 60)
 

@@ -1019,9 +1019,9 @@ class ResQCalibrator:
             return
 
         if safetensors_name is None:
-            safetensors_name = "quant_model_weight_resq.safetensors"
+            safetensors_name = "model.safetensors"
         if json_name is None:
-            json_name = "quant_model_description_resq.json"
+            json_name = "quant_model_description.json"
         if save_type is None:
             save_type = ["safe_tensor"]
 
@@ -1030,7 +1030,7 @@ class ResQCalibrator:
         # Collect all weights and parameters
         weight_dict = {}
         quant_description = {
-            "model_quant_type": "W4A8_ResQ",
+            "model_quant_type": "ResQ",
             "high_bits": self.cfg.high_bits,
             "low_bits": self.cfg.low_bits,
             "high_fraction": self.cfg.high_fraction,

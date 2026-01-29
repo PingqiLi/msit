@@ -646,8 +646,8 @@ def main():
     print("Saving quantized model...")
     calibrator.save(
         output_path=save_directory,
-        json_name="quant_model_description_resq.json",
-        safetensors_name="quant_model_weight_resq.safetensors",
+        json_name="quant_model_description.json",
+        safetensors_name="model.safetensors",
         save_type=["safe_tensor"],
     )
 

@@ -1256,6 +1256,9 @@ class ResQCalibrator:
             save_file(weight_dict, safetensors_path)
             self.logger.info(f"Saved weights to {safetensors_path}")
 
+            # Generate model.safetensors.index.json for the quantized model
+            self._save_index_json(output_path, safetensors_name, weight_dict)
+
         # Save JSON description
         import json
         json_path = os.path.join(output_path, json_name)
@@ -1270,6 +1273,31 @@ class ResQCalibrator:
             self.logger.info(f"Saved adaptive ratios to {adaptive_ratio_path}")
 
         self.logger.info("Save complete!")
+
+    def _save_index_json(self, output_path: str, safetensors_name: str, weight_dict: dict) -> None:
+        """Generate model.safetensors.index.json for the quantized model."""
+        import json
+
+        # Calculate total size
+        total_size = sum(
+            tensor.numel() * tensor.element_size()
+            for tensor in weight_dict.values()
+            if hasattr(tensor, 'numel')
+        )
+
+        # Build weight map - all weights point to the single safetensors file
+        weight_map = {name: safetensors_name for name in weight_dict.keys()}
+
+        # Use existing utility function
+        from msmodelslim.pytorch.llm_ptq.llm_ptq_tools.save.writer.buffered_safetensor import get_index_json
+        index_json_dict = get_index_json(weight_map, total_size)
+
+        # Save as model.safetensors.index.json
+        index_path = os.path.join(output_path, 'model.safetensors.index.json')
+        with open(index_path, 'w', encoding='utf-8') as f:
+            json.dump(index_json_dict, f, indent=2, ensure_ascii=False)
+
+        self.logger.info(f"Saved index JSON to {index_path}")
 
 
 def resq_calibrate(

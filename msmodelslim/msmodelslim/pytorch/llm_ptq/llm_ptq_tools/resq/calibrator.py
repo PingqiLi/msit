@@ -1107,6 +1107,13 @@ class ResQCalibrator:
             if isinstance(module, LinearResQQuantizer):
                 quant_weights = module.get_quant_weights()
 
+                # Get the actual high_fraction used for this layer
+                layer_high_fraction = quant_weights.get('high_fraction', self.cfg.high_fraction)
+
+                # Save high_fraction as a scalar tensor (readable from safetensor)
+                weight_dict[f"{name}.high_fraction"] = torch.tensor(layer_high_fraction, dtype=torch.float32)
+                quant_description[f"{name}.high_fraction"] = "RESQ"
+
                 # Save low precision weights and scales
                 if 'weight_low' in quant_weights:
                     weight_dict[f"{name}.weight_low"] = quant_weights['weight_low']

@@ -174,6 +174,9 @@ class ResQWeightQuantizer(nn.Module):
             weight_high_dequant = (self.high_weight.float() * self.high_weight_scale).to(weight.dtype)
             self.high_weight_dequant = weight_high_dequant
 
+        # Store actual high_fraction for later retrieval (for safetensor)
+        self.actual_high_fraction = self.high_dim / self.total_dim if self.total_dim > 0 else 0.0
+
         # Combine dequantized weights for inference
         if self.low_dim > 0 and self.high_dim > 0:
             quantized_weight = torch.cat([weight_low_dequant, weight_high_dequant], dim=cat_dim)
@@ -431,6 +434,12 @@ class LinearResQQuantizer(nn.Module):
         if self.quant_weight.high_weight is not None:
             result['weight_high'] = self.quant_weight.high_weight.cpu()
             result['scale_high'] = self.quant_weight.high_weight_scale.cpu()
+
+        # Add high_fraction to result for safetensor
+        if hasattr(self.quant_weight, 'actual_high_fraction'):
+            result['high_fraction'] = self.quant_weight.actual_high_fraction
+        else:
+            result['high_fraction'] = self.quant_weight.high_fraction
 
         return result
 

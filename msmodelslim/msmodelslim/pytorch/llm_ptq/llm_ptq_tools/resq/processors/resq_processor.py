@@ -9,6 +9,7 @@ This module provides the core quantization functionality:
 - Configuring quantizers for each layer
 """
 
+import fnmatch
 import logging
 from typing import Dict, Optional, Any, List
 
@@ -566,6 +567,7 @@ def apply_rotations(
     rotation_dict: Dict[str, torch.Tensor],
     config: Any,
     ratio_dict: Optional[Dict[str, float]] = None,
+    mix_cfg: Optional[Dict[str, str]] = None,
 ) -> None:
     """
     Apply basis and rotation matrices to model weights.
@@ -580,7 +582,22 @@ def apply_rotations(
         config: ResQ configuration
         ratio_dict: Optional dictionary of per-layer/per-transform ratios.
                    If None, uses config.high_fraction for all layers.
+        mix_cfg: Optional dictionary mapping layer names/patterns to quantization types.
+                 Used to skip Ud fusion for down_proj layers with non-resq types.
     """
+    def should_skip_ud_fusion(layer_name: str) -> bool:
+        """Check if this down_proj layer should skip Ud fusion based on mix_cfg."""
+        if not mix_cfg:
+            return False
+        # Check exact match
+        if layer_name in mix_cfg:
+            return mix_cfg[layer_name].lower() != 'resq'
+        # Check pattern matches
+        for pattern, quant_type in mix_cfg.items():
+            if fnmatch.fnmatchcase(layer_name, pattern):
+                return quant_type.lower() != 'resq'
+        return False
+
     # Check if we should skip fusion (transform-only mode)
     if getattr(config, 'should_skip_fusion', False):
         logger.info(f"output_mode='{config.output_mode}': Skipping weight fusion")
@@ -679,7 +696,14 @@ def apply_rotations(
 
         # Rotate MLP output (down_proj) based on ud_rotation_type
         pd_key = f'layer.{idx}.mlp.down_proj'
-        if pd_key in basis_dict:
+        down_proj_name = f'model.layers.{idx}.mlp.down_proj'
+
+        # Check if this down_proj should skip Ud fusion (non-resq type in mix_cfg)
+        if should_skip_ud_fusion(down_proj_name):
+            # Skip Ud fusion - only apply Ua rotation
+            logger.info(f"Skipping Ud fusion for {down_proj_name} (in mix_cfg)")
+            rotate_mlp_output(layer, R1=U_attn)
+        elif pd_key in basis_dict:
             Pd = basis_dict[pd_key].to(torch.float64)
             if ud_rotation_type == 'hadamard':
                 rotate_mlp_output_hadamard(layer, U_attn, Pd, hadK, K, blocksize)

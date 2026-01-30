@@ -163,7 +163,7 @@ class ResQCalibrator:
 
             # Apply rotations with basis
             self.logger.info("Applying rotations to model...")
-            apply_rotations(model, self.basis_dict, self.rotation_dict, self.cfg, self.ratio_dict)
+            apply_rotations(model, self.basis_dict, self.rotation_dict, self.cfg, self.ratio_dict, self.cfg.mix_cfg)
             cleanup_memory(verbos=False)
 
             # Skip column rearrangement in transform-only mode (we're not modifying weights)

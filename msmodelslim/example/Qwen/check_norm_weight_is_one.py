@@ -9,10 +9,13 @@ check_norm_weight_is_one.py
   python check_norm_weight_is_one.py /path/to/model.safetensors --only model.layers.0.input_layernorm.weight
   python check_norm_weight_is_one.py /path/to/model.safetensors --pattern "input_layernorm.weight"
   python check_norm_weight_is_one.py /path/to/model.safetensors --atol 1e-6 --rtol 1e-6
+  python check_norm_weight_is_one.py /path/to/model.safetensors --exclude-qk-norm  # 排除 q_norm/k_norm
 
 说明：
   - 会检查所有匹配到的 norm weight key 是否接近全 1
   - 默认模式：匹配包含 norm/layernorm/rmsnorm 且以 .weight 结尾的 key
+  - 对于 Qwen3 等带 QK-Norm 的模型，建议使用 --exclude-qk-norm 排除 q_norm/k_norm
+    （这些 norm 无法融合到权重中，保持原始训练值是正确的）
 """
 
 import argparse
@@ -28,6 +31,8 @@ def main():
     ap.add_argument("--atol", type=float, default=1e-5, help="绝对容差")
     ap.add_argument("--rtol", type=float, default=0.0, help="相对容差")
     ap.add_argument("--max_report", type=int, default=20, help="最多报告多少个失败 key")
+    ap.add_argument("--exclude-qk-norm", action="store_true",
+                    help="排除 q_norm 和 k_norm（Qwen3 等模型的 QK-Norm 无法融合，保持原值是正确的）")
     args = ap.parse_args()
 
     try:
@@ -41,6 +46,10 @@ def main():
     default_re = re.compile(r".*(rmsnorm|layernorm|norm).*\.weight$", re.IGNORECASE)
 
     def key_selected(k: str) -> bool:
+        # 排除 QK-Norm（q_norm/k_norm）- 这些 norm 无法融合到权重中
+        if getattr(args, 'exclude_qk_norm', False) and ('q_norm' in k or 'k_norm' in k):
+            return False
+
         if args.only is not None:
             return k == args.only
         if args.pattern is not None:

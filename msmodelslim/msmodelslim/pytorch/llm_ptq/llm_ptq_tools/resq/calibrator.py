@@ -20,7 +20,7 @@ from msmodelslim import logger as msmodelslim_logger
 from msmodelslim.pytorch.llm_ptq.llm_ptq_tools.save import SaverFactory
 
 from .config import ResQConfig
-from .quant_modules import LinearResQQuantizer, add_resq_quantizers
+from .quant_modules import LinearResQQuantizer, LinearW8A8DynamicQuantizer, add_resq_quantizers
 from .processors.basis_processor import compute_basis, generate_random_rotations, load_basis
 from .processors.resq_processor import apply_rotations, rearrange_columns
 from .processors.adaptive_ratio import (
@@ -196,6 +196,7 @@ class ResQCalibrator:
             skip_names=skip_names,
             ratio_dict=self.ratio_dict,  # Per-layer/per-transform ratios (None if not adaptive)
             splits_dict=self.scaled_splits_dict,  # Scaled splits for actual weight dimensions
+            mix_cfg=self.cfg.mix_cfg,  # Mixed quantization type per layer
         )
 
         if self._is_multi_device:
@@ -525,7 +526,11 @@ class ResQCalibrator:
             if isinstance(module, LinearResQQuantizer):
                 # Quantize weights immediately
                 module.quant_weight.quantize_weight(module.weight)
-                self.logger.info(f"Quantized layer: {name}")
+                self.logger.info(f"Quantized layer (ResQ): {name}")
+            elif isinstance(module, LinearW8A8DynamicQuantizer):
+                # Quantize weights immediately
+                module.quantize_weight()
+                self.logger.info(f"Quantized layer (W8A8_DYNAMIC): {name}")
 
     def _run_gptq_mode(self) -> None:
         """
@@ -1061,7 +1066,7 @@ class ResQCalibrator:
                 # Print all projection layers in layer 0
                 if 'layers.0' in name and any(proj in name for proj in ['q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_proj', 'up_proj', 'down_proj']):
                     quant_weights = module.get_quant_weights()
-                    self.logger.info(f"[DEBUG] {name} (split_dim={module.split_dim}):")
+                    self.logger.info(f"[DEBUG] {name} (ResQ, split_dim={module.split_dim}):")
                     self.logger.info(f"  original weight shape: [{module.out_features}, {module.in_features}]")
                     if 'weight_low' in quant_weights:
                         self.logger.info(f"  weight_low shape: {quant_weights['weight_low'].shape}")
@@ -1069,6 +1074,14 @@ class ResQCalibrator:
                     if 'weight_high' in quant_weights:
                         self.logger.info(f"  weight_high shape: {quant_weights['weight_high'].shape}")
                         self.logger.info(f"  scale_high shape: {quant_weights['scale_high'].shape}")
+            elif isinstance(module, LinearW8A8DynamicQuantizer):
+                # Print all projection layers in layer 0
+                if 'layers.0' in name and any(proj in name for proj in ['q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_proj', 'up_proj', 'down_proj']):
+                    quant_weights = module.get_quant_weights()
+                    self.logger.info(f"[DEBUG] {name} (W8A8_DYNAMIC):")
+                    self.logger.info(f"  original weight shape: [{module.out_features}, {module.in_features}]")
+                    self.logger.info(f"  weight shape: {quant_weights['weight'].shape}")
+                    self.logger.info(f"  weight_scale shape: {quant_weights['weight_scale'].shape}")
         self.logger.info("=" * 60)
 
         # Save per-layer normalization weights
@@ -1140,6 +1153,20 @@ class ResQCalibrator:
                 if module.bias is not None:
                     weight_dict[f"{name}.bias"] = module.bias.data.cpu()
                     quant_description[f"{name}.bias"] = "RESQ"
+
+            elif isinstance(module, LinearW8A8DynamicQuantizer):
+                # W8A8 dynamic quantization - save weight and weight_scale
+                quant_weights = module.get_quant_weights()
+
+                weight_dict[f"{name}.weight"] = quant_weights['weight']
+                weight_dict[f"{name}.weight_scale"] = quant_weights['weight_scale']
+                quant_description[f"{name}.weight"] = "W8A8_DYNAMIC"
+                quant_description[f"{name}.weight_scale"] = "W8A8_DYNAMIC"
+
+                # Save bias if present (as FLOAT since it's not quantized)
+                if module.bias is not None:
+                    weight_dict[f"{name}.bias"] = module.bias.data.cpu()
+                    quant_description[f"{name}.bias"] = "FLOAT"
 
             elif isinstance(module, nn.Linear):
                 # Non-quantized linear layers (e.g., lm_head)

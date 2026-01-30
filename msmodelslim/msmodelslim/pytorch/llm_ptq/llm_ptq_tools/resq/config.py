@@ -4,6 +4,12 @@
 ResQ configuration class.
 """
 
+from typing import Optional, Dict
+
+
+# Allowed quantization types for mix_cfg
+RESQ_ALLOWED_MIX_TYPES = {"resq", "w8a8_dynamic", "float"}
+
 
 class ResQConfig:
     """Configuration for ResQ quantization method."""
@@ -16,6 +22,7 @@ class ResQConfig:
         seed: int = 0,
         dev_type: str = 'npu',
         dev_id: int = 0,
+        mix_cfg: Optional[Dict[str, str]] = None,
         **kwargs
     ):
         # General Arguments
@@ -24,6 +31,10 @@ class ResQConfig:
         # Device settings
         self.dev_type = dev_type
         self.dev_id = dev_id
+
+        # Mixed-precision layer configuration
+        # Keys are layer name patterns (fnmatch), values are quant types: 'resq', 'w8a8_dynamic', 'float'
+        self.mix_cfg = mix_cfg or {}
 
         # Paths for pre-computed rotations and basis
         self.optimized_rotation_path = kwargs.get('optimized_rotation_path', None)
@@ -200,6 +211,12 @@ class ResQConfig:
         # Validate remove_ub configuration
         assert isinstance(self.remove_ub, bool), \
             f"remove_ub must be a boolean, got {type(self.remove_ub)}"
+
+        # Validate mix_cfg configuration
+        if self.mix_cfg:
+            for pattern, quant_type in self.mix_cfg.items():
+                assert quant_type.lower() in RESQ_ALLOWED_MIX_TYPES, \
+                    f"mix_cfg type '{quant_type}' not in allowed types: {RESQ_ALLOWED_MIX_TYPES}"
 
         if strict:
             assert self.optimized_basis_path is not None, \

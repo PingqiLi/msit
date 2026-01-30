@@ -206,6 +206,10 @@ def parse_args():
                         help="Path to pre-computed adaptive ratios JSON")
     parser.add_argument('--compute_kurtosis', type=cmd_bool, default=False,
                         help="Compute kurtosis during basis computation (enables kurtosis algorithm)")
+    parser.add_argument('--mix_cfg', type=str, default=None,
+                        help="JSON dict mapping layer name patterns to quant types: "
+                             "'resq', 'w8a8_dynamic', or 'float'. "
+                             "Example: '{\"*.mlp.down_proj\": \"w8a8_dynamic\"}'")
 
     return parser.parse_args()
 
@@ -297,6 +301,8 @@ def main():
             print(f"  Pre-computed ratios: {args.adaptive_ratio_path}")
     else:
         print(f"  High fraction: {args.high_fraction} (fixed)")
+    if args.mix_cfg:
+        print(f"  Mix config: {args.mix_cfg}")
     print(f"  Device: {args.dev_type}:{args.dev_id}")
     print("")
     if args.basis_path:
@@ -425,6 +431,11 @@ def main():
     if args.transform_algorithms:
         transform_algorithms = json.loads(args.transform_algorithms)
 
+    # Parse mix_cfg JSON if provided
+    mix_cfg = {}
+    if args.mix_cfg:
+        mix_cfg = json.loads(args.mix_cfg)
+
     # Auto-enable compute_kurtosis for algorithms that need it
     needs_kurtosis = args.adaptive_ratio_mode in ['kurtosis', 'hybrid']
     if needs_kurtosis and not args.compute_kurtosis:
@@ -453,6 +464,7 @@ def main():
         ub_head_aggregation=args.ub_head_aggregation,
         adaptive_ratio_path=args.adaptive_ratio_path,
         compute_kurtosis=args.compute_kurtosis,
+        mix_cfg=mix_cfg,
     )
 
     # Determine the device for layer-by-layer processing

@@ -444,12 +444,76 @@ class LinearResQQuantizer(nn.Module):
         return result
 
 
+class LinearW8A8DynamicQuantizer(nn.Module):
+    """
+    W8A8 dynamic quantizer for use in ResQ context (after rotation fusion).
+
+    - Per-channel symmetric weight quantization (int8)
+    - Per-token dynamic activation quantization at runtime
+    """
+
+    def __init__(self, cfg=None, logger=None):
+        super().__init__()
+        self.cfg = cfg
+        self.logger = logger
+        self.weight_scale = None
+        self.weight_quant = None  # int8
+        self.has_init_quant_para = False
+
+        # Linear layer parameters
+        self.in_features = None
+        self.out_features = None
+        self.weight = None
+        self.bias = None
+
+    def set_param(self, linear: nn.Linear) -> None:
+        """Set parameters from a linear layer."""
+        self.in_features = linear.in_features
+        self.out_features = linear.out_features
+        self.weight = nn.Parameter(linear.weight.data.clone())
+        if linear.bias is not None:
+            self.bias = nn.Parameter(linear.bias.data.clone())
+        else:
+            self.bias = None
+
+    def quantize_weight(self) -> None:
+        """Quantize weight to int8 with per-channel symmetric quantization."""
+        n = 127  # int8 symmetric range
+        abs_max = self.weight.abs().max(dim=1, keepdim=True)[0]
+        scale = abs_max / n
+        scale = torch.clamp(scale, min=1e-8)
+
+        quant_float = torch.round(self.weight / scale)
+        quant_float = torch.clamp(quant_float, -128, 127)
+
+        self.weight_scale = scale.squeeze(-1)
+        self.weight_quant = quant_float.to(torch.int8)
+        self.has_init_quant_para = True
+
+    def get_quant_weights(self) -> dict:
+        """Return quantized weights in w8a8_dynamic format."""
+        if not self.has_init_quant_para:
+            self.quantize_weight()
+        return {
+            'weight': self.weight_quant.cpu(),
+            'weight_scale': self.weight_scale.cpu(),
+        }
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass with weight dequantization."""
+        if not self.has_init_quant_para:
+            self.quantize_weight()
+        weight_dequant = self.weight_quant.float() * self.weight_scale.unsqueeze(1)
+        return F.linear(x, weight_dequant.to(x.dtype), self.bias)
+
+
 def add_resq_quantizers(model: nn.Module, cfg=None, logger=None,
                         high_bits: int = 8, low_bits: int = 4,
                         high_fraction: float = 0.125,
                         skip_names: list = None,
                         ratio_dict: dict = None,
-                        splits_dict: dict = None) -> nn.Module:
+                        splits_dict: dict = None,
+                        mix_cfg: dict = None) -> nn.Module:
     """
     Replace linear layers with ResQ quantizers.
 
@@ -467,11 +531,29 @@ def add_resq_quantizers(model: nn.Module, cfg=None, logger=None,
         splits_dict: Optional dictionary of scaled dimension splits for actual weight dimensions.
                     Keys are same format as ratio_dict, values are (low_dim, high_dim) tuples.
                     If provided, overrides ratio-based dimension calculation for alignment.
+        mix_cfg: Optional dictionary mapping layer name patterns to quant types.
+                Keys are fnmatch patterns, values are 'resq', 'w8a8_dynamic', or 'float'.
 
     Returns:
         Model with ResQ quantizers
     """
+    import fnmatch
+
     skip_names = skip_names or []
+    mix_cfg = mix_cfg or {}
+
+    def get_layer_quant_type(name: str) -> str:
+        """Determine quant type from mix_cfg patterns."""
+        if not mix_cfg:
+            return 'resq'
+        # Check exact match first
+        if name in mix_cfg:
+            return mix_cfg[name].lower()
+        # Check pattern matches
+        for pattern, quant_type in mix_cfg.items():
+            if fnmatch.fnmatchcase(name, pattern):
+                return quant_type.lower()
+        return 'resq'  # default
 
     # All projections split along in_features (dim=1, the last dimension)
     # This is because ResQ rotations are applied to the INPUT of each linear layer
@@ -491,53 +573,67 @@ def add_resq_quantizers(model: nn.Module, cfg=None, logger=None,
         if name in skip_names:
             continue
         if isinstance(mod, nn.Linear):
-            # All projections split along in_features (dim=1, the last dimension)
-            # ResQ rotations are applied to inputs, so we split on input dimension
-            split_dim = 1
+            # Determine quantization type from mix_cfg
+            quant_type = get_layer_quant_type(name)
 
-            # Determine per-layer ratio and high_dim_override based on layer type
-            layer_fraction = high_fraction  # Default
-            high_dim_override = None
-            ratio_key = None
+            if quant_type == 'float':
+                # No quantization - keep original Linear layer
+                continue
 
-            # Parse layer index from name (e.g., "model.layers.0.self_attn.q_proj")
-            import re
-            layer_match = re.search(r'layers\.(\d+)\.', name)
-            layer_idx = int(layer_match.group(1)) if layer_match else None
+            elif quant_type == 'w8a8_dynamic':
+                # W8A8 dynamic quantization
+                quant_mod = LinearW8A8DynamicQuantizer(cfg=cfg, logger=logger)
+                quant_mod.set_param(mod)
+                _set_module(model, name, quant_mod)
 
-            if layer_idx is not None:
-                # Map projection type to transform type
-                if any(proj in name for proj in ['q_proj', 'k_proj', 'v_proj', 'gate_proj', 'up_proj']):
-                    # Uses Ua ratio (shared) or fallback to default
-                    ratio_key = 'Ua'
-                elif 'o_proj' in name:
-                    # Uses Ub ratio (per-layer)
-                    ratio_key = f'layer.{layer_idx}.Ub'
-                elif 'down_proj' in name:
-                    # Uses Ud ratio (per-layer)
-                    ratio_key = f'layer.{layer_idx}.Ud'
-                else:
-                    ratio_key = 'Ua'  # Default to Ua
+            else:  # 'resq' - default ResQ mixed-precision quantization
+                # All projections split along in_features (dim=1, the last dimension)
+                # ResQ rotations are applied to inputs, so we split on input dimension
+                split_dim = 1
 
-            # Get ratio from ratio_dict if available
-            if ratio_dict is not None and ratio_key is not None and ratio_key in ratio_dict:
-                layer_fraction = ratio_dict[ratio_key]
+                # Determine per-layer ratio and high_dim_override based on layer type
+                layer_fraction = high_fraction  # Default
+                high_dim_override = None
+                ratio_key = None
 
-            # Get aligned high_dim from splits_dict if available
-            if splits_dict is not None and ratio_key is not None and ratio_key in splits_dict:
-                _, high_dim = splits_dict[ratio_key]  # (low_dim, high_dim)
-                high_dim_override = high_dim
+                # Parse layer index from name (e.g., "model.layers.0.self_attn.q_proj")
+                import re
+                layer_match = re.search(r'layers\.(\d+)\.', name)
+                layer_idx = int(layer_match.group(1)) if layer_match else None
 
-            quant_mod = LinearResQQuantizer(
-                cfg=cfg,
-                logger=logger,
-                high_bits=high_bits,
-                low_bits=low_bits,
-                high_fraction=layer_fraction,
-                split_dim=split_dim,
-                high_dim_override=high_dim_override,
-            )
-            quant_mod.set_param(mod)
-            _set_module(model, name, quant_mod)
+                if layer_idx is not None:
+                    # Map projection type to transform type
+                    if any(proj in name for proj in ['q_proj', 'k_proj', 'v_proj', 'gate_proj', 'up_proj']):
+                        # Uses Ua ratio (shared) or fallback to default
+                        ratio_key = 'Ua'
+                    elif 'o_proj' in name:
+                        # Uses Ub ratio (per-layer)
+                        ratio_key = f'layer.{layer_idx}.Ub'
+                    elif 'down_proj' in name:
+                        # Uses Ud ratio (per-layer)
+                        ratio_key = f'layer.{layer_idx}.Ud'
+                    else:
+                        ratio_key = 'Ua'  # Default to Ua
+
+                # Get ratio from ratio_dict if available
+                if ratio_dict is not None and ratio_key is not None and ratio_key in ratio_dict:
+                    layer_fraction = ratio_dict[ratio_key]
+
+                # Get aligned high_dim from splits_dict if available
+                if splits_dict is not None and ratio_key is not None and ratio_key in splits_dict:
+                    _, high_dim = splits_dict[ratio_key]  # (low_dim, high_dim)
+                    high_dim_override = high_dim
+
+                quant_mod = LinearResQQuantizer(
+                    cfg=cfg,
+                    logger=logger,
+                    high_bits=high_bits,
+                    low_bits=low_bits,
+                    high_fraction=layer_fraction,
+                    split_dim=split_dim,
+                    high_dim_override=high_dim_override,
+                )
+                quant_mod.set_param(mod)
+                _set_module(model, name, quant_mod)
 
     return model

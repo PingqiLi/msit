@@ -31,9 +31,10 @@ def main():
     args = ap.parse_args()
 
     try:
-        from safetensors.numpy import safe_open
+        from safetensors.torch import safe_open
+        import torch
     except Exception as e:
-        print("ERROR: 需要安装 safetensors：pip install safetensors", file=sys.stderr)
+        print("ERROR: 需要安装 safetensors 和 torch：pip install safetensors torch", file=sys.stderr)
         raise e
 
     # 默认筛选规则：常见 norm weight 命名
@@ -53,7 +54,7 @@ def main():
     selected = []
     failed = []
 
-    with safe_open(args.safetensors_path, framework="np") as f:
+    with safe_open(args.safetensors_path, framework="pt") as f:
         keys = list(f.keys())
 
         for k in keys:
@@ -61,10 +62,11 @@ def main():
                 continue
 
             selected.append(k)
-            t = f.get_tensor(k)  # numpy array
+            t = f.get_tensor(k)  # torch tensor
+            original_dtype = t.dtype
 
-            # 统一转 float 做比较（int/uint 也能转）
-            tf = t.astype(np.float32, copy=False)
+            # 统一转 float32 做比较（bfloat16/float16 等都能转）
+            tf = t.float().numpy()
             ones = np.ones_like(tf, dtype=np.float32)
 
             ok = np.allclose(tf, ones, rtol=args.rtol, atol=args.atol)
@@ -75,7 +77,7 @@ def main():
                 mean_err = float(abs_err.mean()) if abs_err.size else 0.0
                 # 取一些样本值
                 sample = tf.reshape(-1)[:8].tolist() if tf.size else []
-                failed.append((k, t.dtype, t.shape, max_err, mean_err, sample))
+                failed.append((k, original_dtype, t.shape, max_err, mean_err, sample))
 
     if not selected:
         print("WARN: 未匹配到任何 norm.weight key。你可以用 --pattern 指定匹配规则，或用 --only 指定具体 key。")

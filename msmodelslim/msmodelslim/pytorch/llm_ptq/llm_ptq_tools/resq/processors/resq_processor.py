@@ -33,6 +33,46 @@ from ..components.weight_quantizer import (
 logger = logging.getLogger(__name__)
 
 
+def get_rotation_device(weight_tensor: torch.Tensor, use_npu: bool = True) -> torch.device:
+    """
+    Determine device for rotation operations.
+
+    When use_npu is True, keeps operations on the weight's original device (NPU).
+    When False, moves to CPU for compatibility.
+
+    Args:
+        weight_tensor: The weight tensor to get device from
+        use_npu: Whether to use NPU for rotation operations
+
+    Returns:
+        Device to use for rotation operations
+    """
+    if not use_npu:
+        return torch.device("cpu")
+    return weight_tensor.device
+
+
+def batch_inverse_with_fallback(matrices: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """
+    Compute batch matrix inverse with CPU fallback if NPU doesn't support it.
+
+    Some NPU implementations may not support torch.linalg.inv. This function
+    attempts the operation on the target device and falls back to CPU if needed.
+
+    Args:
+        matrices: Batch of matrices to invert [batch, n, n]
+        device: Target device for computation
+
+    Returns:
+        Inverted matrices on the target device
+    """
+    try:
+        return torch.linalg.inv(matrices.to(device))
+    except RuntimeError:
+        # Fallback to CPU if NPU doesn't support inverse
+        return torch.linalg.inv(matrices.cpu()).to(device)
+
+
 def rotate_embeddings(model: nn.Module, R1: torch.Tensor) -> None:
     """
     Rotate the embedding weights.
@@ -43,8 +83,10 @@ def rotate_embeddings(model: nn.Module, R1: torch.Tensor) -> None:
     """
     for W in [model.model.embed_tokens]:
         dtype = W.weight.data.dtype
-        W_ = W.weight.data.cpu().to(torch.float64)
-        W.weight.data = torch.matmul(W_, R1.cpu()).to(dtype=dtype)
+        dev = W.weight.device
+        W_ = W.weight.data.to(torch.float64)  # Keep on original device
+        R1_dev = R1.to(device=dev, dtype=torch.float64)
+        W.weight.data = torch.matmul(W_, R1_dev).to(dtype=dtype)
 
 
 def rotate_attention_inputs(layer: nn.Module, R1: torch.Tensor) -> None:
@@ -57,8 +99,10 @@ def rotate_attention_inputs(layer: nn.Module, R1: torch.Tensor) -> None:
     """
     for W in [layer.self_attn.q_proj, layer.self_attn.k_proj, layer.self_attn.v_proj]:
         dtype = W.weight.dtype
-        W_ = W.weight.cpu().to(torch.float64)
-        W.weight.data = torch.matmul(W_, R1.cpu()).to(dtype=dtype)
+        dev = W.weight.device
+        W_ = W.weight.to(torch.float64)  # Keep on original device
+        R1_dev = R1.to(device=dev, dtype=torch.float64)
+        W.weight.data = torch.matmul(W_, R1_dev).to(dtype=dtype)
 
 
 def rotate_attention_output(layer: nn.Module, R1: torch.Tensor) -> None:
@@ -71,12 +115,14 @@ def rotate_attention_output(layer: nn.Module, R1: torch.Tensor) -> None:
     """
     W = layer.self_attn.o_proj
     dtype = W.weight.data.dtype
-    W_ = W.weight.data.cpu().to(torch.float64)
-    W.weight.data = torch.matmul(R1.T.cpu(), W_).to(dtype=dtype)
+    dev = W.weight.device
+    W_ = W.weight.data.to(torch.float64)  # Keep on original device
+    R1_T_dev = R1.T.to(device=dev, dtype=torch.float64)
+    W.weight.data = torch.matmul(R1_T_dev, W_).to(dtype=dtype)
 
     if W.bias is not None:
-        b = W.bias.data.cpu().to(torch.float64)
-        W.bias.data = torch.matmul(R1.T.cpu(), b).to(dtype=dtype)
+        b = W.bias.data.to(torch.float64)
+        W.bias.data = torch.matmul(R1_T_dev, b).to(dtype=dtype)
 
 
 def rotate_mlp_input(layer: nn.Module, R1: torch.Tensor) -> None:
@@ -90,8 +136,10 @@ def rotate_mlp_input(layer: nn.Module, R1: torch.Tensor) -> None:
     mlp_inputs = [layer.mlp.up_proj, layer.mlp.gate_proj]
     for W in mlp_inputs:
         dtype = W.weight.dtype
-        W_ = W.weight.data.cpu().to(torch.float64)
-        W.weight.data = torch.matmul(W_, R1.cpu()).to(dtype=dtype)
+        dev = W.weight.device
+        W_ = W.weight.data.to(torch.float64)  # Keep on original device
+        R1_dev = R1.to(device=dev, dtype=torch.float64)
+        W.weight.data = torch.matmul(W_, R1_dev).to(dtype=dtype)
 
 
 def rotate_mlp_output(
@@ -110,13 +158,15 @@ def rotate_mlp_output(
     """
     W = layer.mlp.down_proj
     dtype = W.weight.data.dtype
-    W_ = W.weight.data.cpu().to(torch.float64)
+    dev = W.weight.device
+    W_ = W.weight.data.to(torch.float64)  # Keep on original device
+    R1_T_dev = R1.T.to(device=dev, dtype=torch.float64)
 
-    W.weight.data = torch.matmul(R1.T.cpu(), W_).to(dtype=dtype)
+    W.weight.data = torch.matmul(R1_T_dev, W_).to(dtype=dtype)
 
     if W.bias is not None:
-        b = W.bias.data.cpu().to(torch.float64)
-        W.bias.data = torch.matmul(R1.T.cpu(), b).to(dtype=dtype)
+        b = W.bias.data.to(torch.float64)
+        W.bias.data = torch.matmul(R1_T_dev, b).to(dtype=dtype)
 
 
 def rotate_mlp_output_hadamard(
@@ -143,30 +193,33 @@ def rotate_mlp_output_hadamard(
     W = layer.mlp.down_proj
     dtype = W.weight.data.dtype
     dev = W.weight.device
-    W_ = W.weight.data.cpu().to(torch.float64)
+
+    # Step 1: Apply Ua to output dimension on NPU: W1 = Ua.T @ Wd
+    # This is the large 5120x5120 @ 5120x27392 matmul - keep on device
+    W_ = W.weight.data.to(torch.float64)  # Keep on original device
+    Ua_T_dev = Ua.T.to(device=dev, dtype=torch.float64)
+    W_ = torch.matmul(Ua_T_dev, W_)
 
     intermediate_size = W_.shape[1]
     num_blocks = intermediate_size // blocksize
 
-    # Step 1: Apply Ua to output dimension: W1 = Ua.T @ Wd
-    W_ = torch.matmul(Ua.T.cpu().to(torch.float64), W_)
-
-    # Step 2: Apply block_diag(Pd) to input dimension
+    # Step 2: Apply block_diag(Pd) to input dimension (on device)
     # Reshape to [hidden_dim, num_blocks, blocksize]
     W_ = W_.view(W_.shape[0], num_blocks, blocksize)
     # Apply Pd to each block (broadcast across all blocks)
-    W_ = torch.matmul(W_, Pd.cpu().to(torch.float64))
+    Pd_dev = Pd.to(device=dev, dtype=torch.float64)
+    W_ = torch.matmul(W_, Pd_dev)
     # Reshape back to [hidden_dim, intermediate_size]
     W_ = W_.view(W_.shape[0], intermediate_size)
 
-    # Step 3: Apply H using fast Hadamard (W_ @ H)
-    W_ = matmul_hadU_cpu(W_, hadK, K)
+    # Step 3: Apply H using fast Hadamard (W_ @ H) - requires CPU
+    W_ = matmul_hadU_cpu(W_.cpu(), hadK, K)
 
     W.weight.data = W_.to(dtype=dtype).to(device=dev)
 
     if W.bias is not None:
-        b = W.bias.data.cpu().to(torch.float64)
-        W.bias.data = torch.matmul(Ua.T.cpu().to(torch.float64), b).to(dtype=dtype)
+        b = W.bias.data.to(torch.float64)  # Keep on device
+        W.bias.data = torch.matmul(Ua_T_dev, b).to(dtype=dtype)
 
 
 def rotate_mlp_output_random(
@@ -191,30 +244,34 @@ def rotate_mlp_output_random(
     W = layer.mlp.down_proj
     dtype = W.weight.data.dtype
     dev = W.weight.device
-    W_ = W.weight.data.cpu().to(torch.float64)
+
+    # Step 1: Apply Ua to output dimension on NPU: W1 = Ua.T @ Wd
+    # This is the large 5120x5120 @ 5120x27392 matmul - keep on device
+    W_ = W.weight.data.to(torch.float64)  # Keep on original device
+    Ua_T_dev = Ua.T.to(device=dev, dtype=torch.float64)
+    W_ = torch.matmul(Ua_T_dev, W_)
 
     intermediate_size = W_.shape[1]
     num_blocks = intermediate_size // blocksize
 
-    # Step 1: Apply Ua to output dimension: W1 = Ua.T @ Wd
-    W_ = torch.matmul(Ua.T.cpu().to(torch.float64), W_)
-
-    # Step 2: Apply block_diag(Pd) to input dimension
+    # Step 2: Apply block_diag(Pd) to input dimension (on device)
     # Reshape to [hidden_dim, num_blocks, blocksize]
     W_ = W_.view(W_.shape[0], num_blocks, blocksize)
     # Apply Pd to each block (broadcast across all blocks)
-    W_ = torch.matmul(W_, Pd.cpu().to(torch.float64))
+    Pd_dev = Pd.to(device=dev, dtype=torch.float64)
+    W_ = torch.matmul(W_, Pd_dev)
     # Reshape back to [hidden_dim, intermediate_size]
     W_ = W_.view(W_.shape[0], intermediate_size)
 
-    # Step 3: Apply Rd (W_ @ Rd)
-    W_ = torch.matmul(W_, Rd.cpu().to(torch.float64))
+    # Step 3: Apply Rd (W_ @ Rd) - keep on device
+    Rd_dev = Rd.to(device=dev, dtype=torch.float64)
+    W_ = torch.matmul(W_, Rd_dev)
 
-    W.weight.data = W_.to(dtype=dtype).to(device=dev)
+    W.weight.data = W_.to(dtype=dtype)
 
     if W.bias is not None:
-        b = W.bias.data.cpu().to(torch.float64)
-        W.bias.data = torch.matmul(Ua.T.cpu().to(torch.float64), b).to(dtype=dtype)
+        b = W.bias.data.to(torch.float64)  # Keep on device
+        W.bias.data = torch.matmul(Ua_T_dev, b).to(dtype=dtype)
 
 
 def rotate_head(model: nn.Module, R1: torch.Tensor) -> None:
@@ -227,8 +284,10 @@ def rotate_head(model: nn.Module, R1: torch.Tensor) -> None:
     """
     W = model.lm_head
     dtype = W.weight.data.dtype
-    W_ = W.weight.data.cpu().to(torch.float64)
-    W.weight.data = torch.matmul(W_, R1.cpu()).to(dtype=dtype)
+    dev = W.weight.device
+    W_ = W.weight.data.to(torch.float64)  # Keep on original device
+    R1_dev = R1.to(device=dev, dtype=torch.float64)
+    W.weight.data = torch.matmul(W_, R1_dev).to(dtype=dtype)
 
 
 def rotate_ov_proj(
@@ -260,41 +319,48 @@ def rotate_ov_proj(
     o_proj_in_dim = o_proj.weight.shape[1]
     num_attention_heads = o_proj_in_dim // head_dim
 
-    # v_proj: apply Ub to output dimension
+    # v_proj: apply Ub to output dimension (batched)
     # v_proj weight shape: [num_kv_heads * head_dim, hidden_dim]
     # y_new = y @ Ub, so W_new = Ub.T @ W
-    W_v = v_proj.weight.data.cpu().to(torch.float64)
+    W_v = v_proj.weight.data.to(torch.float64)  # Keep on device
     W_v = W_v.view(num_kv_heads, head_dim, -1)
-    for hd in range(num_kv_heads):
-        W_v[hd] = torch.matmul(Ub[hd].T.cpu().to(torch.float64), W_v[hd])
-    v_proj.weight.data = W_v.view(-1, W_v.shape[-1]).to(dtype=dtype, device=dev)
+    # Batched matmul: Ub.T @ W_v for each head
+    Ub_T = Ub.transpose(-2, -1).to(device=dev, dtype=torch.float64)
+    W_v = torch.bmm(Ub_T, W_v)  # [num_kv_heads, head_dim, hidden_dim]
+    v_proj.weight.data = W_v.view(-1, W_v.shape[-1]).to(dtype=dtype)
 
     if v_proj.bias is not None:
-        b_v = v_proj.bias.data.cpu().to(torch.float64)
-        b_v = b_v.view(num_kv_heads, head_dim)
-        for hd in range(num_kv_heads):
-            b_v[hd] = torch.matmul(Ub[hd].T.cpu().to(torch.float64), b_v[hd])
-        v_proj.bias.data = b_v.view(-1).to(dtype=dtype, device=dev)
+        b_v = v_proj.bias.data.to(torch.float64)
+        b_v = b_v.view(num_kv_heads, head_dim, 1)
+        b_v = torch.bmm(Ub_T, b_v)  # [num_kv_heads, head_dim, 1]
+        v_proj.bias.data = b_v.view(-1).to(dtype=dtype)
 
-    # o_proj: absorb Ub^(-1) into input dimension
+    # o_proj: absorb Ub^(-1) into input dimension (batched)
     # o_proj weight shape: [hidden_dim, num_attention_heads * head_dim]
     # x_new = x @ Ub, so we need W_new = W @ Ub^(-1).T
-    W_o = o_proj.weight.data.cpu().to(torch.float64)
+    W_o = o_proj.weight.data.to(torch.float64)  # Keep on device
     W_o = W_o.view(W_o.shape[0], num_attention_heads, head_dim)
 
-    # For GQA: replicate Ub inverse for Q heads sharing the same KV head
+    # Pre-compute all inverses at once using batch inverse with fallback
+    Ub_inv = batch_inverse_with_fallback(Ub.to(torch.float64), dev)
+    Ub_inv_T = Ub_inv.transpose(-2, -1)  # [num_kv_heads, head_dim, head_dim]
+
+    # For GQA: expand Ub_inv_T to match num_attention_heads
     if num_attention_heads > num_kv_heads:
         num_q_per_kv = num_attention_heads // num_kv_heads
-        for hd in range(num_attention_heads):
-            kv_hd = hd // num_q_per_kv
-            Ub_inv_T = torch.linalg.inv(Ub[kv_hd]).T.cpu().to(torch.float64)
-            W_o[:, hd, :] = torch.matmul(W_o[:, hd, :], Ub_inv_T)
+        Ub_inv_T_expanded = Ub_inv_T.repeat_interleave(num_q_per_kv, dim=0)
     else:
-        for hd in range(num_attention_heads):
-            Ub_inv_T = torch.linalg.inv(Ub[hd]).T.cpu().to(torch.float64)
-            W_o[:, hd, :] = torch.matmul(W_o[:, hd, :], Ub_inv_T)
+        Ub_inv_T_expanded = Ub_inv_T
 
-    o_proj.weight.data = W_o.view(W_o.shape[0], -1).to(dtype=dtype, device=dev)
+    # Batched matmul: W_o @ Ub_inv_T for each head
+    # W_o is [hidden_dim, num_attention_heads, head_dim]
+    # Ub_inv_T_expanded is [num_attention_heads, head_dim, head_dim]
+    # Need to permute W_o for bmm: [num_attention_heads, hidden_dim, head_dim]
+    W_o = W_o.permute(1, 0, 2)
+    W_o = torch.bmm(W_o, Ub_inv_T_expanded)
+    W_o = W_o.permute(1, 0, 2)  # Back to [hidden_dim, num_attention_heads, head_dim]
+
+    o_proj.weight.data = W_o.reshape(W_o.shape[0], -1).to(dtype=dtype)
 
 
 def rotate_ov_proj_rotation_only(
@@ -329,36 +395,41 @@ def rotate_ov_proj_rotation_only(
     o_proj_in_dim = o_proj.weight.shape[1]
     num_attention_heads = o_proj_in_dim // head_dim
 
-    # v_proj: apply Rb to output dimension
+    # v_proj: apply Rb to output dimension (batched)
     # v_proj weight shape: [num_kv_heads * head_dim, hidden_dim]
     # y_new = y @ Rb, so W_new = Rb.T @ W
-    W_v = v_proj.weight.data.cpu().to(torch.float64)
+    W_v = v_proj.weight.data.to(torch.float64)  # Keep on device
     W_v = W_v.view(num_kv_heads, head_dim, -1)
-    Rb_cpu = Rb.cpu().to(torch.float64)
-    for hd in range(num_kv_heads):
-        W_v[hd] = torch.matmul(Rb_cpu.T, W_v[hd])
-    v_proj.weight.data = W_v.view(-1, W_v.shape[-1]).to(dtype=dtype, device=dev)
+    # Rb is shared across all heads - expand for batched matmul
+    Rb_T = Rb.T.to(device=dev, dtype=torch.float64)
+    Rb_T_expanded = Rb_T.unsqueeze(0).expand(num_kv_heads, -1, -1)
+    W_v = torch.bmm(Rb_T_expanded, W_v)  # [num_kv_heads, head_dim, hidden_dim]
+    v_proj.weight.data = W_v.view(-1, W_v.shape[-1]).to(dtype=dtype)
 
     if v_proj.bias is not None:
-        b_v = v_proj.bias.data.cpu().to(torch.float64)
-        b_v = b_v.view(num_kv_heads, head_dim)
-        for hd in range(num_kv_heads):
-            b_v[hd] = torch.matmul(Rb_cpu.T, b_v[hd])
-        v_proj.bias.data = b_v.view(-1).to(dtype=dtype, device=dev)
+        b_v = v_proj.bias.data.to(torch.float64)
+        b_v = b_v.view(num_kv_heads, head_dim, 1)
+        b_v = torch.bmm(Rb_T_expanded, b_v)  # [num_kv_heads, head_dim, 1]
+        v_proj.bias.data = b_v.view(-1).to(dtype=dtype)
 
-    # o_proj: absorb Rb^(-1) into input dimension
+    # o_proj: absorb Rb^(-1) into input dimension (batched)
     # o_proj weight shape: [hidden_dim, num_attention_heads * head_dim]
     # x_new = x @ Rb, so we need W_new = W @ Rb^(-1).T
-    W_o = o_proj.weight.data.cpu().to(torch.float64)
+    W_o = o_proj.weight.data.to(torch.float64)  # Keep on device
     W_o = W_o.view(W_o.shape[0], num_attention_heads, head_dim)
 
     # Rb is orthogonal, so Rb^(-1) = Rb.T, and Rb^(-1).T = Rb
-    Rb_inv_T = Rb_cpu  # Rb^(-1).T = (Rb.T).T = Rb
+    Rb_inv_T = Rb.to(device=dev, dtype=torch.float64)  # Rb^(-1).T = (Rb.T).T = Rb
+    Rb_inv_T_expanded = Rb_inv_T.unsqueeze(0).expand(num_attention_heads, -1, -1)
 
-    for hd in range(num_attention_heads):
-        W_o[:, hd, :] = torch.matmul(W_o[:, hd, :], Rb_inv_T)
+    # Batched matmul: W_o @ Rb_inv_T for each head
+    # W_o is [hidden_dim, num_attention_heads, head_dim]
+    # Need to permute W_o for bmm: [num_attention_heads, hidden_dim, head_dim]
+    W_o = W_o.permute(1, 0, 2)
+    W_o = torch.bmm(W_o, Rb_inv_T_expanded)
+    W_o = W_o.permute(1, 0, 2)  # Back to [hidden_dim, num_attention_heads, head_dim]
 
-    o_proj.weight.data = W_o.view(W_o.shape[0], -1).to(dtype=dtype, device=dev)
+    o_proj.weight.data = W_o.reshape(W_o.shape[0], -1).to(dtype=dtype)
 
 
 def rearrange_o_proj(

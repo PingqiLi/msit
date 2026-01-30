@@ -57,6 +57,11 @@ class ResQConfig:
         # - rearrange_o_proj() is skipped (no column reordering)
         self.remove_ub = kwargs.get('remove_ub', False)
 
+        # NPU optimization for rotation operations
+        # When enabled (default), rotation matmul operations are performed on NPU
+        # instead of CPU, providing significant speedup for large models
+        self.use_npu_rotation = kwargs.get('use_npu_rotation', True)
+
         # Activation Quantization Arguments
         self.a_bits = kwargs.get('a_bits', 4)
         self.a_groupsize = kwargs.get('a_groupsize', -1)

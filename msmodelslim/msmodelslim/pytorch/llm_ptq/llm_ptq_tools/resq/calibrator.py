@@ -239,6 +239,16 @@ class ResQCalibrator:
                 model = dispatch_model(model, device_map=device_map)
                 self.logger.info("Model redistributed successfully")
 
+                # Ensure model.norm is on a real device (not meta)
+                if hasattr(model, 'model') and hasattr(model.model, 'norm'):
+                    norm_module = model.model.norm
+                    if hasattr(norm_module, 'weight') and norm_module.weight is not None:
+                        if norm_module.weight.device.type == 'meta':
+                            # Move norm to the same device as embed_tokens
+                            target_device = model.model.embed_tokens.weight.device
+                            model.model.norm = model.model.norm.to(target_device)
+                            self.logger.info(f"Moved model.norm from meta to {target_device}")
+
                 # Set input device
                 if hasattr(model, 'model') and hasattr(model.model, 'embed_tokens'):
                     self._input_device = model.model.embed_tokens.weight.device
@@ -1054,9 +1064,12 @@ class ResQCalibrator:
         if hasattr(self.model, 'model') and hasattr(self.model.model, 'norm'):
             norm_module = self.model.model.norm
             if hasattr(norm_module, 'weight') and norm_module.weight is not None:
-                weight_dict['model.norm.weight'] = norm_module.weight.data.cpu()
-                quant_description['model.norm.weight'] = "FLOAT"
-                self.logger.info(f"Saved model.norm.weight: {norm_module.weight.shape}")
+                if norm_module.weight.device.type == 'meta':
+                    self.logger.warning("Skipping model.norm.weight: meta tensor (no data)")
+                else:
+                    weight_dict['model.norm.weight'] = norm_module.weight.data.cpu()
+                    quant_description['model.norm.weight'] = "FLOAT"
+                    self.logger.info(f"Saved model.norm.weight: {norm_module.weight.shape}")
 
         # Debug: Print shapes of attention and MLP weights
         self.logger.info("=" * 60)

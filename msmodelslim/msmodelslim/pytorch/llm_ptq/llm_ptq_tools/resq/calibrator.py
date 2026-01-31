@@ -260,9 +260,19 @@ class ResQCalibrator:
 
             except Exception as e:
                 self.logger.warning(f"Failed to redistribute model with accelerate: {e}")
-                self.logger.warning("Falling back to single device mode")
-                self._is_multi_device = False
-                # Fall through to single-device handling
+                # Keep multi-device mode but use original device map
+                # Don't try to move entire model to single device (causes OOM for large models)
+                self.logger.warning("Keeping original multi-device distribution (redistribution failed)")
+
+                # Set input device from embed_tokens
+                if hasattr(model, 'model') and hasattr(model.model, 'embed_tokens'):
+                    self._input_device = model.model.embed_tokens.weight.device
+                    self.logger.info(f"Using embed_tokens device as input device: {self._input_device}")
+                else:
+                    # Use first device from original device map
+                    first_device = list(self._original_device_map.values())[0]
+                    self._input_device = torch.device(first_device) if isinstance(first_device, str) else first_device
+                    self.logger.info(f"Using first device from original map as input: {self._input_device}")
 
         if not self._is_multi_device:
             # For single-device models, remove accelerate hooks and move to target device

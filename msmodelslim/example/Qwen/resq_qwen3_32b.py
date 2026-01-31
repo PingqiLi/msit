@@ -301,8 +301,7 @@ def main():
             print(f"  Pre-computed ratios: {args.adaptive_ratio_path}")
     else:
         print(f"  High fraction: {args.high_fraction} (fixed)")
-    if args.mix_cfg:
-        print(f"  Mix config: {args.mix_cfg}")
+
     print(f"  Device: {args.dev_type}:{args.dev_id}")
     print("")
     if args.basis_path:
@@ -432,10 +431,15 @@ def main():
         transform_algorithms = json.loads(args.transform_algorithms)
 
     # Parse mix_cfg JSON if provided
-    mix_cfg = {}
+    mix_cfg = {
+            #    "*.self_attn.o_proj": "w8a8_dynamic", 
+               "*.mlp.down_proj": "w8a8_dynamic"}
     if args.mix_cfg:
         mix_cfg = json.loads(args.mix_cfg)
 
+    if mix_cfg:
+        print(f"  Mix config: {mix_cfg}")
+    
     # Auto-enable compute_kurtosis for algorithms that need it
     needs_kurtosis = args.adaptive_ratio_mode in ['kurtosis', 'hybrid']
     if needs_kurtosis and not args.compute_kurtosis:
@@ -569,24 +573,11 @@ def main():
         # After basis computation, reload model with device_map="auto" for calibration
         print("Reloading model for calibration...")
         del model
-        del basis_dataloader  # Also delete the dataloader
         gc.collect()
-
-        # Clear ALL NPU devices (device_map="auto" will probe all of them)
         try:
-            device_count = torch.npu.device_count()
-            print(f"Clearing NPU cache on {device_count} devices...")
-            for i in range(device_count):
-                torch.npu.synchronize(i)
-            for i in range(device_count):
-                with torch.npu.device(i):
-                    torch.npu.empty_cache()
-            torch.npu.reset_peak_memory_stats()
-        except Exception as e:
-            print(f"NPU cleanup warning: {e}")
-
-        # Extra GC pass after cache clear
-        gc.collect()
+            torch_npu.npu.empty_cache()
+        except Exception:
+            pass
 
         model = safe_generator.get_model_from_pretrained(
             model_path=model_path,

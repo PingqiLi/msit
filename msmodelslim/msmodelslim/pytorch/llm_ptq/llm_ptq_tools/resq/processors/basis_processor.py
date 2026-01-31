@@ -876,14 +876,14 @@ def generate_random_rotations(
             rotation_dict['Rd'] = Rd
             logger.info(f"Generated random orthogonal rotation for Ud: intermediate_dim={intermediate_dim}")
 
-        # Also keep block-diagonal Rd for backward compatibility (if needed elsewhere)
-        # These are no longer used for Ud but may be referenced elsewhere
-        high_inter_dim = int(high_fraction * intermediate_dim)
-        mid_inter_dim = intermediate_dim - high_inter_dim
-        Rd_1 = random_orthogonal_matrix(mid_inter_dim)
-        Rd_2 = random_orthogonal_matrix(high_inter_dim)
-        rotation_dict['Rd_1'] = Rd_1
-        rotation_dict['Rd_2'] = Rd_2
+        # NOTE: Rd_1/Rd_2 block-diagonal rotations are no longer used.
+        # Keeping commented out for reference.
+        # high_inter_dim = int(high_fraction * intermediate_dim)
+        # mid_inter_dim = intermediate_dim - high_inter_dim
+        # Rd_1 = random_orthogonal_matrix(mid_inter_dim)
+        # Rd_2 = random_orthogonal_matrix(high_inter_dim)
+        # rotation_dict['Rd_1'] = Rd_1
+        # rotation_dict['Rd_2'] = Rd_2
 
     return rotation_dict
 

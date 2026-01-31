@@ -569,11 +569,24 @@ def main():
         # After basis computation, reload model with device_map="auto" for calibration
         print("Reloading model for calibration...")
         del model
+        del basis_dataloader  # Also delete the dataloader
         gc.collect()
+
+        # Clear ALL NPU devices (device_map="auto" will probe all of them)
         try:
-            torch_npu.npu.empty_cache()
-        except Exception:
-            pass
+            device_count = torch.npu.device_count()
+            print(f"Clearing NPU cache on {device_count} devices...")
+            for i in range(device_count):
+                torch.npu.synchronize(i)
+            for i in range(device_count):
+                with torch.npu.device(i):
+                    torch.npu.empty_cache()
+            torch.npu.reset_peak_memory_stats()
+        except Exception as e:
+            print(f"NPU cleanup warning: {e}")
+
+        # Extra GC pass after cache clear
+        gc.collect()
 
         model = safe_generator.get_model_from_pretrained(
             model_path=model_path,

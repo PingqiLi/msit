@@ -85,6 +85,13 @@ class ResQCalibrator:
         self.scaled_splits_dict = None  # Scaled splits for actual weight dimensions
         self.adaptive_ratio_result = None  # Full adaptive ratio result
 
+        # Try to get model path from config for loading weights from safetensors
+        # (needed when meta tensors are encountered during multi-device distribution)
+        if hasattr(model.config, '_name_or_path'):
+            self._model_path = model.config._name_or_path
+        else:
+            self._model_path = None
+
         if basis_path:
             self.logger.info(f"Loading basis from {basis_path}")
             self.basis_dict = load_basis(basis_path)
@@ -96,6 +103,75 @@ class ResQCalibrator:
         # Apply transformations and quantization
         self.model = self._prepare_model(model)
         self.logger.info("ResQ Calibrator initialized successfully!")
+
+    def _load_weight_from_safetensors(self, param_name: str) -> Optional[torch.Tensor]:
+        """Load a weight tensor from original safetensors files.
+
+        Used to materialize meta tensors that were offloaded during multi-device distribution.
+
+        Args:
+            param_name: The full parameter name (e.g., 'model.layers.62.input_layernorm.weight')
+
+        Returns:
+            The loaded tensor on CPU, or None if not found
+        """
+        if self._model_path is None:
+            return None
+
+        import glob
+        from safetensors.torch import load_file
+
+        weight_files = sorted(glob.glob(os.path.join(self._model_path, "*.safetensors")))
+        for wf in weight_files:
+            try:
+                state_dict = load_file(wf, device='cpu')
+                if param_name in state_dict:
+                    tensor = state_dict[param_name].clone()
+                    del state_dict
+                    return tensor
+                del state_dict
+            except Exception as e:
+                self.logger.warning(f"Error loading from {wf}: {e}")
+                continue
+        return None
+
+    def _get_weight_safe(self, module, name: str) -> Optional[torch.Tensor]:
+        """Get weight tensor, loading from safetensors if it's a meta tensor.
+
+        Args:
+            module: The module containing the weight
+            name: The full module name (e.g., 'model.layers.62.input_layernorm')
+
+        Returns:
+            The weight tensor on CPU, or None if unavailable
+        """
+        if not hasattr(module, 'weight') or module.weight is None:
+            return None
+        if module.weight.device.type == 'meta':
+            loaded = self._load_weight_from_safetensors(f"{name}.weight")
+            if loaded is None:
+                self.logger.warning(f"Skipping {name}.weight: meta tensor (no data available)")
+            return loaded
+        return module.weight.data.cpu()
+
+    def _get_bias_safe(self, module, name: str) -> Optional[torch.Tensor]:
+        """Get bias tensor, loading from safetensors if it's a meta tensor.
+
+        Args:
+            module: The module containing the bias
+            name: The full module name (e.g., 'model.layers.62.input_layernorm')
+
+        Returns:
+            The bias tensor on CPU, or None if unavailable
+        """
+        if not hasattr(module, 'bias') or module.bias is None:
+            return None
+        if module.bias.device.type == 'meta':
+            loaded = self._load_weight_from_safetensors(f"{name}.bias")
+            if loaded is None:
+                self.logger.warning(f"Skipping {name}.bias: meta tensor (no data available)")
+            return loaded
+        return module.bias.data.cpu()
 
     def _prepare_model(self, model: nn.Module) -> nn.Module:
         """Prepare model for ResQ quantization."""
@@ -1111,39 +1187,39 @@ class ResQCalibrator:
         for name, module in self.model.named_modules():
             # Save input_layernorm weights
             if 'input_layernorm' in name and hasattr(module, 'weight'):
-                if module.weight is not None:
-                    weight_dict[f"{name}.weight"] = module.weight.data.cpu()
+                weight = self._get_weight_safe(module, name)
+                if weight is not None:
+                    weight_dict[f"{name}.weight"] = weight
                     quant_description[f"{name}.weight"] = "FLOAT"
-                if hasattr(module, 'bias') and module.bias is not None:
-                    weight_dict[f"{name}.bias"] = module.bias.data.cpu()
+                bias = self._get_bias_safe(module, name)
+                if bias is not None:
+                    weight_dict[f"{name}.bias"] = bias
                     quant_description[f"{name}.bias"] = "FLOAT"
 
             # Save post_attention_layernorm weights
             if 'post_attention_layernorm' in name and hasattr(module, 'weight'):
-                if module.weight is not None:
-                    weight_dict[f"{name}.weight"] = module.weight.data.cpu()
+                weight = self._get_weight_safe(module, name)
+                if weight is not None:
+                    weight_dict[f"{name}.weight"] = weight
                     quant_description[f"{name}.weight"] = "FLOAT"
-                if hasattr(module, 'bias') and module.bias is not None:
-                    weight_dict[f"{name}.bias"] = module.bias.data.cpu()
+                bias = self._get_bias_safe(module, name)
+                if bias is not None:
+                    weight_dict[f"{name}.bias"] = bias
                     quant_description[f"{name}.bias"] = "FLOAT"
 
             # Save self_attn.q_norm weights (Qwen3 specific)
             if 'q_norm' in name and hasattr(module, 'weight'):
-                if module.weight is not None:
-                    if module.weight.device.type == 'meta':
-                        self.logger.warning(f"Skipping {name}.weight: meta tensor (no data)")
-                    else:
-                        weight_dict[f"{name}.weight"] = module.weight.data.cpu()
-                        quant_description[f"{name}.weight"] = "FLOAT"
+                weight = self._get_weight_safe(module, name)
+                if weight is not None:
+                    weight_dict[f"{name}.weight"] = weight
+                    quant_description[f"{name}.weight"] = "FLOAT"
 
             # Save self_attn.k_norm weights (Qwen3 specific)
             if 'k_norm' in name and hasattr(module, 'weight'):
-                if module.weight is not None:
-                    if module.weight.device.type == 'meta':
-                        self.logger.warning(f"Skipping {name}.weight: meta tensor (no data)")
-                    else:
-                        weight_dict[f"{name}.weight"] = module.weight.data.cpu()
-                        quant_description[f"{name}.weight"] = "FLOAT"
+                weight = self._get_weight_safe(module, name)
+                if weight is not None:
+                    weight_dict[f"{name}.weight"] = weight
+                    quant_description[f"{name}.weight"] = "FLOAT"
 
         for name, module in self.model.named_modules():
             if isinstance(module, LinearResQQuantizer):
@@ -1179,8 +1255,9 @@ class ResQCalibrator:
                         quant_description[f"{name}.offset_high"] = "RESQ"
 
                 # Save bias if present
-                if module.bias is not None:
-                    weight_dict[f"{name}.bias"] = module.bias.data.cpu()
+                bias = self._get_bias_safe(module, name)
+                if bias is not None:
+                    weight_dict[f"{name}.bias"] = bias
                     quant_description[f"{name}.bias"] = "RESQ"
 
             elif isinstance(module, LinearW8A8DynamicQuantizer):
@@ -1193,16 +1270,20 @@ class ResQCalibrator:
                 quant_description[f"{name}.weight_scale"] = "W8A8_DYNAMIC"
 
                 # Save bias if present (as FLOAT since it's not quantized)
-                if module.bias is not None:
-                    weight_dict[f"{name}.bias"] = module.bias.data.cpu()
+                bias = self._get_bias_safe(module, name)
+                if bias is not None:
+                    weight_dict[f"{name}.bias"] = bias
                     quant_description[f"{name}.bias"] = "FLOAT"
 
             elif isinstance(module, nn.Linear):
                 # Non-quantized linear layers (e.g., lm_head)
-                weight_dict[f"{name}.weight"] = module.weight.data.cpu()
-                quant_description[f"{name}.weight"] = "FLOAT"
-                if module.bias is not None:
-                    weight_dict[f"{name}.bias"] = module.bias.data.cpu()
+                weight = self._get_weight_safe(module, name)
+                if weight is not None:
+                    weight_dict[f"{name}.weight"] = weight
+                    quant_description[f"{name}.weight"] = "FLOAT"
+                bias = self._get_bias_safe(module, name)
+                if bias is not None:
+                    weight_dict[f"{name}.bias"] = bias
                     quant_description[f"{name}.bias"] = "FLOAT"
 
         # Save online rotation matrices following original ResQ

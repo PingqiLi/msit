@@ -1130,12 +1130,14 @@ class ResQCalibrator:
             # Save self_attn.q_norm weights (Qwen3 specific)
             if 'q_norm' in name and hasattr(module, 'weight'):
                 if module.weight is not None:
+                    print(f"DEBUG q_norm: {name}.weight, device={module.weight.device}")
                     weight_dict[f"{name}.weight"] = module.weight.data.cpu()
                     quant_description[f"{name}.weight"] = "FLOAT"
 
             # Save self_attn.k_norm weights (Qwen3 specific)
             if 'k_norm' in name and hasattr(module, 'weight'):
                 if module.weight is not None:
+                    print(f"DEBUG k_norm: {name}.weight, device={module.weight.device}")
                     weight_dict[f"{name}.weight"] = module.weight.data.cpu()
                     quant_description[f"{name}.weight"] = "FLOAT"
 

@@ -249,6 +249,51 @@ def pre_check_files(path):
         _ = get_valid_read_path(os.path.join(path, file), extensions=['.json', '.py'])
 
 
+def fix_meta_norm_params(model, model_path, model_device):
+    """Fix Qwen3 q_norm/k_norm meta tensors left by device_map='auto'."""
+    meta_norm_params = []
+    for name, param in model.named_parameters():
+        if param.device.type == 'meta' and ('norm' in name.lower()):
+            meta_norm_params.append(name)
+
+    if not meta_norm_params:
+        return
+
+    print(f"Found {len(meta_norm_params)} meta norm parameters, loading from pretrained...")
+    from safetensors.torch import load_file
+    import glob as glob_module
+
+    weight_files = sorted(glob_module.glob(os.path.join(model_path, "*.safetensors")))
+    loaded_count = 0
+
+    for wf in weight_files:
+        if not meta_norm_params:
+            break
+        state_dict = load_file(wf, device='cpu')
+        for name in list(meta_norm_params):
+            if name in state_dict:
+                parts = name.split('.')
+                module = model
+                for part in parts[:-1]:
+                    module = getattr(module, part)
+                param_name = parts[-1]
+
+                new_param = torch.nn.Parameter(
+                    state_dict[name].to(model_device),
+                    requires_grad=False
+                )
+                setattr(module, param_name, new_param)
+                meta_norm_params.remove(name)
+                loaded_count += 1
+                print(f"  Loaded {name}: {new_param.shape}")
+        del state_dict
+
+    if meta_norm_params:
+        print(f"WARNING: Could not load {len(meta_norm_params)} params: {meta_norm_params}")
+    else:
+        print(f"Successfully loaded {loaded_count} meta norm parameters")
+
+
 def main():
     args = parse_args()
     set_logger_level("info")
@@ -399,6 +444,9 @@ def main():
             else:
                 model_device = next(model.parameters()).device
         print(f"Detected model device for calibration data: {model_device}")
+
+        # Fix meta norm parameters for Qwen3
+        fix_meta_norm_params(model, model_path, model_device)
 
     # Load calibration data
     print("Loading calibration data...")
@@ -608,49 +656,8 @@ def main():
                     model_device = torch.device('cpu')
         print(f"Detected model device for calibration data (after reload): {model_device}")
 
-        # Fix Qwen3 q_norm/k_norm meta tensors left by device_map="auto"
-        # These are not processed by fuse_layer_norms and may remain as meta
-        meta_norm_params = []
-        for name, param in model.named_parameters():
-            if param.device.type == 'meta' and ('norm' in name.lower()):
-                meta_norm_params.append(name)
-
-        if meta_norm_params:
-            print(f"Found {len(meta_norm_params)} meta norm parameters, loading from pretrained...")
-            from safetensors.torch import load_file
-            import glob as glob_module
-
-            weight_files = sorted(glob_module.glob(os.path.join(model_path, "*.safetensors")))
-            loaded_count = 0
-
-            for wf in weight_files:
-                if not meta_norm_params:
-                    break
-                state_dict = load_file(wf, device='cpu')
-                for name in list(meta_norm_params):
-                    if name in state_dict:
-                        # Navigate to the module containing this parameter
-                        parts = name.split('.')
-                        module = model
-                        for part in parts[:-1]:
-                            module = getattr(module, part)
-                        param_name = parts[-1]
-
-                        # Replace with loaded weights
-                        new_param = torch.nn.Parameter(
-                            state_dict[name].to(model_device),
-                            requires_grad=False
-                        )
-                        setattr(module, param_name, new_param)
-                        meta_norm_params.remove(name)
-                        loaded_count += 1
-                        print(f"  Loaded {name}: {new_param.shape}")
-                del state_dict
-
-            if meta_norm_params:
-                print(f"WARNING: Could not load {len(meta_norm_params)} params: {meta_norm_params}")
-            else:
-                print(f"Successfully loaded {loaded_count} meta norm parameters")
+        # Fix meta norm parameters for Qwen3
+        fix_meta_norm_params(model, model_path, model_device)
 
         dataset_calib = get_calib_dataset_batch(
             tokenizer, calib_prompt, args.batch_size, args.seq_len, model_device

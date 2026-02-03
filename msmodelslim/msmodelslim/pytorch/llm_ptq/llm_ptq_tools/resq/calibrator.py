@@ -1261,13 +1261,15 @@ class ResQCalibrator:
                     quant_description[f"{name}.bias"] = "RESQ"
 
             elif isinstance(module, LinearW8A8DynamicQuantizer):
-                # W8A8 dynamic quantization - save weight and weight_scale
+                # W8A8 dynamic quantization - save weight, weight_scale, and weight_offset
                 quant_weights = module.get_quant_weights()
 
                 weight_dict[f"{name}.weight"] = quant_weights['weight']
                 weight_dict[f"{name}.weight_scale"] = quant_weights['weight_scale']
+                weight_dict[f"{name}.weight_offset"] = quant_weights['weight_offset']
                 quant_description[f"{name}.weight"] = "W8A8_DYNAMIC"
                 quant_description[f"{name}.weight_scale"] = "W8A8_DYNAMIC"
+                quant_description[f"{name}.weight_offset"] = "W8A8_DYNAMIC"
 
                 # Save bias if present (as FLOAT since it's not quantized)
                 bias = self._get_bias_safe(module, name)
@@ -1346,15 +1348,9 @@ class ResQCalibrator:
                         weight_dict['resq.Hd'] = hadK.float().cpu().contiguous()
                         quant_description['resq.Hd'] = "FLOAT"
                         self.logger.info(f"    Saved resq.Hd [{hadK.shape[0]}x{hadK.shape[1]}]")
-                    weight_dict['resq.Hd_K'] = torch.tensor(K, dtype=torch.int64)
-                    quant_description['resq.Hd_K'] = "INT"
-                    self.logger.info(f"    Saved resq.Hd_K = {K}")
-
-                    # Save intermediate_size and blocksize for inference
-                    weight_dict['resq.intermediate_size'] = torch.tensor(intermediate_size, dtype=torch.int64)
-                    weight_dict['resq.down_proj_blocksize'] = torch.tensor(blocksize, dtype=torch.int64)
-                    quant_description['resq.intermediate_size'] = "INT"
-                    quant_description['resq.down_proj_blocksize'] = "INT"
+                    # Note: Hd_K, intermediate_size, and down_proj_blocksize are NOT saved to safetensors
+                    # These metadata values should be stored in JSON config, not in the weight file
+                    self.logger.info(f"    Hd_K = {K} (not saved to safetensors, use config)")
 
                 else:  # 'random' mode
                     # Random mode: compute and save full Ud = block_diag(Pd) @ Rd per layer

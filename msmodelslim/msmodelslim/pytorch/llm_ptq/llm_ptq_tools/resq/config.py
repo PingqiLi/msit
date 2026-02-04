@@ -8,7 +8,7 @@ from typing import Optional, Dict
 
 
 # Allowed quantization types for mix_cfg
-RESQ_ALLOWED_MIX_TYPES = {"resq", "w8a8_dynamic", "float"}
+RESQ_ALLOWED_MIX_TYPES = {"resq", "w8a8_dynamic", "float", "int4_hadamard"}
 
 
 class ResQConfig:
@@ -60,6 +60,12 @@ class ResQConfig:
         self.adaptive_ratio_path = kwargs.get('adaptive_ratio_path', None)
         # Compute kurtosis during basis computation (requires extra memory)
         self.compute_kurtosis = kwargs.get('compute_kurtosis', False)
+
+        # Down projection ratio threshold for adaptive quantization type selection
+        # When adaptive_ratio is enabled, down_proj layers with ratio < threshold use int4_hadamard,
+        # and those with ratio >= threshold use w8a8_dynamic.
+        # Default: midpoint of (adaptive_min_ratio + adaptive_max_ratio) / 2
+        self.down_proj_ratio_threshold = kwargs.get('down_proj_ratio_threshold', None)
 
         # Remove Ub (basis) mode - use rotation only for value projection
         # When enabled:

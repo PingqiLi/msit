@@ -206,9 +206,13 @@ def parse_args():
                         help="Path to pre-computed adaptive ratios JSON")
     parser.add_argument('--compute_kurtosis', type=cmd_bool, default=False,
                         help="Compute kurtosis during basis computation (enables kurtosis algorithm)")
+    parser.add_argument('--down_proj_ratio_threshold', type=float, default=None,
+                        help="Ratio threshold for down_proj quant type selection. "
+                             "Layers with ratio < threshold use int4_hadamard, >= threshold use w8a8_dynamic. "
+                             "Default: midpoint of (adaptive_min_ratio + adaptive_max_ratio) / 2")
     parser.add_argument('--mix_cfg', type=str, default=None,
                         help="JSON dict mapping layer name patterns to quant types: "
-                             "'resq', 'w8a8_dynamic', or 'float'. "
+                             "'resq', 'w8a8_dynamic', 'int4_hadamard', or 'float'. "
                              "Example: '{\"*.mlp.down_proj\": \"w8a8_dynamic\"}'")
 
     return parser.parse_args()
@@ -344,8 +348,16 @@ def main():
             print(f"  Kurtosis computation: enabled")
         if args.adaptive_ratio_path:
             print(f"  Pre-computed ratios: {args.adaptive_ratio_path}")
+        # Show down_proj ratio threshold
+        threshold = args.down_proj_ratio_threshold
+        if threshold is None:
+            threshold = (args.adaptive_min_ratio + args.adaptive_max_ratio) / 2
+            print(f"  Down proj ratio threshold: {threshold:.4f} (default)")
+        else:
+            print(f"  Down proj ratio threshold: {threshold:.4f}")
     else:
         print(f"  High fraction: {args.high_fraction} (fixed)")
+        print(f"  Down proj: all layers use w8a8_dynamic (fixed mode)")
 
     print(f"  Device: {args.dev_type}:{args.dev_id}")
     print("")
@@ -516,6 +528,7 @@ def main():
         ub_head_aggregation=args.ub_head_aggregation,
         adaptive_ratio_path=args.adaptive_ratio_path,
         compute_kurtosis=args.compute_kurtosis,
+        down_proj_ratio_threshold=args.down_proj_ratio_threshold,
         mix_cfg=mix_cfg,
     )
 

@@ -211,6 +211,9 @@ class ResQCalibrator:
             if self.cfg.adaptive_ratio:
                 self._compute_adaptive_ratios(model)
 
+            # Compute down_proj quantization types based on adaptive ratios (or fixed mode)
+            self._compute_down_proj_quant_types(model)
+
             # Generate rotations if not provided
             if self.rotation_dict is None:
                 self.logger.info("Generating random rotations...")
@@ -514,6 +517,63 @@ class ResQCalibrator:
                 scaled_splits[key] = (low_dim, high_dim)
 
         return scaled_splits
+
+    def _compute_down_proj_quant_types(self, model: nn.Module) -> None:
+        """
+        Compute and set quantization types for down_proj layers based on adaptive ratios.
+
+        For fixed mode (adaptive_ratio=False):
+            All down_proj layers use w8a8_dynamic quantization.
+
+        For adaptive modes (adaptive_ratio=True):
+            Based on per-layer Ud ratio value:
+            - ratio < threshold: int4_hadamard (pure int4 with Hadamard transform fused into weights)
+            - ratio >= threshold: w8a8_dynamic quantization
+
+        The threshold is determined by down_proj_ratio_threshold config, or defaults to
+        the midpoint of (adaptive_min_ratio + adaptive_max_ratio) / 2.
+
+        Args:
+            model: The transformer model
+        """
+        num_layers = model.config.num_hidden_layers
+
+        # Determine threshold
+        threshold = self.cfg.down_proj_ratio_threshold
+        if threshold is None:
+            threshold = (self.cfg.adaptive_min_ratio + self.cfg.adaptive_max_ratio) / 2
+            self.logger.info(f"Using default down_proj ratio threshold: {threshold:.4f}")
+        else:
+            self.logger.info(f"Using configured down_proj ratio threshold: {threshold:.4f}")
+
+        if not self.cfg.adaptive_ratio:
+            # Fixed mode: all down_proj use w8a8_dynamic
+            self.logger.info("Fixed ratio mode: Setting all down_proj to w8a8_dynamic")
+            for i in range(num_layers):
+                layer_key = f'model.layers.{i}.mlp.down_proj'
+                self.cfg.mix_cfg[layer_key] = 'w8a8_dynamic'
+            self.logger.info(f"Set {num_layers} down_proj layers to w8a8_dynamic")
+        else:
+            # Adaptive mode: use ratio threshold to decide between int4_hadamard and w8a8_dynamic
+            int4_count = 0
+            w8a8_count = 0
+
+            for i in range(num_layers):
+                # Get the Ud ratio for this layer
+                ud_key = f'layer.{i}.Ud'
+                ratio = self.ratio_dict.get(ud_key, self.cfg.high_fraction) if self.ratio_dict else self.cfg.high_fraction
+
+                layer_key = f'model.layers.{i}.mlp.down_proj'
+                if ratio < threshold:
+                    self.cfg.mix_cfg[layer_key] = 'int4_hadamard'
+                    int4_count += 1
+                else:
+                    self.cfg.mix_cfg[layer_key] = 'w8a8_dynamic'
+                    w8a8_count += 1
+
+            self.logger.info(f"Adaptive down_proj quant types (threshold={threshold:.4f}):")
+            self.logger.info(f"  int4_hadamard: {int4_count} layers")
+            self.logger.info(f"  w8a8_dynamic: {w8a8_count} layers")
 
     @torch.no_grad()
     def run(self) -> None:

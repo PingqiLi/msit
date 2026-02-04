@@ -591,6 +591,24 @@ def add_resq_quantizers(model: nn.Module, cfg=None, logger=None,
                 quant_mod.set_param(mod)
                 _set_module(model, name, quant_mod)
 
+            elif quant_type == 'int4_hadamard':
+                # Pure int4 with Hadamard transform (fused into weights)
+                # Use existing LinearResQQuantizer with high_fraction=0 (pure int4, no 8-bit portion)
+                # The Hadamard transform is fused into weights by rotate_mlp_output_hadamard_only
+                split_dim = 1  # Split along in_features for down_proj
+
+                quant_mod = LinearResQQuantizer(
+                    cfg=cfg,
+                    logger=logger,
+                    high_bits=high_bits,
+                    low_bits=low_bits,
+                    high_fraction=0.0,  # Pure int4, no 8-bit portion
+                    split_dim=split_dim,
+                    high_dim_override=0,  # Explicitly set high_dim to 0
+                )
+                quant_mod.set_param(mod)
+                _set_module(model, name, quant_mod)
+
             else:  # 'resq' - default ResQ mixed-precision quantization
                 # All projections split along in_features (dim=1, the last dimension)
                 # ResQ rotations are applied to inputs, so we split on input dimension

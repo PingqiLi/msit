@@ -170,6 +170,46 @@ def rotate_mlp_output(
         W.bias.data = torch.matmul(R1_T_dev, b).to(dtype=dtype)
 
 
+def rotate_mlp_output_hadamard_only(
+    layer: nn.Module,
+    Ua: torch.Tensor,
+    hadK: Optional[torch.Tensor],
+    K: int,
+) -> None:
+    """
+    Rotate the MLP output (down_proj) weights with Hadamard transform only (skip Pd basis).
+
+    Computes: Wd_merged = Ua.T @ Wd @ Hd
+
+    This is used for int4_hadamard quantization where we skip the Pd eigenvector basis
+    and only apply the Hadamard transform to the input dimension.
+
+    Args:
+        layer: Decoder layer
+        Ua: Rotation matrix for hidden dimension (output rotation)
+        hadK: Hadamard block matrix from get_hadK() (may be None for power-of-2)
+        K: Block size for Hadamard factorization
+    """
+    W = layer.mlp.down_proj
+    dtype = W.weight.data.dtype
+    dev = W.weight.device
+
+    # Step 1: Apply Ua to output dimension: W1 = Ua.T @ Wd
+    W_ = W.weight.data.to(torch.float32)
+    Ua_T_dev = Ua.T.to(device=dev, dtype=torch.float32)
+    W_ = torch.matmul(Ua_T_dev, W_)
+
+    # Step 2: Apply Hd using fast Hadamard (W_ @ Hd) - requires CPU
+    # Note: We skip block_diag(Pd) compared to rotate_mlp_output_hadamard
+    W_ = matmul_hadU_cpu(W_.cpu(), hadK, K)
+
+    W.weight.data = W_.to(dtype=dtype).to(device=dev)
+
+    if W.bias is not None:
+        b = W.bias.data.to(torch.float32)
+        W.bias.data = torch.matmul(Ua_T_dev, b).to(dtype=dtype)
+
+
 def rotate_mlp_output_hadamard(
     layer: nn.Module,
     Ua: torch.Tensor,
@@ -598,6 +638,19 @@ def apply_rotations(
                 return quant_type.lower() != 'resq'
         return False
 
+    def get_down_proj_quant_type(layer_name: str) -> str:
+        """Get the quantization type for a down_proj layer from mix_cfg."""
+        if not mix_cfg:
+            return 'resq'
+        # Check exact match
+        if layer_name in mix_cfg:
+            return mix_cfg[layer_name].lower()
+        # Check pattern matches
+        for pattern, quant_type in mix_cfg.items():
+            if fnmatch.fnmatchcase(layer_name, pattern):
+                return quant_type.lower()
+        return 'resq'  # default
+
     # Check if we should skip fusion (transform-only mode)
     if getattr(config, 'should_skip_fusion', False):
         logger.info(f"output_mode='{config.output_mode}': Skipping weight fusion")
@@ -694,16 +747,23 @@ def apply_rotations(
         # Rotate MLP input
         rotate_mlp_input(layer, U_attn)
 
-        # Rotate MLP output (down_proj) based on ud_rotation_type
+        # Rotate MLP output (down_proj) based on quant type and ud_rotation_type
         pd_key = f'layer.{idx}.mlp.down_proj'
         down_proj_name = f'model.layers.{idx}.mlp.down_proj'
 
-        # Check if this down_proj should skip Ud fusion (non-resq type in mix_cfg)
-        if should_skip_ud_fusion(down_proj_name):
-            # Skip Ud fusion - only apply Ua rotation
-            logger.info(f"Skipping Ud fusion for {down_proj_name} (in mix_cfg)")
+        # Get the quantization type for this down_proj layer
+        quant_type = get_down_proj_quant_type(down_proj_name)
+
+        if quant_type == 'int4_hadamard':
+            # int4_hadamard: Apply Ua.T @ W @ Hd (skip Pd basis, fuse Hd into weights)
+            logger.info(f"Applying Hadamard-only rotation for {down_proj_name} (int4_hadamard)")
+            rotate_mlp_output_hadamard_only(layer, U_attn, hadK, K)
+        elif quant_type in ('w8a8_dynamic', 'float'):
+            # w8a8_dynamic or float: Only apply Ua rotation (no Ud fusion)
+            logger.info(f"Skipping Ud fusion for {down_proj_name} ({quant_type})")
             rotate_mlp_output(layer, R1=U_attn)
         elif pd_key in basis_dict:
+            # resq (default): Apply full Ua.T @ W @ Pd @ Hd (or Rd)
             Pd = basis_dict[pd_key].to(torch.float64)
             if ud_rotation_type == 'hadamard':
                 rotate_mlp_output_hadamard(layer, U_attn, Pd, hadK, K, blocksize)

@@ -105,6 +105,7 @@ from msmodelslim.pytorch.llm_ptq.llm_ptq_tools.resq import (
     ResQCalibrator,
     compute_basis,
 )
+from msmodelslim.pytorch.llm_ptq.llm_ptq_tools.resq.processors.basis_processor import save_basis
 
 
 def seed_everything(seed=0) -> None:
@@ -610,12 +611,12 @@ def main():
                 save_basis_dir = os.path.dirname(save_basis_path)
                 if save_basis_dir:
                     os.makedirs(save_basis_dir, exist_ok=True)
-                torch.save(basis_dict, save_basis_path)
+                save_basis(basis_dict, save_basis_path, eval_dict, kurtosis_dict)
                 print(f"Saved basis to: {save_basis_path}")
 
             # Save basis to output directory as well
             basis_output_path = os.path.join(save_directory, "resq_basis.pt")
-            torch.save(basis_dict, basis_output_path)
+            save_basis(basis_dict, basis_output_path, eval_dict, kurtosis_dict)
             print(f"Saved basis to: {basis_output_path}")
 
             # Use the computed basis path

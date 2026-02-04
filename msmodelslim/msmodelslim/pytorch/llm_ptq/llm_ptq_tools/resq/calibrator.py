@@ -94,7 +94,15 @@ class ResQCalibrator:
 
         if basis_path:
             self.logger.info(f"Loading basis from {basis_path}")
-            self.basis_dict = load_basis(basis_path)
+            self.basis_dict, loaded_eval_dict, loaded_kurtosis_dict = load_basis(basis_path)
+
+            # Use loaded values if not provided via constructor
+            if self.eval_dict is None and loaded_eval_dict is not None:
+                self.eval_dict = loaded_eval_dict
+                self.logger.info(f"Loaded eval_dict with {len(loaded_eval_dict)} entries from basis file")
+            if self.kurtosis_dict is None and loaded_kurtosis_dict is not None:
+                self.kurtosis_dict = loaded_kurtosis_dict
+                self.logger.info(f"Loaded kurtosis_dict with {len(loaded_kurtosis_dict)} entries from basis file")
 
         if rotation_path:
             self.logger.info(f"Loading rotations from {rotation_path}")

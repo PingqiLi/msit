@@ -888,14 +888,47 @@ def generate_random_rotations(
     return rotation_dict
 
 
-def save_basis(basis_dict: Dict[str, torch.Tensor], path: str):
-    """Save basis matrices to file."""
-    torch.save(basis_dict, path)
+def save_basis(basis_dict: Dict[str, torch.Tensor], path: str,
+               eval_dict: Dict[str, torch.Tensor] = None,
+               kurtosis_dict: Dict[str, torch.Tensor] = None):
+    """Save basis matrices and optional eigenvalues/kurtosis to file.
+
+    Args:
+        basis_dict: Dictionary of basis (eigenvector) matrices
+        path: Path to save the file
+        eval_dict: Optional dictionary of eigenvalues for adaptive ratio
+        kurtosis_dict: Optional dictionary of kurtosis values for adaptive ratio
+    """
+    save_data = {
+        'basis_dict': basis_dict,
+        'eval_dict': eval_dict,
+        'kurtosis_dict': kurtosis_dict,
+        'version': 2,  # Version marker for new format
+    }
+    torch.save(save_data, path)
     logger.info(f"Saved basis matrices to {path}")
 
 
-def load_basis(path: str) -> Dict[str, torch.Tensor]:
-    """Load basis matrices from file."""
-    basis_dict = torch.load(path, map_location='cpu')
-    logger.info(f"Loaded basis matrices from {path}")
-    return basis_dict
+def load_basis(path: str):
+    """Load basis matrices from file.
+
+    Returns:
+        Tuple of (basis_dict, eval_dict, kurtosis_dict)
+        eval_dict and kurtosis_dict may be None for older files
+    """
+    data = torch.load(path, map_location='cpu')
+
+    # Check for new format (version 2+)
+    if isinstance(data, dict) and 'version' in data:
+        basis_dict = data['basis_dict']
+        eval_dict = data.get('eval_dict')
+        kurtosis_dict = data.get('kurtosis_dict')
+        logger.info(f"Loaded basis matrices from {path} (format v{data['version']})")
+    else:
+        # Old format: data is the basis_dict directly
+        basis_dict = data
+        eval_dict = None
+        kurtosis_dict = None
+        logger.info(f"Loaded basis matrices from {path} (legacy format)")
+
+    return basis_dict, eval_dict, kurtosis_dict

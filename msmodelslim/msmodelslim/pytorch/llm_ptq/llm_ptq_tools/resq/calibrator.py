@@ -462,18 +462,14 @@ class ResQCalibrator:
 
         # Log computed ratios
         self.logger.info("Computed adaptive ratios:")
-        for key, ratio in sorted(self.ratio_dict.items())[:10]:  # Show first 10
+        for key, ratio in sorted(self.ratio_dict.items()):
             self.logger.info(f"  {key}: {ratio:.4f}")
-        if len(self.ratio_dict) > 10:
-            self.logger.info(f"  ... ({len(self.ratio_dict) - 10} more)")
 
         # Log scaled splits if available
         if self.scaled_splits_dict:
             self.logger.info("Scaled dimension splits (low_dim, high_dim):")
-            for key, (low_dim, high_dim) in sorted(self.scaled_splits_dict.items())[:10]:
+            for key, (low_dim, high_dim) in sorted(self.scaled_splits_dict.items()):
                 self.logger.info(f"  {key}: ({low_dim}, {high_dim})")
-            if len(self.scaled_splits_dict) > 10:
-                self.logger.info(f"  ... ({len(self.scaled_splits_dict) - 10} more)")
 
         self.logger.info("=" * 60)
 

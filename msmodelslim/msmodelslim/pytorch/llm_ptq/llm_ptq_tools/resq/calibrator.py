@@ -287,26 +287,21 @@ class ResQCalibrator:
         )
 
         if self._is_multi_device:
-            # For multi-device models, redistribute using accelerate
             self.logger.info("Redistributing model across multiple devices...")
+
+            # Remove any stale hooks first (module tree changed after quantizer wrapping)
+            try:
+                from accelerate.hooks import remove_hook_from_module
+                for name, module in model.named_modules():
+                    remove_hook_from_module(module, recurse=False)
+            except Exception:
+                pass
+
             try:
                 from accelerate import dispatch_model, infer_auto_device_map
                 from accelerate.utils import get_balanced_memory
 
-                # Remove any stale hooks first
-                try:
-                    from accelerate.hooks import remove_hook_from_module
-                    for name, module in model.named_modules():
-                        remove_hook_from_module(module, recurse=False)
-                except Exception:
-                    pass
-
-                # Use accelerate to redistribute the model
-                # First, get available devices from original device map
-                available_devices = list(set(self._original_device_map.values()))
-                self.logger.info(f"Available devices: {available_devices}")
-
-                # Infer a new device map for the transformed model
+                # Infer new device map to check if CPU overflow would occur
                 no_split_classes = ["Qwen2DecoderLayer", "Qwen3DecoderLayer", "LlamaDecoderLayer"]
                 max_memory = get_balanced_memory(
                     model,
@@ -320,46 +315,39 @@ class ResQCalibrator:
                     no_split_module_classes=no_split_classes,
                     dtype=model.dtype if hasattr(model, 'dtype') else torch.float16,
                 )
-                self.logger.info(f"New device_map: {device_map}")
+                self.logger.info(f"Inferred device_map: {device_map}")
 
-                # Dispatch the model
-                model = dispatch_model(model, device_map=device_map)
-                self.logger.info("Model redistributed successfully")
+                # Check if any modules would be offloaded to CPU/disk
+                has_cpu_offload = any(
+                    str(dev) in ('cpu', 'disk') for dev in device_map.values()
+                )
 
-                # Ensure model.norm is on a real device (not meta)
-                if hasattr(model, 'model') and hasattr(model.model, 'norm'):
-                    norm_module = model.model.norm
-                    if hasattr(norm_module, 'weight') and norm_module.weight is not None:
-                        if norm_module.weight.device.type == 'meta':
-                            # Move norm to the same device as embed_tokens
-                            target_device = model.model.embed_tokens.weight.device
-                            model.model.norm = model.model.norm.to(target_device)
-                            self.logger.info(f"Moved model.norm from meta to {target_device}")
-
-                # Set input device
-                if hasattr(model, 'model') and hasattr(model.model, 'embed_tokens'):
-                    self._input_device = model.model.embed_tokens.weight.device
+                if not has_cpu_offload:
+                    # All layers fit on NPU — safe to use dispatch_model
+                    model = dispatch_model(model, device_map=device_map)
+                    self.logger.info("Model redistributed successfully (all on NPU)")
                 else:
-                    # Get first device from device_map
-                    first_device = list(device_map.values())[0]
-                    self._input_device = torch.device(first_device) if isinstance(first_device, str) else first_device
-                self.logger.info(f"Calibration data will be sent to: {self._input_device}")
+                    # CPU overflow detected — skip dispatch_model to avoid meta tensors.
+                    # Instead, add lightweight activation-routing hooks that move inputs
+                    # between devices without offloading any weights.
+                    self.logger.info(
+                        "CPU overflow detected in device_map. "
+                        "Skipping dispatch_model to preserve real CPU tensors. "
+                        "Setting up manual activation-routing hooks instead."
+                    )
+                    self._setup_device_routing_hooks(model)
 
             except Exception as e:
-                self.logger.warning(f"Failed to redistribute model with accelerate: {e}")
-                # Keep multi-device mode but use original device map
-                # Don't try to move entire model to single device (causes OOM for large models)
-                self.logger.warning("Keeping original multi-device distribution (redistribution failed)")
+                self.logger.warning(f"Failed to set up multi-device routing: {e}")
+                self.logger.warning("Keeping original multi-device distribution")
 
-                # Set input device from embed_tokens
-                if hasattr(model, 'model') and hasattr(model.model, 'embed_tokens'):
-                    self._input_device = model.model.embed_tokens.weight.device
-                    self.logger.info(f"Using embed_tokens device as input device: {self._input_device}")
-                else:
-                    # Use first device from original device map
-                    first_device = list(self._original_device_map.values())[0]
-                    self._input_device = torch.device(first_device) if isinstance(first_device, str) else first_device
-                    self.logger.info(f"Using first device from original map as input: {self._input_device}")
+            # Set input device
+            if hasattr(model, 'model') and hasattr(model.model, 'embed_tokens'):
+                self._input_device = model.model.embed_tokens.weight.device
+            else:
+                first_device = list(self._original_device_map.values())[0]
+                self._input_device = torch.device(first_device) if isinstance(first_device, str) else first_device
+            self.logger.info(f"Calibration data will be sent to: {self._input_device}")
 
         if not self._is_multi_device:
             # For single-device models, remove accelerate hooks and move to target device
@@ -384,6 +372,58 @@ class ResQCalibrator:
             self._input_device = self.device
 
         return model
+
+    def _setup_device_routing_hooks(self, model: nn.Module) -> None:
+        """
+        Set up lightweight activation-routing hooks for multi-device models.
+
+        Unlike dispatch_model(), this does NOT offload weights to meta tensors.
+        It only adds AlignDevicesHook(offload=False) to move activations between
+        devices during forward passes.
+
+        This is used when some layers overflow to CPU but we need to keep their
+        real tensor weights intact for quantization calibration.
+        """
+        from accelerate.hooks import AlignDevicesHook, add_hook_to_module
+
+        def get_module_device(module: nn.Module) -> torch.device:
+            """Get device of a module's first non-meta parameter."""
+            for p in module.parameters(recurse=True):
+                if p.device.type != 'meta':
+                    return p.device
+            return torch.device('cpu')
+
+        hook_count = 0
+
+        if hasattr(model, 'model'):
+            inner = model.model
+
+            # embed_tokens
+            if hasattr(inner, 'embed_tokens'):
+                dev = get_module_device(inner.embed_tokens)
+                add_hook_to_module(inner.embed_tokens, AlignDevicesHook(execution_device=dev, offload=False))
+                hook_count += 1
+
+            # Each decoder layer
+            if hasattr(inner, 'layers'):
+                for i, layer in enumerate(inner.layers):
+                    dev = get_module_device(layer)
+                    add_hook_to_module(layer, AlignDevicesHook(execution_device=dev, offload=False))
+                    hook_count += 1
+
+            # model.norm
+            if hasattr(inner, 'norm'):
+                dev = get_module_device(inner.norm)
+                add_hook_to_module(inner.norm, AlignDevicesHook(execution_device=dev, offload=False))
+                hook_count += 1
+
+        # lm_head
+        if hasattr(model, 'lm_head'):
+            dev = get_module_device(model.lm_head)
+            add_hook_to_module(model.lm_head, AlignDevicesHook(execution_device=dev, offload=False))
+            hook_count += 1
+
+        self.logger.info(f"Added {hook_count} activation-routing hooks (no weight offloading)")
 
     def _compute_adaptive_ratios(self, model: nn.Module) -> None:
         """

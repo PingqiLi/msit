@@ -216,6 +216,15 @@ def parse_args():
                              "'resq', 'w8a8_dynamic', 'int4_hadamard', or 'float'. "
                              "Example: '{\"*.mlp.down_proj\": \"w8a8_dynamic\"}'")
 
+    # NPU memory configuration
+    parser.add_argument('--max_memory_per_device', type=str, default=None,
+                        help="Max memory per NPU device for model loading (e.g., '55GiB'). "
+                             "Used to tell accelerate actual NPU memory since it can't auto-detect it. "
+                             "If not set, tries torch.npu.get_device_properties() auto-detection.")
+    parser.add_argument('--disable_cpu_offload', type=cmd_bool, default=True,
+                        help="Prevent accelerate from offloading layers to CPU (default: True). "
+                             "Set to False if you want to allow CPU offloading.")
+
     return parser.parse_args()
 
 
@@ -297,6 +306,54 @@ def fix_meta_norm_params(model, model_path, model_device):
         print(f"WARNING: Could not load {len(meta_norm_params)} params: {meta_norm_params}")
     else:
         print(f"Successfully loaded {loaded_count} meta norm parameters")
+
+
+def build_npu_max_memory(max_memory_per_device=None, disable_cpu_offload=True):
+    """Build max_memory dict for NPU devices.
+
+    accelerate can't auto-detect NPU memory, causing it to underestimate available
+    memory and offload layers to CPU. This function provides the actual memory info.
+
+    Args:
+        max_memory_per_device: Manual memory specification (e.g., "55GiB").
+            If None, tries torch.npu.get_device_properties() auto-detection.
+        disable_cpu_offload: If True, sets CPU memory to "0GiB" to prevent offloading.
+
+    Returns:
+        max_memory dict mapping device indices to memory limits, or None if
+        no NPU devices are available.
+    """
+    num_npus = torch.npu.device_count()
+    if num_npus == 0:
+        return None
+
+    max_memory = {}
+
+    if max_memory_per_device:
+        # Use the user-specified value for all NPUs
+        for i in range(num_npus):
+            max_memory[i] = max_memory_per_device
+        print(f"Using manual max_memory: {max_memory_per_device} x {num_npus} NPUs")
+    else:
+        # Try auto-detection via torch.npu.get_device_properties()
+        try:
+            for i in range(num_npus):
+                props = torch.npu.get_device_properties(i)
+                total_mem = props.total_memory
+                # Use 85% to leave headroom for runtime allocations
+                usable_mem = int(total_mem * 0.85)
+                max_memory[i] = usable_mem
+                print(f"NPU {i}: {total_mem / (1024**3):.1f} GiB total, "
+                      f"using {usable_mem / (1024**3):.1f} GiB (85%)")
+        except (AttributeError, RuntimeError) as e:
+            print(f"WARNING: Could not auto-detect NPU memory ({e}). "
+                  f"Consider passing --max_memory_per_device (e.g., '55GiB').")
+            return None
+
+    if disable_cpu_offload:
+        max_memory["cpu"] = "0GiB"
+
+    return max_memory
 
 
 def main():
@@ -433,14 +490,33 @@ def main():
         )
         model_device = torch.device('cpu')
     else:
-        model = safe_generator.get_model_from_pretrained(
+        # Build max_memory to tell accelerate actual NPU memory
+        # (accelerate can't auto-detect NPU memory and may offload layers to CPU)
+        npu_max_memory = build_npu_max_memory(
+            max_memory_per_device=args.max_memory_per_device,
+            disable_cpu_offload=args.disable_cpu_offload,
+        )
+
+        load_kwargs = dict(
             model_path=model_path,
             config=config,
             trust_remote_code=args.trust_remote_code,
             device_map="auto",
             torch_dtype="auto",
-            attn_implementation='eager'
+            attn_implementation='eager',
         )
+        if npu_max_memory is not None:
+            load_kwargs["max_memory"] = npu_max_memory
+
+        model = safe_generator.get_model_from_pretrained(**load_kwargs)
+
+        # Verify no layers ended up on CPU
+        if hasattr(model, 'hf_device_map'):
+            cpu_layers = [k for k, v in model.hf_device_map.items() if v == 'cpu']
+            if cpu_layers:
+                print(f"WARNING: {len(cpu_layers)} layers mapped to CPU: {cpu_layers[:5]}...")
+                print("Consider passing --max_memory_per_device to specify NPU memory.")
+
         # Get the device of the embedding layer (where input_ids are sent first)
         if hasattr(model, 'model') and hasattr(model.model, 'embed_tokens'):
             model_device = model.model.embed_tokens.weight.device
@@ -641,14 +717,31 @@ def main():
         except Exception:
             pass
 
-        model = safe_generator.get_model_from_pretrained(
+        # Build max_memory for reload (same as initial load)
+        npu_max_memory = build_npu_max_memory(
+            max_memory_per_device=args.max_memory_per_device,
+            disable_cpu_offload=args.disable_cpu_offload,
+        )
+
+        reload_kwargs = dict(
             model_path=model_path,
             config=config,
             trust_remote_code=args.trust_remote_code,
             device_map="auto",
             torch_dtype="auto",
-            attn_implementation='eager'
+            attn_implementation='eager',
         )
+        if npu_max_memory is not None:
+            reload_kwargs["max_memory"] = npu_max_memory
+
+        model = safe_generator.get_model_from_pretrained(**reload_kwargs)
+
+        # Verify no layers ended up on CPU
+        if hasattr(model, 'hf_device_map'):
+            cpu_layers = [k for k, v in model.hf_device_map.items() if v == 'cpu']
+            if cpu_layers:
+                print(f"WARNING: {len(cpu_layers)} layers mapped to CPU: {cpu_layers[:5]}...")
+                print("Consider passing --max_memory_per_device to specify NPU memory.")
 
         # Re-prepare calibration data for the new model device
         # Get the device of the embedding layer (where input_ids are sent first)

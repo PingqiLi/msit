@@ -1210,16 +1210,16 @@ class ResQCalibrator:
             quant_description['model.embed_tokens.weight'] = "FLOAT"
             self.logger.info(f"Saved model.embed_tokens.weight: {embed_weight.shape}")
 
-        # Save model.norm.weight (final layer norm)
+        # Save model.norm.weight (all-ones after fuse_layer_norms)
         if hasattr(self.model, 'model') and hasattr(self.model.model, 'norm'):
             norm_module = self.model.model.norm
             if hasattr(norm_module, 'weight') and norm_module.weight is not None:
-                if norm_module.weight.device.type == 'meta':
-                    self.logger.warning("Skipping model.norm.weight: meta tensor (no data)")
-                else:
-                    weight_dict['model.norm.weight'] = norm_module.weight.data.cpu()
-                    quant_description['model.norm.weight'] = "FLOAT"
-                    self.logger.info(f"Saved model.norm.weight: {norm_module.weight.shape}")
+                # After fuse_layer_norms(), norm.weight is always all-ones
+                # (original values absorbed into lm_head). Use shape from meta tensor.
+                norm_shape = norm_module.weight.shape
+                weight_dict['model.norm.weight'] = torch.ones(norm_shape, dtype=torch.float32)
+                quant_description['model.norm.weight'] = "FLOAT"
+                self.logger.info(f"Saved model.norm.weight: {norm_shape} (all-ones after fusion)")
 
         # Debug: Print shapes of attention and MLP weights
         self.logger.info("=" * 60)
@@ -1249,27 +1249,25 @@ class ResQCalibrator:
 
         # Save per-layer normalization weights
         for name, module in self.model.named_modules():
-            # Save input_layernorm weights
+            # Save input_layernorm weights (all-ones after fuse_layer_norms)
             if 'input_layernorm' in name and hasattr(module, 'weight'):
-                weight = self._get_weight_safe(module, name)
-                if weight is not None:
-                    weight_dict[f"{name}.weight"] = weight
+                if module.weight is not None:
+                    if module.weight.device.type == 'meta':
+                        # Fused norm: construct all-ones from shape
+                        weight_dict[f"{name}.weight"] = torch.ones(module.weight.shape, dtype=torch.float32)
+                    else:
+                        weight_dict[f"{name}.weight"] = module.weight.data.cpu()
                     quant_description[f"{name}.weight"] = "FLOAT"
-                bias = self._get_bias_safe(module, name)
-                if bias is not None:
-                    weight_dict[f"{name}.bias"] = bias
-                    quant_description[f"{name}.bias"] = "FLOAT"
 
-            # Save post_attention_layernorm weights
+            # Save post_attention_layernorm weights (all-ones after fuse_layer_norms)
             if 'post_attention_layernorm' in name and hasattr(module, 'weight'):
-                weight = self._get_weight_safe(module, name)
-                if weight is not None:
-                    weight_dict[f"{name}.weight"] = weight
+                if module.weight is not None:
+                    if module.weight.device.type == 'meta':
+                        # Fused norm: construct all-ones from shape
+                        weight_dict[f"{name}.weight"] = torch.ones(module.weight.shape, dtype=torch.float32)
+                    else:
+                        weight_dict[f"{name}.weight"] = module.weight.data.cpu()
                     quant_description[f"{name}.weight"] = "FLOAT"
-                bias = self._get_bias_safe(module, name)
-                if bias is not None:
-                    weight_dict[f"{name}.bias"] = bias
-                    quant_description[f"{name}.bias"] = "FLOAT"
 
             # Save self_attn.q_norm weights (Qwen3 specific)
             if 'q_norm' in name and hasattr(module, 'weight'):
@@ -1396,14 +1394,20 @@ class ResQCalibrator:
                     # Hadamard mode: save Pd per layer [blocksize, blocksize] + Hd globally
                     self.logger.info(f"  Saving Ud in Hadamard mode (Pd per layer + Hd globally)")
 
-                    # Save Pd per layer
+                    # Save Pd per layer (only for layers that need rotation)
+                    pd_saved_count = 0
                     for i in range(nlayers):
+                        layer_key = f'model.layers.{i}.mlp.down_proj'
+                        quant_type = self.cfg.mix_cfg.get(layer_key, 'resq')
+                        if quant_type in ('w8a8_dynamic', 'float'):
+                            continue  # These quant types don't use Pd rotation
                         key = f'layer.{i}.mlp.down_proj'
                         if key in self.basis_dict:
                             Pd = self.basis_dict[key].to(torch.float64)
                             weight_dict[f'resq.layer.{i}.Pd'] = Pd.float().cpu()
                             quant_description[f'resq.layer.{i}.Pd'] = "FLOAT"
-                    self.logger.info(f"    Saved {nlayers} per-layer Pd matrices [{blocksize}x{blocksize}]")
+                            pd_saved_count += 1
+                    self.logger.info(f"    Saved {pd_saved_count}/{nlayers} per-layer Pd matrices [{blocksize}x{blocksize}]")
 
                     # Save global Hadamard info
                     hadK = self.rotation_dict.get('Hd')
@@ -1427,7 +1431,12 @@ class ResQCalibrator:
                         Rd = Rd.to(torch.float64)
                         num_blocks = intermediate_size // blocksize
 
+                        ud_saved_count = 0
                         for i in range(nlayers):
+                            layer_key = f'model.layers.{i}.mlp.down_proj'
+                            quant_type = self.cfg.mix_cfg.get(layer_key, 'resq')
+                            if quant_type in ('w8a8_dynamic', 'float'):
+                                continue  # These quant types don't use Ud rotation
                             key = f'layer.{i}.mlp.down_proj'
                             if key in self.basis_dict:
                                 Pd = self.basis_dict[key].to(torch.float64)
@@ -1443,8 +1452,9 @@ class ResQCalibrator:
 
                                 weight_dict[f'resq.layer.{i}.Ud'] = Ud.float().cpu()
                                 quant_description[f'resq.layer.{i}.Ud'] = "FLOAT"
+                                ud_saved_count += 1
 
-                        self.logger.info(f"    Saved {nlayers} per-layer Ud matrices [{intermediate_size}x{intermediate_size}]")
+                        self.logger.info(f"    Saved {ud_saved_count}/{nlayers} per-layer Ud matrices [{intermediate_size}x{intermediate_size}]")
 
             elif R2 is not None:
                 # Simplified mode: save R2 as shared Uc

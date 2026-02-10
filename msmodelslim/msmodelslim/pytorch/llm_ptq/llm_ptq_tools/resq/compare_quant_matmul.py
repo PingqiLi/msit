@@ -248,6 +248,40 @@ def load_original_layer_weights(model_path: str, layer_idx: int) -> Dict[str, to
         return weights
 
 
+def load_original_global_weights(model_path: str) -> Dict[str, torch.Tensor]:
+    """Load embed_tokens, model.norm, and lm_head weights from the original HF model (lazy)."""
+    target_keys = {"model.embed_tokens.weight", "model.norm.weight", "lm_head.weight"}
+    index_path = os.path.join(model_path, 'model.safetensors.index.json')
+
+    if os.path.exists(index_path):
+        with open(index_path, 'r') as f:
+            index = json.load(f)
+        weight_map = index['weight_map']
+
+        needed_shards = set()
+        for key, shard in weight_map.items():
+            if key in target_keys:
+                needed_shards.add(shard)
+
+        weights = {}
+        for shard_name in needed_shards:
+            shard_path = os.path.join(model_path, shard_name)
+            with safe_open(shard_path, framework="pt", device="cpu") as f:
+                for key in f.keys():
+                    if key in target_keys:
+                        weights[key] = f.get_tensor(key)
+        return weights
+    else:
+        st_files = sorted([f for f in os.listdir(model_path) if f.endswith('.safetensors')])
+        weights = {}
+        for fname in st_files:
+            with safe_open(os.path.join(model_path, fname), framework="pt", device="cpu") as f:
+                for key in f.keys():
+                    if key in target_keys:
+                        weights[key] = f.get_tensor(key)
+        return weights
+
+
 # ---------------------------------------------------------------------------
 # Transform reconstruction
 # ---------------------------------------------------------------------------
@@ -808,6 +842,119 @@ def compare_single_layer(
     print()
 
 
+def compare_embedding_and_head(
+    model_path: str,
+    quant_path: str,
+    seq_len: int = 32,
+    seed: int = 42,
+):
+    """Compare embedding and lm_head transforms between original and quantized models."""
+    print("=" * 70)
+    print("Embedding & LM Head Comparison")
+    print("=" * 70)
+
+    # ---- Load transform tensors ----
+    transform_path = os.path.join(quant_path, 'resq_transforms.safetensors')
+    if not os.path.exists(transform_path):
+        raise FileNotFoundError(
+            f"Transform file not found: {transform_path}\n"
+            f"Run quantization with --output_mode debug to generate it."
+        )
+    transform_tensors = load_safetensors(transform_path)
+
+    cfg = load_config_from_transforms(transform_tensors)
+    hidden_dim = int(cfg['hidden_dim'])
+
+    # Reconstruct Ua from layer 0 (shared rotation for all layers)
+    transforms = reconstruct_transforms(transform_tensors, 0)
+    Ua = transforms['Ua']  # [hidden_dim, hidden_dim]
+
+    # ---- Load original global weights ----
+    print(f"Loading original global weights from: {model_path}")
+    orig_global = load_original_global_weights(model_path)
+    embed_orig = orig_global['model.embed_tokens.weight'].float()  # [vocab_size, hidden_dim]
+    gamma_final = orig_global['model.norm.weight'].float()          # [hidden_dim]
+    lm_head_orig = orig_global['lm_head.weight'].float()            # [vocab_size, hidden_dim]
+
+    # ---- Load quantized weights ----
+    print(f"Loading quantized weights from: {quant_path}")
+    quant_tensors = load_safetensors(quant_path)
+    embed_quant = quant_tensors['model.embed_tokens.weight'].float()
+    lm_head_quant = quant_tensors['lm_head.weight'].float()
+
+    comparisons = []
+
+    # =====================================================================
+    # EMBEDDING CHECK
+    # =====================================================================
+    print()
+    print("-" * 70)
+    print("Checking embedding transform...")
+    print("-" * 70)
+
+    # Expected: embed_quant = (embed_orig - row_mean) @ Ua
+    embed_centered = embed_orig - embed_orig.mean(dim=-1, keepdim=True)
+    embed_expected = torch.matmul(embed_centered, Ua)
+
+    comparisons.append(("embed (weight)", embed_expected, embed_quant))
+
+    # Token lookup comparison: generate random token IDs, look up embeddings
+    torch.manual_seed(seed)
+    vocab_size = embed_orig.shape[0]
+    token_ids = torch.randint(0, vocab_size, (seq_len,))
+
+    # Original path: embed_orig[tokens] (what the original model produces)
+    orig_lookup = embed_centered[token_ids]  # [seq_len, hidden_dim]
+
+    # Quantized path: embed_quant[tokens] @ Ua.T (recover original centered space)
+    quant_lookup_recovered = torch.matmul(embed_quant[token_ids], Ua.T)
+
+    comparisons.append(("embed (lookup)", orig_lookup, quant_lookup_recovered))
+
+    # =====================================================================
+    # LM HEAD CHECK
+    # =====================================================================
+    print("-" * 70)
+    print("Checking lm_head transform...")
+    print("-" * 70)
+
+    # Expected: lm_head_quant = (lm_head_orig * gamma) @ Ua
+    # fuse_ln_linear does: W_new = W * ln_weight (broadcast gamma across output dim)
+    lm_head_fused = lm_head_orig * gamma_final  # [vocab_size, hidden_dim] * [hidden_dim]
+    lm_head_expected = torch.matmul(lm_head_fused, Ua)
+
+    comparisons.append(("lm_head (weight)", lm_head_expected, lm_head_quant))
+
+    # Logits comparison: generate random hidden state, compute logits both ways
+    torch.manual_seed(seed + 1)
+    x_hidden = torch.randn(1, seq_len, hidden_dim, dtype=torch.float32)
+
+    # Original path: rmsnorm(x, gamma) @ lm_head_orig.T
+    logits_orig = torch.matmul(rmsnorm(x_hidden, gamma_final), lm_head_orig.T)
+
+    # Quantized path: rmsnorm(x @ Ua, ones) @ lm_head_quant.T
+    x_rotated = torch.matmul(x_hidden, Ua)
+    logits_quant = torch.matmul(rmsnorm(x_rotated, weight=None), lm_head_quant.T)
+
+    comparisons.append(("lm_head (logits)", logits_orig, logits_quant))
+
+    # =====================================================================
+    # PRINT RESULTS
+    # =====================================================================
+    print()
+    print(f"{'Comparison':<20} {'Shape':<26} {'MSE':>10} {'Cos Sim':>10} {'SNR(dB)':>10} {'Max Err':>10}")
+    print("-" * 88)
+
+    for name, expected, actual in comparisons:
+        metrics = compute_error_metrics(expected, actual)
+        shape_str = str(list(expected.shape))
+        print(f"{name:<20} {shape_str:<26} {metrics['mse']:>10.2e} {metrics['cos_sim']:>10.5f} "
+              f"{metrics['snr_db']:>10.1f} {metrics['max_abs_error']:>10.4f}")
+
+    print("-" * 88)
+    print()
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Single-layer forward comparison between original and quantized models"
@@ -822,6 +969,9 @@ def main():
                         help="Sequence length for random input (default: 32)")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed (default: 42)")
+    parser.add_argument("--check_embedding_head", action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help="Check embedding and lm_head transforms (default: True)")
 
     args = parser.parse_args()
 
@@ -832,6 +982,14 @@ def main():
         seq_len=args.seq_len,
         seed=args.seed,
     )
+
+    if args.check_embedding_head:
+        compare_embedding_and_head(
+            model_path=args.model_path,
+            quant_path=args.quant_path,
+            seq_len=args.seq_len,
+            seed=args.seed,
+        )
 
 
 if __name__ == "__main__":

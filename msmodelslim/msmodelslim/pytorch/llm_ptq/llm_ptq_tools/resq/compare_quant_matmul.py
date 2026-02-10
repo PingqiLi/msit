@@ -752,7 +752,7 @@ def compare_single_layer(
         # v_recovered[..., h, :] = v_rot_heads[..., h, :] @ Ub[h].T
         Ub_T = Ub.transpose(-2, -1)  # [num_kv_heads, head_dim, head_dim]
         v_recovered = torch.einsum('bshd,hde->bshe', v_rot_heads, Ub_T)
-        v_recovered = v_recovered.view(B_, S_, num_kv_heads * head_dim)
+        v_recovered = v_recovered.reshape(B_, S_, num_kv_heads * head_dim)
     else:
         v_recovered = v_rot
     comparisons.append(("v", v_orig, v_recovered))
@@ -766,7 +766,7 @@ def compare_single_layer(
         B_, S_, _ = attn_rot.shape
         attn_rot_heads = attn_rot.view(B_, S_, num_heads, head_dim)
         attn_recovered = torch.einsum('bshd,hde->bshe', attn_rot_heads, Ub_expanded_T)
-        attn_recovered = attn_recovered.view(B_, S_, num_heads * head_dim)
+        attn_recovered = attn_recovered.reshape(B_, S_, num_heads * head_dim)
     else:
         attn_recovered = attn_rot
     comparisons.append(("attn_out", attn_orig, attn_recovered))

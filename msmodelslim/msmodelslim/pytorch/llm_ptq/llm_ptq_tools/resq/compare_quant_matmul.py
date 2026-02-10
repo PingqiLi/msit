@@ -455,7 +455,7 @@ def compare_single_layer(
         return None
 
     def get_quant_dequant(proj: str) -> torch.Tensor:
-        """Dequantize and concatenate low + high weight parts."""
+        """Dequantize and concatenate low + high weight parts (ResQ or W8A8_DYNAMIC)."""
         full_name = f"{L}.{proj}"
         parts = []
         low_key = f"{full_name}.weight_low"
@@ -474,8 +474,22 @@ def compare_single_layer(
             return torch.cat(parts, dim=1)
         elif len(parts) == 1:
             return parts[0]
-        else:
-            raise ValueError(f"No quantized weights found for {full_name}")
+
+        # Fallback: W8A8_DYNAMIC format (.weight + .weight_scale + .weight_offset)
+        w_key = f"{full_name}.weight"
+        ws_key = f"{full_name}.weight_scale"
+        wo_key = f"{full_name}.weight_offset"
+        if w_key in quant_tensors and ws_key in quant_tensors:
+            w = quant_tensors[w_key]
+            scale = quant_tensors[ws_key]
+            offset = quant_tensors.get(wo_key)
+            # dequant: scale * (w - offset)
+            if offset is not None:
+                return scale * (w.float() - offset.float())
+            else:
+                return w.float() * scale
+
+        raise ValueError(f"No quantized weights found for {full_name}")
 
     def get_quant_bias(proj: str) -> Optional[torch.Tensor]:
         key = f"{L}.{proj}.bias"
@@ -693,12 +707,19 @@ def compare_single_layer(
 
     mlp_rot = torch.nn.functional.silu(gate_rot) * up_rot
 
-    # Apply Ud transform for down_proj input
-    P_d = transforms['P_d']
-    hadK = transforms['hadK']
-    K_val = int(transforms['K'])
+    # Check if down_proj uses ResQ (has Ud transform) or W8A8_DYNAMIC (no Ud)
+    down_proj_is_resq = f"{L}.mlp.down_proj.weight_low" in quant_tensors or \
+                        f"{L}.mlp.down_proj.weight_high" in quant_tensors
 
-    mlp_ud = apply_Ud_forward(mlp_rot, P_d, hadK, K_val, blocksize)
+    if down_proj_is_resq:
+        # Apply Ud transform for down_proj input
+        P_d = transforms['P_d']
+        hadK = transforms['hadK']
+        K_val = int(transforms['K'])
+        mlp_ud = apply_Ud_forward(mlp_rot, P_d, hadK, K_val, blocksize)
+    else:
+        # W8A8_DYNAMIC: no Ud transform, weight only has Ua.T @ W_orig applied
+        mlp_ud = mlp_rot
 
     down_rot = torch.matmul(mlp_ud, W_down_dq.T)
     if b_down_quant is not None:

@@ -129,7 +129,11 @@ def rmsnorm_per_head(x: torch.Tensor, weight: torch.Tensor, num_heads: int, head
     x_heads = x.float().view(B, S, num_heads, head_dim)
     rms = torch.sqrt(torch.mean(x_heads ** 2, dim=-1, keepdim=True) + eps)
     x_norm = x_heads / rms
-    x_norm = x_norm * weight.float().view(1, 1, num_heads, head_dim)
+    # weight may be [head_dim] (shared across heads) or [num_heads * head_dim] (per-head)
+    if weight.numel() == head_dim:
+        x_norm = x_norm * weight.float().view(1, 1, 1, head_dim)
+    else:
+        x_norm = x_norm * weight.float().view(1, 1, num_heads, head_dim)
     return x_norm.view(B, S, num_heads * head_dim)
 
 

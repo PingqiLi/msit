@@ -570,7 +570,8 @@ def main():
     # Parse mix_cfg JSON if provided
     mix_cfg = {
             #    "*.self_attn.o_proj": "w8a8_dynamic", 
-               "*.mlp.down_proj": "w8a8_dynamic"}
+            #    "*.mlp.down_proj": "w8a8_dynamic"
+            }
     if args.mix_cfg:
         mix_cfg = json.loads(args.mix_cfg)
 

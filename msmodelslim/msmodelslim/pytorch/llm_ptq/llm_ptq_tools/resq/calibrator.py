@@ -478,6 +478,10 @@ class ResQCalibrator:
             alignment=self.cfg.adaptive_alignment,
             transform_algorithms=self.cfg.transform_algorithms,
             ub_head_aggregation=self.cfg.ub_head_aggregation,
+            hessian_log_scale=self.cfg.hessian_log_scale,
+            kurtosis_adaptive_thresholds=self.cfg.kurtosis_adaptive_thresholds,
+            kurtosis_percentile_low=self.cfg.kurtosis_percentile_low,
+            kurtosis_percentile_high=self.cfg.kurtosis_percentile_high,
         )
 
         # Create computer and compute ratios

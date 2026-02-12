@@ -415,3 +415,132 @@ quant_description = {
 - `model.layers.{i}.mlp.down_proj.weight_low/high` - Dual precision down
 - `resq.layer.{i}.Uc` - Per-layer K cache rotation matrix
 - `resq.layer.{i}.Ud` - Per-layer down_proj rotation matrix
+
+---
+
+## Adaptive Ratio Algorithm Analysis
+
+### Overview
+
+The adaptive ratio system (`adaptive_ratio.py`) replaces the fixed `high_fraction=0.125` with per-layer, per-transform ratios computed from calibration statistics. Four algorithms are available: Hessian Trace, Kurtosis, CEV, and Hybrid (weighted combination).
+
+### Algorithm Details
+
+#### 1. Hessian Trace Algorithm (Lines 170-229)
+
+**Metric:** Normalized trace of eigenvalues (Hessian diagonal approximation).
+
+**Mapping function:**
+```
+normalized_trace = sum(eigenvalues) / dim
+relative_trace = 2.0 / (1.0 + exp(-scale_factor * normalized_trace)) - 1.0
+ratio = min_ratio + (max_ratio - min_ratio) * clamp(relative_trace, 0, 1)
+```
+
+**Problem - Sigmoid saturation:** Covariance eigenvalue traces in transformer layers are typically large positive numbers (order of magnitude 10-1000+). With `scale_factor=1.0`, `exp(-normalized_trace)` is effectively 0 for any `normalized_trace > 5`, making `relative_trace ≈ 1.0` for *all* layers. This causes every layer to map to `max_ratio = 0.25` regardless of actual sensitivity differences.
+
+**Two-pass mode (reference_trace):** When `reference_trace` is set, the algorithm uses `normalized_trace / reference_trace` instead of the sigmoid. This produces better differentiation but requires a separate first pass to collect traces, and is not enabled by default.
+
+#### 2. Kurtosis Algorithm (Lines 231-267)
+
+**Metric:** Excess kurtosis of activation distributions (peakedness/outlier tendency).
+
+**Mapping function:** Linear interpolation between two thresholds:
+```
+if kurtosis <= 3.0:  ratio = min_ratio (0.0625)
+if kurtosis >= 10.0: ratio = max_ratio (0.25)
+else: ratio = min_ratio + (kurtosis - 3.0) / 7.0 * (max_ratio - min_ratio)
+```
+
+**Problem - Narrow effective range:** Transformer activation kurtosis values typically cluster in a narrow sub-range (e.g., 4-7 for most layers). With thresholds at [3.0, 10.0], only a fraction of the [min, max] range is actually utilized. For example, kurtosis values in [4, 7] map to ratios in [0.089, 0.143] — a spread of only 0.054 within the 0.1875 total range.
+
+#### 3. CEV (Cumulative Explained Variance) Algorithm (Lines 270-318)
+
+**Metric:** Number of dimensions needed to explain 95% of total variance.
+
+**Mapping function:**
+```
+sorted_evals = sort_descending(eigenvalues)
+cum_var = cumsum(sorted_evals) / total_variance
+high_dim = first index where cum_var >= 0.95
+ratio = clamp(high_dim / total_dim, min_ratio, max_ratio)
+```
+
+**Problem - Spectral concentration in transformers:** Neural network covariance matrices exhibit steep eigenvalue decay — a small fraction of dimensions captures most variance. For Qwen3-32B with hidden_dim=5120, the top 5-15% of eigenvectors typically explain 95% of variance, yielding CEV ratios in [0.05, 0.15]. This clusters near the lower bound and rarely approaches max_ratio.
+
+#### 4. Hybrid Algorithm (Lines 321-376)
+
+**Mapping function:** Weighted average of available algorithms:
+```
+ratio = (0.4 * hessian_ratio + 0.3 * kurtosis_ratio + 0.3 * cev_ratio)
+```
+
+**Problem - Averaging compresses the distribution further.** Consider typical values:
+- Hessian (saturated): ≈ 0.25 for all layers
+- Kurtosis (clustered): ≈ 0.09 - 0.14
+- CEV (low-biased): ≈ 0.06 - 0.15
+
+Hybrid result: ≈ 0.4×0.25 + 0.3×0.12 + 0.3×0.10 = 0.100 + 0.036 + 0.030 = **0.166**
+
+With inter-layer variation of at most ±0.03, the hybrid output concentrates around **0.15-0.20** with minimal differentiation between layers.
+
+### Root Causes of Concentration Around 0.2
+
+| Cause | Algorithm | Effect |
+|-------|-----------|--------|
+| Sigmoid saturation | Hessian | All layers → max_ratio (0.25) |
+| Narrow kurtosis spread | Kurtosis | Uses only ~30% of ratio range |
+| Steep spectral decay | CEV | Clusters near min_ratio |
+| Weighted averaging | Hybrid | Compresses already-narrow spreads |
+| Tight bounds [0.0625, 0.25] | All | Only 4x ratio range available |
+| 512-byte alignment | Post-processing | Quantizes continuous ratios to discrete steps |
+
+### Quantitative Example (Qwen3-32B, hidden_dim=5120)
+
+With 512-alignment on dim=5120, possible aligned fractions are:
+```
+high_dim:  0, 512, 1024, 1536, 2048, 2560, 3072, 3584, 4096, 4608, 5120
+fraction:  0, 0.1, 0.2,  0.3,  0.4,  0.5,  0.6,  0.7,  0.8,  0.9,  1.0
+```
+Within [min=0.0625, max=0.25], the only valid aligned fractions for Ua are: **0.1 and 0.2**. This means regardless of algorithm output, Ua can only be one of two values.
+
+For head_dim=128 (Ub, Uc), alignment to 512 exceeds the dimension itself, so no alignment occurs and the integer split has more resolution — but the ratio range [0.0625, 0.25] still limits Ub/Uc to at most 8-32 of 128 channels (6-25%).
+
+### Potential Improvements for More Even Distribution
+
+#### A. Percentile Rank Normalization (Recommended)
+After computing raw ratios for all layers, rank them and remap:
+```python
+# Compute raw ratios for all layers
+raw_ratios = [algorithm.compute_ratio(evals_i) for i in range(nlayers)]
+# Rank-based remapping
+ranks = rankdata(raw_ratios) / len(raw_ratios)  # uniform in [0, 1]
+final_ratios = [min_ratio + r * (max_ratio - min_ratio) for r in ranks]
+```
+This guarantees uniform spread over [min_ratio, max_ratio] regardless of the raw metric distribution.
+
+#### B. Log-Scale Hessian
+Replace sigmoid with log-scale mapping to handle the large dynamic range:
+```python
+log_trace = log(1 + normalized_trace)
+log_ref = log(1 + reference_trace)  # median or mean
+relative = log_trace / log_ref  # centered around 1.0
+```
+This prevents saturation and preserves relative ordering.
+
+#### C. Adaptive Kurtosis Thresholds
+Compute thresholds from the actual kurtosis distribution rather than fixed [3.0, 10.0]:
+```python
+threshold_low = percentile(all_kurtosis_values, 10)
+threshold_high = percentile(all_kurtosis_values, 90)
+```
+This uses the full [min, max] range for the middle 80% of layers.
+
+#### D. Wider Ratio Range
+Expand from [0.0625, 0.25] to [0.03125, 0.5] (1/32 to 1/2). This gives 16x range instead of 4x, allowing more differentiation. The memory/accuracy tradeoff can be controlled by the overall average rather than tight bounds.
+
+#### E. Reduce Alignment Granularity
+Use 128 or 256 instead of 512 for alignment, giving more discrete options within the ratio range. For hidden_dim=5120 with alignment=128, valid fractions in [0.0625, 0.25] would be: 0.075, 0.1, 0.125, 0.15, 0.175, 0.2, 0.225, 0.25 — 8 options instead of 2.
+
+#### F. Per-Transform Separate Normalization
+Each transform (Ua, Ub, Uc, Ud) has different eigenvalue magnitude characteristics. Normalizing within each transform group separately would prevent one transform's scale from dominating hybrid calculations.

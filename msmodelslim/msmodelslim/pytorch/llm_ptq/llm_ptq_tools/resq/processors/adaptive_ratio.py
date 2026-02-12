@@ -49,10 +49,14 @@ class AdaptiveRatioConfig:
 
     # Hessian algorithm parameters
     hessian_scale_factor: float = 1.0
+    hessian_log_scale: bool = True        # Use log-scale instead of sigmoid
 
     # Kurtosis algorithm parameters
     kurtosis_threshold_low: float = 3.0   # Normal distribution kurtosis
     kurtosis_threshold_high: float = 10.0  # High kurtosis threshold
+    kurtosis_adaptive_thresholds: bool = True   # Use data-driven thresholds
+    kurtosis_percentile_low: float = 10.0       # Low percentile for threshold
+    kurtosis_percentile_high: float = 90.0      # High percentile for threshold
 
     # Hybrid algorithm weights
     hybrid_weight_hessian: float = 0.4
@@ -203,8 +207,17 @@ class HessianTraceAlgorithm(BaseRatioAlgorithm):
         # Store for reference computation
         self._trace_history.append(normalized_trace)
 
-        # Use reference trace for normalization if available
-        if self.reference_trace is not None and self.reference_trace > 0:
+        # Compute relative trace using configured method
+        if self.config.hessian_log_scale:
+            # Log-scale mapping: preserves inter-layer differences
+            log_trace = math.log(1.0 + normalized_trace)
+            if self.reference_trace is not None and self.reference_trace > 0:
+                log_ref = math.log(1.0 + self.reference_trace)
+                relative_trace = log_trace / (2.0 * log_ref)
+            else:
+                # Pass 1 placeholder: return midpoint, will be recomputed in pass 2
+                return (self.config.min_ratio + self.config.max_ratio) / 2
+        elif self.reference_trace is not None and self.reference_trace > 0:
             relative_trace = normalized_trace / self.reference_trace
         else:
             # Use sigmoid-like scaling for relative importance
@@ -240,6 +253,12 @@ class KurtosisAlgorithm(BaseRatioAlgorithm):
         ratio = interpolate(kurtosis, [threshold_low, threshold_high], [min_ratio, max_ratio])
     """
 
+    def __init__(self, config: AdaptiveRatioConfig):
+        super().__init__(config)
+        self._kurtosis_history = []
+        self._adaptive_threshold_low = None
+        self._adaptive_threshold_high = None
+
     def compute_ratio(
         self,
         eigenvalues: Optional[torch.Tensor] = None,
@@ -251,9 +270,17 @@ class KurtosisAlgorithm(BaseRatioAlgorithm):
             logger.warning("KurtosisAlgorithm: No kurtosis provided, using default ratio")
             return (self.config.min_ratio + self.config.max_ratio) / 2
 
-        # Linear interpolation between thresholds
-        threshold_low = self.config.kurtosis_threshold_low
-        threshold_high = self.config.kurtosis_threshold_high
+        # Collect kurtosis values for adaptive threshold computation
+        if self.config.kurtosis_adaptive_thresholds:
+            self._kurtosis_history.append(kurtosis)
+
+        # Use adaptive thresholds if available, otherwise use configured thresholds
+        if self._adaptive_threshold_low is not None and self._adaptive_threshold_high is not None:
+            threshold_low = self._adaptive_threshold_low
+            threshold_high = self._adaptive_threshold_high
+        else:
+            threshold_low = self.config.kurtosis_threshold_low
+            threshold_high = self.config.kurtosis_threshold_high
 
         if kurtosis <= threshold_low:
             ratio = self.config.min_ratio
@@ -265,6 +292,37 @@ class KurtosisAlgorithm(BaseRatioAlgorithm):
             ratio = self.config.min_ratio + t * (self.config.max_ratio - self.config.min_ratio)
 
         return self.clamp_ratio(ratio)
+
+    def set_adaptive_thresholds(self, all_kurtosis_values: List[float]):
+        """Compute adaptive thresholds from collected kurtosis values using percentiles."""
+        if not all_kurtosis_values:
+            logger.warning("KurtosisAlgorithm: No kurtosis values for adaptive thresholds")
+            return
+
+        sorted_values = sorted(all_kurtosis_values)
+        n = len(sorted_values)
+
+        # Compute percentile indices
+        low_idx = max(0, int(self.config.kurtosis_percentile_low / 100.0 * n) - 1)
+        high_idx = min(n - 1, int(self.config.kurtosis_percentile_high / 100.0 * n))
+
+        self._adaptive_threshold_low = sorted_values[low_idx]
+        self._adaptive_threshold_high = sorted_values[high_idx]
+
+        # Guard against degenerate case
+        if self._adaptive_threshold_high <= self._adaptive_threshold_low:
+            self._adaptive_threshold_high = self._adaptive_threshold_low + 1.0
+
+        logger.info(
+            f"KurtosisAlgorithm: Adaptive thresholds set to "
+            f"[{self._adaptive_threshold_low:.4f}, {self._adaptive_threshold_high:.4f}] "
+            f"(from {n} values, p{self.config.kurtosis_percentile_low:.0f}/p{self.config.kurtosis_percentile_high:.0f})"
+        )
+
+    def compute_reference_from_history(self):
+        """Compute adaptive thresholds from collected kurtosis history."""
+        if self._kurtosis_history:
+            self.set_adaptive_thresholds(self._kurtosis_history)
 
 
 class CEVAlgorithm(BaseRatioAlgorithm):
@@ -374,6 +432,11 @@ class HybridAlgorithm(BaseRatioAlgorithm):
         """Set reference trace for Hessian algorithm."""
         self.hessian_alg.set_reference_trace(reference_trace)
 
+    def compute_reference_from_history(self):
+        """Propagate reference computation to sub-algorithms."""
+        self.hessian_alg.compute_reference_from_history()
+        self.kurtosis_alg.compute_reference_from_history()
+
 
 def create_algorithm(name: str, config: AdaptiveRatioConfig) -> BaseRatioAlgorithm:
     """
@@ -436,22 +499,31 @@ class AdaptiveRatioComputer:
             alg_name = config.transform_algorithms.get(transform, config.algorithm)
             self.algorithms[transform] = create_algorithm(alg_name, config)
 
-    def compute_all_ratios(
+    def _needs_two_pass(self) -> bool:
+        """Check if any algorithm requires a two-pass approach."""
+        return self.config.hessian_log_scale or self.config.kurtosis_adaptive_thresholds
+
+    def _compute_references_from_history(self):
+        """Compute reference values from history for all algorithms."""
+        for transform, algorithm in self.algorithms.items():
+            if hasattr(algorithm, 'compute_reference_from_history'):
+                algorithm.compute_reference_from_history()
+
+    def _run_pass(
         self,
         eval_dict: Dict[str, torch.Tensor],
-        kurtosis_dict: Optional[Dict[str, float]] = None,
-        model_config: Any = None,
+        kurtosis_dict: Optional[Dict[str, float]],
+        model_config: Any,
+        collect_only: bool = False,
     ) -> AdaptiveRatioResult:
         """
-        Compute adaptive ratios for all layers and transforms.
+        Run a single pass of ratio computation.
 
         Args:
-            eval_dict: Dictionary of eigenvalues from compute_basis()
-                Keys: 'attn_mlp', 'layer.{i}.self_attn.value',
-                      'layer.{i}.self_attn.key_pos', 'layer.{i}.mlp.down_proj'
+            eval_dict: Dictionary of eigenvalues
             kurtosis_dict: Dictionary of kurtosis values (optional)
-                Keys: Same as eval_dict
             model_config: Model configuration for dimension info
+            collect_only: If True, skip computing splits (pass 1 optimization)
 
         Returns:
             AdaptiveRatioResult with computed ratios and metrics
@@ -485,7 +557,7 @@ class AdaptiveRatioComputer:
             result.algorithms_used['Ua'] = self.config.transform_algorithms.get(
                 'Ua', self.config.algorithm
             )
-            if hidden_dim:
+            if not collect_only and hidden_dim:
                 result.splits['Ua'] = align_dimension_split(
                     hidden_dim, ua_ratio, self.config.alignment
                 )
@@ -503,7 +575,7 @@ class AdaptiveRatioComputer:
                 result.algorithms_used[f'layer.{i}.Ub'] = self.config.transform_algorithms.get(
                     'Ub', self.config.algorithm
                 )
-                if head_dim:
+                if not collect_only and head_dim:
                     result.splits[f'layer.{i}.Ub'] = align_dimension_split(
                         head_dim, ub_ratio, self.config.alignment
                     )
@@ -519,7 +591,7 @@ class AdaptiveRatioComputer:
                 result.algorithms_used[f'layer.{i}.Uc'] = self.config.transform_algorithms.get(
                     'Uc', self.config.algorithm
                 )
-                if head_dim:
+                if not collect_only and head_dim:
                     result.splits[f'layer.{i}.Uc'] = align_dimension_split(
                         head_dim, uc_ratio, self.config.alignment
                     )
@@ -536,12 +608,55 @@ class AdaptiveRatioComputer:
                     'Ud', self.config.algorithm
                 )
                 # Compute aligned split at full intermediate_size level (NOT blocksize)
-                if intermediate_size:
+                if not collect_only and intermediate_size:
                     result.splits[f'layer.{i}.Ud'] = align_dimension_split(
                         intermediate_size, ud_ratio, self.config.alignment
                     )
 
         return result
+
+    def compute_all_ratios(
+        self,
+        eval_dict: Dict[str, torch.Tensor],
+        kurtosis_dict: Optional[Dict[str, float]] = None,
+        model_config: Any = None,
+    ) -> AdaptiveRatioResult:
+        """
+        Compute adaptive ratios for all layers and transforms.
+
+        When hessian_log_scale or kurtosis_adaptive_thresholds is enabled,
+        uses a two-pass approach:
+        - Pass 1: Collect statistics (trace history, kurtosis values)
+        - Compute references from collected statistics
+        - Pass 2: Compute final ratios using calibrated references
+
+        Args:
+            eval_dict: Dictionary of eigenvalues from compute_basis()
+                Keys: 'attn_mlp', 'layer.{i}.self_attn.value',
+                      'layer.{i}.self_attn.key_pos', 'layer.{i}.mlp.down_proj'
+            kurtosis_dict: Dictionary of kurtosis values (optional)
+                Keys: Same as eval_dict
+            model_config: Model configuration for dimension info
+
+        Returns:
+            AdaptiveRatioResult with computed ratios and metrics
+        """
+        if self._needs_two_pass():
+            logger.info("Two-pass adaptive ratio: Pass 1/2 — collecting statistics...")
+            # Pass 1: collect statistics (trace history, kurtosis values)
+            self._run_pass(eval_dict, kurtosis_dict, model_config, collect_only=True)
+
+            # Compute references from collected statistics
+            logger.info("Two-pass adaptive ratio: Computing references from collected statistics...")
+            self._compute_references_from_history()
+
+            # Pass 2: compute final ratios with calibrated references
+            logger.info("Two-pass adaptive ratio: Pass 2/2 — computing final ratios...")
+            result = self._run_pass(eval_dict, kurtosis_dict, model_config, collect_only=False)
+            return result
+        else:
+            # Single pass (identical to previous behavior)
+            return self._run_pass(eval_dict, kurtosis_dict, model_config, collect_only=False)
 
     def _compute_ratio_for_key(
         self,

@@ -211,6 +211,16 @@ def parse_args():
                         help="Ratio threshold for down_proj quant type selection. "
                              "Layers with ratio < threshold use int4_hadamard, >= threshold use w8a8_dynamic. "
                              "Default: midpoint of (adaptive_min_ratio + adaptive_max_ratio) / 2")
+    parser.add_argument('--hessian_log_scale', type=cmd_bool, default=True,
+                        help="Use log-scale mapping for Hessian trace instead of sigmoid. "
+                             "Preserves inter-layer differences. Requires two-pass computation.")
+    parser.add_argument('--kurtosis_adaptive_thresholds', type=cmd_bool, default=True,
+                        help="Use data-driven percentile-based kurtosis thresholds instead of fixed [3, 10]. "
+                             "Requires two-pass computation.")
+    parser.add_argument('--kurtosis_percentile_low', type=float, default=10.0,
+                        help="Low percentile for adaptive kurtosis threshold (default: 10.0)")
+    parser.add_argument('--kurtosis_percentile_high', type=float, default=90.0,
+                        help="High percentile for adaptive kurtosis threshold (default: 90.0)")
     parser.add_argument('--mix_cfg', type=str, default=None,
                         help="JSON dict mapping layer name patterns to quant types: "
                              "'resq', 'w8a8_dynamic', 'int4_hadamard', or 'float'. "
@@ -607,6 +617,10 @@ def main():
         adaptive_ratio_path=args.adaptive_ratio_path,
         compute_kurtosis=args.compute_kurtosis,
         down_proj_ratio_threshold=args.down_proj_ratio_threshold,
+        hessian_log_scale=args.hessian_log_scale,
+        kurtosis_adaptive_thresholds=args.kurtosis_adaptive_thresholds,
+        kurtosis_percentile_low=args.kurtosis_percentile_low,
+        kurtosis_percentile_high=args.kurtosis_percentile_high,
         mix_cfg=mix_cfg,
     )
 

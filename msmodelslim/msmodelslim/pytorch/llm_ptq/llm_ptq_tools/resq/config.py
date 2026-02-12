@@ -61,6 +61,13 @@ class ResQConfig:
         # Compute kurtosis during basis computation (requires extra memory)
         self.compute_kurtosis = kwargs.get('compute_kurtosis', False)
 
+        # Hessian log-scale: use log mapping instead of sigmoid for better inter-layer differentiation
+        self.hessian_log_scale = kwargs.get('hessian_log_scale', True)
+        # Kurtosis adaptive thresholds: use data-driven percentile-based thresholds
+        self.kurtosis_adaptive_thresholds = kwargs.get('kurtosis_adaptive_thresholds', True)
+        self.kurtosis_percentile_low = kwargs.get('kurtosis_percentile_low', 10.0)
+        self.kurtosis_percentile_high = kwargs.get('kurtosis_percentile_high', 90.0)
+
         # Down projection ratio threshold for adaptive quantization type selection
         # When adaptive_ratio is enabled, down_proj layers with ratio < threshold use int4_hadamard,
         # and those with ratio >= threshold use w8a8_dynamic.
@@ -213,6 +220,11 @@ class ResQConfig:
                     f"Invalid transform key: {transform}. Valid keys: 'Ua', 'Ub', 'Uc', 'Ud'"
                 assert alg in valid_algorithms, \
                     f"Invalid algorithm for {transform}: {alg}. Valid options: {valid_algorithms}"
+            # Validate kurtosis adaptive threshold percentiles
+            if self.kurtosis_adaptive_thresholds:
+                assert 0.0 <= self.kurtosis_percentile_low < self.kurtosis_percentile_high <= 100.0, \
+                    f"kurtosis_percentile_low ({self.kurtosis_percentile_low}) must be < " \
+                    f"kurtosis_percentile_high ({self.kurtosis_percentile_high}), both in [0, 100]"
 
         # Validate remove_ub configuration
         assert isinstance(self.remove_ub, bool), \

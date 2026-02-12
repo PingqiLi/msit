@@ -504,10 +504,41 @@ class AdaptiveRatioComputer:
         return self.config.hessian_log_scale or self.config.kurtosis_adaptive_thresholds
 
     def _compute_references_from_history(self):
-        """Compute reference values from history for all algorithms."""
+        """Compute GLOBAL references from all transforms' histories."""
+        hessian_algs = []
+        kurtosis_algs = []
+
         for transform, algorithm in self.algorithms.items():
-            if hasattr(algorithm, 'compute_reference_from_history'):
-                algorithm.compute_reference_from_history()
+            if isinstance(algorithm, HybridAlgorithm):
+                hessian_algs.append((transform, algorithm.hessian_alg))
+                kurtosis_algs.append((transform, algorithm.kurtosis_alg))
+            elif isinstance(algorithm, HessianTraceAlgorithm):
+                hessian_algs.append((transform, algorithm))
+            elif isinstance(algorithm, KurtosisAlgorithm):
+                kurtosis_algs.append((transform, algorithm))
+
+        # Global hessian reference: pool traces from all transforms
+        all_traces = []
+        for transform, alg in hessian_algs:
+            all_traces.extend(alg._trace_history)
+
+        if all_traces:
+            global_ref = sum(all_traces) / len(all_traces)
+            logger.info(f"Global hessian reference_trace: {global_ref:.6f} "
+                        f"(from {len(all_traces)} entries across {len(hessian_algs)} transforms)")
+            for _, alg in hessian_algs:
+                alg.set_reference_trace(global_ref)
+
+        # Global kurtosis thresholds: pool kurtosis from all transforms
+        all_kurtosis = []
+        for transform, alg in kurtosis_algs:
+            all_kurtosis.extend(alg._kurtosis_history)
+
+        if all_kurtosis and self.config.kurtosis_adaptive_thresholds:
+            logger.info(f"Global kurtosis thresholds from {len(all_kurtosis)} values "
+                        f"across {len(kurtosis_algs)} transforms")
+            for _, alg in kurtosis_algs:
+                alg.set_adaptive_thresholds(all_kurtosis)
 
     def _run_pass(
         self,
@@ -549,18 +580,51 @@ class AdaptiveRatioComputer:
 
         # Compute Ua ratio (shared attn_mlp basis)
         if 'attn_mlp' in eval_dict:
-            ua_ratio, ua_metrics = self._compute_ratio_for_key(
-                'Ua', 'attn_mlp', eval_dict, kurtosis_dict, hidden_dim
-            )
-            result.ratios['Ua'] = ua_ratio
-            result.metrics['Ua'] = ua_metrics
-            result.algorithms_used['Ua'] = self.config.transform_algorithms.get(
-                'Ua', self.config.algorithm
-            )
-            if not collect_only and hidden_dim:
-                result.splits['Ua'] = align_dimension_split(
-                    hidden_dim, ua_ratio, self.config.alignment
+            per_layer_traces = eval_dict.get('attn_mlp_per_layer_traces')
+            per_layer_kurtosis = kurtosis_dict.get('attn_mlp') if kurtosis_dict else None
+
+            if collect_only and per_layer_traces:
+                # Pass 1: feed per-layer traces into Ua's history (64 entries)
+                algorithm = self.algorithms['Ua']
+                for i, trace in enumerate(per_layer_traces):
+                    layer_kurtosis = None
+                    if isinstance(per_layer_kurtosis, list) and i < len(per_layer_kurtosis):
+                        layer_kurtosis = per_layer_kurtosis[i]
+                    # Create a 1-element tensor whose sum/len equals the trace
+                    synthetic_evals = torch.tensor([trace])
+                    algorithm.compute_ratio(
+                        eigenvalues=synthetic_evals,
+                        kurtosis=layer_kurtosis,
+                        dim=hidden_dim
+                    )
+                # Placeholder ratio for pass 1
+                result.ratios['Ua'] = (self.config.min_ratio + self.config.max_ratio) / 2
+                result.metrics['Ua'] = {}
+                result.algorithms_used['Ua'] = self.config.transform_algorithms.get(
+                    'Ua', self.config.algorithm
                 )
+            else:
+                # Pass 2 or single-pass: use shared eigenvalues for actual ratio
+                ua_kurtosis_for_ratio = None
+                if isinstance(per_layer_kurtosis, list) and per_layer_kurtosis:
+                    ua_kurtosis_for_ratio = sum(per_layer_kurtosis) / len(per_layer_kurtosis)
+                elif isinstance(per_layer_kurtosis, (int, float)):
+                    ua_kurtosis_for_ratio = per_layer_kurtosis
+
+                ua_ratio, ua_metrics = self._compute_ratio_for_key(
+                    'Ua', 'attn_mlp', eval_dict,
+                    {'attn_mlp': ua_kurtosis_for_ratio} if ua_kurtosis_for_ratio is not None else kurtosis_dict,
+                    hidden_dim
+                )
+                result.ratios['Ua'] = ua_ratio
+                result.metrics['Ua'] = ua_metrics
+                result.algorithms_used['Ua'] = self.config.transform_algorithms.get(
+                    'Ua', self.config.algorithm
+                )
+                if hidden_dim:
+                    result.splits['Ua'] = align_dimension_split(
+                        hidden_dim, ua_ratio, self.config.alignment
+                    )
 
         # Compute per-layer ratios
         for i in range(nlayers):
@@ -568,7 +632,8 @@ class AdaptiveRatioComputer:
             value_key = f'layer.{i}.self_attn.value'
             if value_key in eval_dict:
                 ub_ratio, ub_metrics = self._compute_ub_ratio(
-                    i, eval_dict, kurtosis_dict, num_kv_heads, head_dim
+                    i, eval_dict, kurtosis_dict, num_kv_heads, head_dim,
+                    collect_only=collect_only
                 )
                 result.ratios[f'layer.{i}.Ub'] = ub_ratio
                 result.metrics[f'layer.{i}.Ub'] = ub_metrics
@@ -694,12 +759,15 @@ class AdaptiveRatioComputer:
         kurtosis_dict: Optional[Dict[str, float]],
         num_kv_heads: Optional[int],
         head_dim: Optional[int],
+        collect_only: bool = False,
     ) -> Tuple[float, Dict[str, float]]:
         """
         Compute Ub ratio with per-head aggregation.
 
-        Ub is per-head, so we compute ratios per head and aggregate
-        using max (conservative) or mean.
+        When collect_only=True (pass 1), selects the representative head and
+        calls compute_ratio once to add 1 history entry per layer.
+        When collect_only=False (pass 2 / single-pass), uses full per-head
+        computation with max/mean aggregation.
         """
         value_key = f'layer.{layer_idx}.self_attn.value'
         eigenvalues = eval_dict.get(value_key)
@@ -709,32 +777,61 @@ class AdaptiveRatioComputer:
 
         # Eigenvalues shape: [num_kv_heads, head_dim]
         if eigenvalues.dim() == 2:
-            # Per-head eigenvalues
-            per_head_ratios = []
             algorithm = self.algorithms['Ub']
 
-            for h in range(eigenvalues.shape[0]):
-                head_evals = eigenvalues[h]
-                kurtosis = None
+            if collect_only:
+                # Pass 1: select representative head, call compute_ratio once
+                # This gives 1 history entry per layer (64 total) instead of 512
+                per_head_traces = eigenvalues.sum(dim=1)  # [num_kv_heads]
+
+                if self.config.ub_head_aggregation == 'max':
+                    rep_head = per_head_traces.argmax().item()
+                else:  # 'mean'
+                    mean_trace = per_head_traces.mean()
+                    rep_head = (per_head_traces - mean_trace).abs().argmin().item()
+
+                rep_evals = eigenvalues[rep_head]
+                rep_kurtosis = None
                 if kurtosis_dict and value_key in kurtosis_dict:
                     kurtosis_data = kurtosis_dict[value_key]
                     if isinstance(kurtosis_data, (list, torch.Tensor)):
-                        kurtosis = kurtosis_data[h] if h < len(kurtosis_data) else None
+                        rep_kurtosis = kurtosis_data[rep_head] if rep_head < len(kurtosis_data) else None
                     else:
-                        kurtosis = kurtosis_data
+                        rep_kurtosis = kurtosis_data
 
-                head_ratio = algorithm.compute_ratio(
-                    eigenvalues=head_evals,
-                    kurtosis=kurtosis,
+                algorithm.compute_ratio(
+                    eigenvalues=rep_evals,
+                    kurtosis=rep_kurtosis,
                     dim=head_dim
                 )
-                per_head_ratios.append(head_ratio)
+                # Placeholder ratio for pass 1
+                ratio = (self.config.min_ratio + self.config.max_ratio) / 2
+            else:
+                # Pass 2 or single-pass: full per-head computation
+                per_head_ratios = []
 
-            # Aggregate across heads
-            if self.config.ub_head_aggregation == 'max':
-                ratio = max(per_head_ratios)
-            else:  # 'mean'
-                ratio = sum(per_head_ratios) / len(per_head_ratios)
+                for h in range(eigenvalues.shape[0]):
+                    head_evals = eigenvalues[h]
+                    kurtosis = None
+                    if kurtosis_dict and value_key in kurtosis_dict:
+                        kurtosis_data = kurtosis_dict[value_key]
+                        if isinstance(kurtosis_data, (list, torch.Tensor)):
+                            kurtosis = kurtosis_data[h] if h < len(kurtosis_data) else None
+                        else:
+                            kurtosis = kurtosis_data
+
+                    head_ratio = algorithm.compute_ratio(
+                        eigenvalues=head_evals,
+                        kurtosis=kurtosis,
+                        dim=head_dim
+                    )
+                    per_head_ratios.append(head_ratio)
+
+                # Aggregate across heads
+                if self.config.ub_head_aggregation == 'max':
+                    ratio = max(per_head_ratios)
+                else:  # 'mean'
+                    ratio = sum(per_head_ratios) / len(per_head_ratios)
         else:
             # Single eigenvalue set (already aggregated)
             kurtosis = kurtosis_dict.get(value_key) if kurtosis_dict else None

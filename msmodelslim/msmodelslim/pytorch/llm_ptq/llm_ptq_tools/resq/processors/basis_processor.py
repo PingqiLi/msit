@@ -611,6 +611,13 @@ def compute_basis(
     # Sum H_attn and H_mlp across all layers and merge
     H_attn_mlp_sum = (H_attn.sum(0) + H_mlp.sum(0)) / (2 * nlayers * normalizer)
 
+    # Compute per-layer normalized traces for adaptive ratio (cheap: diagonal sum only)
+    attn_mlp_per_layer_traces = []
+    for i in range(nlayers):
+        layer_cov = (H_attn[i] + H_mlp[i]) / (2 * normalizer)
+        per_layer_trace = layer_cov.trace().item() / hidden_dim  # normalized trace
+        attn_mlp_per_layer_traces.append(per_layer_trace)
+
     # Eigendecomposition for shared attn_mlp
     eval_attn_mlp, evec_attn_mlp = perform_eigen_decomp(
         H_attn_mlp_sum, damp_percent=0.01, device=eigen_device
@@ -619,6 +626,7 @@ def compute_basis(
     basis_dict['attn_mlp'] = evec_attn_mlp
     eval_dict['config'] = 'full_shared_rotation'
     eval_dict['attn_mlp'] = eval_attn_mlp
+    eval_dict['attn_mlp_per_layer_traces'] = attn_mlp_per_layer_traces
     logger.info(f"  Shared attn_mlp basis computed: {evec_attn_mlp.shape}")
 
     # Per-layer eigendecompositions for value, key_pos, down_proj
@@ -753,7 +761,10 @@ def _compute_kurtosis_from_accum(
                 # For simplicity, use: kurtosis ≈ (E[X^4] - (E[X^2])^2) / var^2
                 kurtosis = (mean_4th / (var ** 2 + eps)).mean().item() - 3
 
-                kurtosis_dict[f'attn_mlp'] = max(-10, min(100, kurtosis))  # Clamp extreme values
+                # Store per-layer kurtosis as a list (matching value projection pattern)
+                if 'attn_mlp' not in kurtosis_dict:
+                    kurtosis_dict['attn_mlp'] = []
+                kurtosis_dict['attn_mlp'].append(max(-10, min(100, kurtosis)))
 
         # Value output kurtosis (per-head, then aggregate)
         if 'value' in kurtosis_accum:

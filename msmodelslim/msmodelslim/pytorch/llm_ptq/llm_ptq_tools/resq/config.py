@@ -118,6 +118,7 @@ class ResQConfig:
         self.act_order = kwargs.get('act_order', False)
         self.nsamples = kwargs.get('nsamples', 128)
         self.gptq_blocksize = kwargs.get('gptq_blocksize', 128)  # Block size for GPTQ column processing
+        self.gptq_device = kwargs.get('gptq_device', None)  # Override device for GPTQ layer processing
 
         # Hadamard settings
         self.fp32_had = kwargs.get('fp32_had', True)

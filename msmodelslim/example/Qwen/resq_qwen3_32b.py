@@ -226,6 +226,18 @@ def parse_args():
                              "'resq', 'w8a8_dynamic', 'int4_hadamard', or 'float'. "
                              "Example: '{\"*.mlp.down_proj\": \"w8a8_dynamic\"}'")
 
+    # GPTQ parameters
+    parser.add_argument('--w_rtn', type=cmd_bool, default=True,
+                        help="RTN mode (default: True). Set to False for GPTQ mode.")
+    parser.add_argument('--percdamp', type=float, default=0.01,
+                        help="GPTQ dampening percentage (default: 0.01)")
+    parser.add_argument('--act_order', type=cmd_bool, default=False,
+                        help="GPTQ activation ordering (default: False)")
+    parser.add_argument('--gptq_blocksize', type=int, default=128,
+                        help="GPTQ block size (default: 128)")
+    parser.add_argument('--gptq_device', type=str, default=None,
+                        help="Override device for GPTQ layer processing (e.g., 'npu:0', 'npu:1')")
+
     # NPU memory configuration
     parser.add_argument('--max_memory_per_device', type=str, default=None,
                         help="Max memory per NPU device for model loading (e.g., '55GiB'). "
@@ -427,6 +439,12 @@ def main():
         print(f"  High fraction: {args.high_fraction} (fixed)")
         print(f"  Down proj: all layers use w8a8_dynamic (fixed mode)")
 
+    if not args.w_rtn:
+        print(f"  Quantization: GPTQ (percdamp={args.percdamp}, blocksize={args.gptq_blocksize}, act_order={args.act_order})")
+        if args.gptq_device:
+            print(f"  GPTQ device: {args.gptq_device}")
+    else:
+        print(f"  Quantization: RTN")
     print(f"  Device: {args.dev_type}:{args.dev_id}")
     print("")
     if args.basis_path:
@@ -622,6 +640,12 @@ def main():
         kurtosis_percentile_low=args.kurtosis_percentile_low,
         kurtosis_percentile_high=args.kurtosis_percentile_high,
         mix_cfg=mix_cfg,
+        # GPTQ parameters
+        w_rtn=args.w_rtn,
+        percdamp=args.percdamp,
+        act_order=args.act_order,
+        gptq_blocksize=args.gptq_blocksize,
+        gptq_device=args.gptq_device,
     )
 
     # Determine the device for layer-by-layer processing

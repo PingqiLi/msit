@@ -767,6 +767,19 @@ class ResQCalibrator:
         high_bits = self.cfg.high_bits
         low_bits = self.cfg.low_bits
 
+        # Remove accelerate hooks before moving to CPU (required for multi-NPU setups
+        # where dispatch hooks interfere with .cpu())
+        try:
+            from accelerate.hooks import remove_hook_from_module
+            for name, module in self.model.named_modules():
+                remove_hook_from_module(module, recurse=False)
+            self.logger.info("Removed accelerate hooks for GPTQ processing")
+        except Exception as e:
+            self.logger.debug(f"No accelerate hooks to remove: {e}")
+
+        if hasattr(self.model, 'hf_device_map'):
+            self.model.hf_device_map = None
+
         # Move model to CPU first
         self.model.cpu()
         cleanup_memory(verbos=False)
@@ -774,7 +787,11 @@ class ResQCalibrator:
         # ========== Step 1: Capture first layer inputs ==========
         self.logger.info("Capturing first layer inputs...")
 
-        embed_device = self._input_device
+        if hasattr(self.cfg, 'gptq_device') and self.cfg.gptq_device is not None:
+            embed_device = torch.device(self.cfg.gptq_device)
+            self.logger.info(f"Using configured GPTQ device: {embed_device}")
+        else:
+            embed_device = self._input_device
         if hasattr(self.model, 'model'):
             self.model.model.embed_tokens = self.model.model.embed_tokens.to(embed_device)
             if hasattr(self.model.model, 'rotary_emb'):
@@ -864,11 +881,17 @@ class ResQCalibrator:
             self.logger.info(f"\nLayer {layer_idx}:")
             layer = layers[layer_idx].to(embed_device)
 
-            # Find all LinearResQQuantizer modules in this layer
+            # Find all quantizer modules in this layer
             full = {}
+            w8a8_modules = {}
             for name, mod in layer.named_modules():
                 if isinstance(mod, LinearResQQuantizer):
                     full[name] = mod
+                elif isinstance(mod, LinearW8A8DynamicQuantizer):
+                    w8a8_modules[name] = mod
+
+            if w8a8_modules:
+                self.logger.info(f"  W8A8 layers (non-GPTQ): {list(w8a8_modules.keys())}")
 
             # Process each group of projections
             for names in sequential:
@@ -969,6 +992,11 @@ class ResQCalibrator:
                     mod.quant_weight.quantize_weight(mod.weight)
 
                     gptq[name].free()
+
+            # Quantize W8A8 layers (per-channel int8, no Hessian needed)
+            for w8_name, w8_mod in w8a8_modules.items():
+                w8_mod.quantize_weight()
+                self.logger.info(f"  Quantized W8A8: {w8_name}")
 
             # Run final forward through layer to get outputs for next layer
             for j in range(nsamples):

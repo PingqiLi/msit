@@ -238,17 +238,37 @@ class GPTQ:
         diag = torch.arange(self.columns, device=self.dev)
         H[diag, diag] += damp
 
+        # Cholesky operations - may not be supported on NPU, fallback to CPU
+        orig_device = H.device
         try:
             H = torch.linalg.cholesky(H)
             H = torch.cholesky_inverse(H)
             Hinv = torch.linalg.cholesky(H, upper=True)
         except RuntimeError as e:
-            logger.warning(f"Cholesky failed, adding epsilon: {e}")
-            epsilon = 1e-5
-            H = H + epsilon * torch.eye(H.size(0), device=H.device)
-            H = torch.linalg.cholesky(H)
-            H = torch.cholesky_inverse(H)
-            Hinv = torch.linalg.cholesky(H, upper=True)
+            if 'npu' in str(orig_device) or 'not implemented' in str(e).lower():
+                logger.info(f"Cholesky not supported on {orig_device}, falling back to CPU")
+                H_cpu = H.to('cpu') if H.device.type != 'cpu' else H
+                H_cpu = torch.linalg.cholesky(H_cpu)
+                H_cpu = torch.cholesky_inverse(H_cpu)
+                Hinv = torch.linalg.cholesky(H_cpu, upper=True).to(orig_device)
+                del H_cpu
+            else:
+                # Genuine numerical issue - add epsilon and retry
+                logger.warning(f"Cholesky failed, adding epsilon: {e}")
+                epsilon = 1e-5
+                H = H + epsilon * torch.eye(H.size(0), device=H.device)
+                try:
+                    H = torch.linalg.cholesky(H)
+                    H = torch.cholesky_inverse(H)
+                    Hinv = torch.linalg.cholesky(H, upper=True)
+                except RuntimeError:
+                    # Final fallback: CPU with epsilon
+                    logger.info(f"Cholesky retry failed on {orig_device}, falling back to CPU")
+                    H_cpu = H.to('cpu')
+                    H_cpu = torch.linalg.cholesky(H_cpu)
+                    H_cpu = torch.cholesky_inverse(H_cpu)
+                    Hinv = torch.linalg.cholesky(H_cpu, upper=True).to(orig_device)
+                    del H_cpu
 
         # Block-wise quantization with error compensation
         for i1 in range(0, self.columns, blocksize):

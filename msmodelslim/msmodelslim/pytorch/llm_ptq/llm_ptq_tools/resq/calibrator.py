@@ -965,6 +965,12 @@ class ResQCalibrator:
                 for name in subset:
                     handles.append(subset[name].register_forward_hook(make_add_batch(name)))
 
+                # Disable quantization during Hessian accumulation to prevent
+                # LinearResQQuantizer.forward() from deleting self.weight
+                for _, m in layer.named_modules():
+                    if isinstance(m, LinearResQQuantizer):
+                        m.is_enable = False
+
                 # Run forward passes to accumulate Hessian
                 for j in range(nsamples):
                     kwargs = {}
@@ -998,6 +1004,11 @@ class ResQCalibrator:
                     mod.quant_weight.quantize_weight(mod.weight)
 
                     gptq[name].free()
+
+                # Re-enable quantization after GPTQ processing
+                for _, m in layer.named_modules():
+                    if isinstance(m, LinearResQQuantizer):
+                        m.is_enable = True
 
             # Quantize W8A8 layers (per-channel int8, no Hessian needed)
             for w8_name, w8_mod in w8a8_modules.items():

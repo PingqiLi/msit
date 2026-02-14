@@ -823,6 +823,12 @@ class ResQCalibrator:
                 super().__init__()
                 self.module = module
 
+            def __getattr__(self, name):
+                try:
+                    return super().__getattr__(name)
+                except AttributeError:
+                    return getattr(self.module, name)
+
             def forward(self, inp, **kwargs):
                 inps[cache["i"]] = inp
                 cache["i"] += 1

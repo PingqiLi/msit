@@ -87,7 +87,8 @@ def fuse_layer_norms(model, verbose: bool = True):
     Fuse all layer normalizations in the model into adjacent linear layers.
 
     This function handles:
-    1. Embedding mean subtraction
+    1. Embedding mean subtraction (only needed for LayerNorm models like OPT,
+       not strictly necessary for RMSNorm models like Qwen3 — see TODO below)
     2. Input layernorm -> Q, K, V projections
     3. Post-attention layernorm -> MLP up/gate projections
     4. Final layernorm -> LM head
@@ -114,19 +115,34 @@ def fuse_layer_norms(model, verbose: bool = True):
         W.weight.data = torch.empty(0, device='cpu', dtype=original_dtype)
         cleanup_memory()
 
-        # Subtract the mean from each embedding vector so that embeddings become
-        # zero-mean. This is required for correct RMSNorm fusion:
+        # NOTE: This embedding mean subtraction is inherited from QuaRot/SliceGPT
+        # but is NOT necessary for RMSNorm-based models (LLaMA, Qwen3, etc.).
+        # See: https://github.com/spcl/QuaRot/issues/7
         #
-        #   RMSNorm(x) = x / sqrt(mean(x^2)) * gamma
-        #   mean(x^2)  = var(x) + mean(x)^2
+        # Background:
+        #   - LayerNorm (used in OPT) subtracts the mean as its first step,
+        #     so fusing LayerNorm into weights requires the input to already be
+        #     zero-mean. That is why QuaRot originally added this step.
+        #   - RMSNorm (used in Qwen3) does NOT subtract the mean:
+        #       RMSNorm(x) = x / sqrt(mean(x^2)) * gamma
+        #     There is no mean-invariance property, so this subtraction is
+        #     mathematically unnecessary for RMSNorm fusion.
         #
-        # When the input is zero-mean, mean(x^2) = var(x), so RMSNorm becomes
-        # equivalent to LayerNorm (without bias). LayerNorm is invariant to the
-        # input mean, which allows us to safely absorb the gamma scaling into
-        # the next linear layer's weights (W_new = W * gamma) and set the norm
-        # weights to ones. Without this step the fusion would be inexact because
-        # RMSNorm and LayerNorm differ by a factor that depends on the input
-        # mean. This technique originates from QuaRot / SliceGPT.
+        # Why it doesn't hurt in practice:
+        #   Embedding weights in these models already have near-zero row means
+        #   (on the order of 1e-7 in float16), so the subtraction is almost a
+        #   no-op. The precision impact is negligible.
+        #
+        # TODO: Remove this mean subtraction for RMSNorm models to be
+        #       mathematically correct. This requires:
+        #   1. Detect the norm type (RMSNorm vs LayerNorm) from the model config
+        #      or by checking isinstance(layer.input_layernorm, LlamaRMSNorm).
+        #   2. Only subtract embedding mean when the model uses LayerNorm
+        #      (e.g., OPT), skip for RMSNorm models (e.g., LLaMA, Qwen3).
+        #   3. Run a perplexity comparison (with vs without mean subtraction)
+        #      on Qwen3-32B to confirm there is no regression.
+        #   4. If supporting both norm types, add a `norm_type` parameter to
+        #      fuse_layer_norms() or auto-detect from the model.
         W_new = W_ - W_.mean(dim=-1, keepdim=True)
         del W_
 

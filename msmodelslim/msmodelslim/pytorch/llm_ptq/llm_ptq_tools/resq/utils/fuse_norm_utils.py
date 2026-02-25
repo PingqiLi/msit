@@ -114,7 +114,19 @@ def fuse_layer_norms(model, verbose: bool = True):
         W.weight.data = torch.empty(0, device='cpu', dtype=original_dtype)
         cleanup_memory()
 
-        # Process on CPU
+        # Subtract the mean from each embedding vector so that embeddings become
+        # zero-mean. This is required for correct RMSNorm fusion:
+        #
+        #   RMSNorm(x) = x / sqrt(mean(x^2)) * gamma
+        #   mean(x^2)  = var(x) + mean(x)^2
+        #
+        # When the input is zero-mean, mean(x^2) = var(x), so RMSNorm becomes
+        # equivalent to LayerNorm (without bias). LayerNorm is invariant to the
+        # input mean, which allows us to safely absorb the gamma scaling into
+        # the next linear layer's weights (W_new = W * gamma) and set the norm
+        # weights to ones. Without this step the fusion would be inexact because
+        # RMSNorm and LayerNorm differ by a factor that depends on the input
+        # mean. This technique originates from QuaRot / SliceGPT.
         W_new = W_ - W_.mean(dim=-1, keepdim=True)
         del W_
 

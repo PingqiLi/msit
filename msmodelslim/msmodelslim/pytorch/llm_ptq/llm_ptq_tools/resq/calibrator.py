@@ -1005,6 +1005,10 @@ class ResQCalibrator:
 
                     gptq[name].free()
 
+                # Release all GPTQ objects for this sequential group
+                del gptq
+                cleanup_memory(verbos=False)
+
                 # Re-enable quantization after GPTQ processing
                 for _, m in layer.named_modules():
                     if isinstance(m, LinearResQQuantizer):

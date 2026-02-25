@@ -211,12 +211,16 @@ class GPTQ:
                 self.quantizer.find_params(W_m)
             if self.high_quantizer is not None and not self.high_quantizer.ready() and self.high_bits_length > 0:
                 self.high_quantizer.find_params(W_h)
+            del W_m, W_h
         else:
             if not self.quantizer.ready():
                 self.quantizer.find_params(W)
 
         H = self.H
         del self.H
+
+        # Free original weight clone early — no longer needed after W is derived
+        del W_org
 
         # Handle dead columns (zero diagonal)
         dead = torch.diag(H) == 0
@@ -248,6 +252,8 @@ class GPTQ:
             if 'npu' in str(orig_device) or 'not implemented' in str(e).lower():
                 logger.info(f"Cholesky not supported on {orig_device}, falling back to CPU")
                 H_cpu = H.to('cpu') if H.device.type != 'cpu' else H
+                del H  # Free NPU H before allocating Hinv on NPU
+                cleanup_memory()
                 H_cpu = torch.linalg.cholesky(H_cpu)
                 H_cpu = torch.cholesky_inverse(H_cpu)
                 Hinv = torch.linalg.cholesky(H_cpu, upper=True).to(orig_device)
@@ -265,6 +271,8 @@ class GPTQ:
                     # Final fallback: CPU with epsilon
                     logger.info(f"Cholesky retry failed on {orig_device}, falling back to CPU")
                     H_cpu = H.to('cpu')
+                    del H  # Free NPU H before allocating Hinv on NPU
+                    cleanup_memory()
                     H_cpu = torch.linalg.cholesky(H_cpu)
                     H_cpu = torch.cholesky_inverse(H_cpu)
                     Hinv = torch.linalg.cholesky(H_cpu, upper=True).to(orig_device)
@@ -306,6 +314,10 @@ class GPTQ:
             Q[:, i1:i2] = Q1
             W[:, i2:] -= Err1.matmul(Hinv[i1:i2, i2:])
 
+        # Free large intermediates after block-wise loop
+        del W, Hinv
+        cleanup_memory()
+
         # Revert column order if actorder was used
         if actorder and invperm is not None:
             Q = Q[:, invperm]
@@ -320,8 +332,11 @@ class GPTQ:
             raise ValueError("NaN in weights after GPTQ quantization")
 
     def free(self) -> None:
-        """Free memory used by GPTQ."""
+        """Free memory used by GPTQ (Hessian, wrapper, and quantizers)."""
         self.H = None
+        self.layer = None
+        self.quantizer = None
+        self.high_quantizer = None
         cleanup_memory()
 
 

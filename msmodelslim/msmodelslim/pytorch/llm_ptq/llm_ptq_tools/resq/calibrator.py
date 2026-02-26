@@ -1033,6 +1033,17 @@ class ResQCalibrator:
 
             # Move layer back to CPU
             layers[layer_idx] = layer.cpu()
+
+            # nn.Module.cpu() only moves Parameters and registered buffers.
+            # Quantizers store int8 weights, scales, and dequantized tensors as
+            # plain attributes (not nn.Parameter/register_buffer), so they stay
+            # on NPU.  Move them explicitly to prevent cross-layer memory leak.
+            for _, mod in layer.named_modules():
+                for attr_name in list(vars(mod).keys()):
+                    val = getattr(mod, attr_name, None)
+                    if isinstance(val, torch.Tensor) and val.device.type != 'cpu':
+                        setattr(mod, attr_name, val.cpu())
+
             cleanup_memory(verbos=False)
 
             # Swap inputs and outputs for next layer

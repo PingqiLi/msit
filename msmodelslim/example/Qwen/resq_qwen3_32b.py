@@ -531,7 +531,7 @@ def main():
             trust_remote_code=args.trust_remote_code,
             device_map="auto",
             torch_dtype="auto",
-            attn_implementation='eager',
+            attn_implementation='sdpa',
         )
         if npu_max_memory is not None:
             load_kwargs["max_memory"] = npu_max_memory
@@ -768,7 +768,7 @@ def main():
             trust_remote_code=args.trust_remote_code,
             device_map="auto",
             torch_dtype="auto",
-            attn_implementation='eager',
+            attn_implementation='sdpa',
         )
         if npu_max_memory is not None:
             reload_kwargs["max_memory"] = npu_max_memory

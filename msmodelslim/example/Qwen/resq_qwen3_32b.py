@@ -108,6 +108,42 @@ from msmodelslim.pytorch.llm_ptq.llm_ptq_tools.resq import (
 from msmodelslim.pytorch.llm_ptq.llm_ptq_tools.resq.processors.basis_processor import save_basis
 
 
+def _patch_eager_mask_for_npu():
+    """Fix eager_mask torch.where crash on NPU.
+
+    The original eager_mask passes a Python float scalar as the third arg to
+    torch.where, which triggers a broken AICPU Index kernel on NPU.
+    Wrapping it in torch.tensor() fixes the issue.
+    """
+    from transformers.masking_utils import (
+        ALL_MASK_ATTENTION_FUNCTIONS, sdpa_mask, causal_mask_function,
+    )
+
+    def _patched_eager_mask(
+        batch_size, cache_position, kv_length, kv_offset=0,
+        mask_function=causal_mask_function, attention_mask=None,
+        dtype=torch.float32, **kwargs,
+    ):
+        _ = kwargs.pop("allow_is_causal_skip", None)
+        mask = sdpa_mask(
+            batch_size=batch_size, cache_position=cache_position,
+            kv_length=kv_length, kv_offset=kv_offset,
+            mask_function=mask_function, attention_mask=attention_mask,
+            allow_is_causal_skip=False, allow_torch_fix=False, **kwargs,
+        )
+        min_dtype = torch.finfo(dtype).min
+        mask = torch.where(
+            mask,
+            torch.tensor(0.0, device=mask.device, dtype=dtype),
+            torch.tensor(min_dtype, device=mask.device, dtype=dtype),
+        )
+        return mask
+
+    ALL_MASK_ATTENTION_FUNCTIONS['eager'] = _patched_eager_mask
+
+_patch_eager_mask_for_npu()
+
+
 def seed_everything(seed=0) -> None:
     """Set random seeds for reproducibility."""
     random.seed(seed)
@@ -531,7 +567,7 @@ def main():
             trust_remote_code=args.trust_remote_code,
             device_map="auto",
             torch_dtype="auto",
-            attn_implementation='sdpa',
+            attn_implementation='eager',
         )
         if npu_max_memory is not None:
             load_kwargs["max_memory"] = npu_max_memory
@@ -768,7 +804,7 @@ def main():
             trust_remote_code=args.trust_remote_code,
             device_map="auto",
             torch_dtype="auto",
-            attn_implementation='sdpa',
+            attn_implementation='eager',
         )
         if npu_max_memory is not None:
             reload_kwargs["max_memory"] = npu_max_memory

@@ -497,7 +497,7 @@ class LinearW8A8DynamicQuantizer(nn.Module):
         # weight_scale: reshape to [out_features, 1] for 2D per-channel format
         # weight_offset: zeros tensor for symmetric quantization
         weight_scale_2d = self.weight_scale.unsqueeze(-1)  # [out_features] -> [out_features, 1]
-        weight_offset = torch.zeros_like(weight_scale_2d, dtype=torch.int8)  # zeros for symmetric
+        weight_offset = torch.zeros_like(weight_scale_2d, dtype=torch.bfloat16)  # zeros for symmetric
         return {
             'weight': self.weight_quant.cpu(),
             'weight_scale': weight_scale_2d.cpu(),

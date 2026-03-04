@@ -521,47 +521,49 @@ class ResQCalibrator:
         """
         Compute scaled dimension splits for actual weight dimensions.
 
-        The adaptive ratio computation works on transform dimensions (head_dim, blocksize),
-        but the actual weights have different dimensions that need proper scaling:
-        - Ua: hidden_dim → hidden_dim (1:1, direct mapping)
-        - Ub: head_dim → num_heads × head_dim (scale by num_heads)
-        - Uc: head_dim → num_kv_heads × head_dim (scale by num_kv_heads)
-        - Ud: blocksize → intermediate_size (scale by num_blocks)
+        The adaptive ratio computation works on transform dimensions (head_dim,
+        blocksize), but actual weights have larger dimensions. This method
+        scales splits and re-aligns at the full dimension level.
 
-        Args:
-            model: The transformer model
-
-        Returns:
-            Dictionary mapping transform keys to (low_dim, high_dim) tuples
-            for actual weight dimensions
+        Alignment is only applied when the full dimension is divisible by the
+        alignment boundary; otherwise the unaligned scaled split is kept as-is.
         """
         if self.splits_dict is None:
             return None
+
+        from .processors.adaptive_ratio import align_dimension_split
 
         config = model.config
         hidden_size = config.hidden_size
         num_heads = config.num_attention_heads
         num_kv_heads = getattr(config, 'num_key_value_heads', num_heads)
         head_dim = getattr(config, 'head_dim', hidden_size // num_heads)
-        intermediate_size = config.intermediate_size
-        blocksize = getattr(self.cfg, 'down_proj_blocksize', 256)
+        alignment = self.cfg.adaptive_alignment
 
         scaled_splits = {}
 
         for key, (low_dim, high_dim) in self.splits_dict.items():
             if key == 'Ua':
-                # Direct mapping (hidden_dim → hidden_dim)
                 scaled_splits[key] = (low_dim, high_dim)
             elif key.endswith('.Ub'):
-                # Scale by num_heads (head_dim → num_heads * head_dim)
-                # Note: o_proj input is num_attention_heads * head_dim
-                scale_factor = num_heads  # For o_proj input dimension
-                scaled_splits[key] = (low_dim * scale_factor, high_dim * scale_factor)
+                full_dim = num_heads * head_dim
+                fraction = high_dim / (low_dim + high_dim)
+                if full_dim % alignment == 0:
+                    scaled_splits[key] = align_dimension_split(
+                        full_dim, fraction, alignment)
+                else:
+                    scaled_splits[key] = (
+                        low_dim * num_heads, high_dim * num_heads)
             elif key.endswith('.Uc'):
-                # Uc is for key position - scales by num_kv_heads for k_proj output
-                scaled_splits[key] = (low_dim * num_kv_heads, high_dim * num_kv_heads)
+                full_dim = num_kv_heads * head_dim
+                fraction = high_dim / (low_dim + high_dim)
+                if full_dim % alignment == 0:
+                    scaled_splits[key] = align_dimension_split(
+                        full_dim, fraction, alignment)
+                else:
+                    scaled_splits[key] = (
+                        low_dim * num_kv_heads, high_dim * num_kv_heads)
             elif key.endswith('.Ud'):
-                # Ud splits are already computed at intermediate_size level, no scaling needed
                 scaled_splits[key] = (low_dim, high_dim)
 
         return scaled_splits
@@ -570,20 +572,16 @@ class ResQCalibrator:
         """
         Compute and set quantization types for down_proj layers based on adaptive ratios.
 
-        For fixed mode (adaptive_ratio=False):
-            All down_proj layers use w8a8_dynamic quantization.
+        User-provided mix_cfg patterns take precedence over adaptive decisions.
+        For layers not covered by mix_cfg:
 
-        For adaptive modes (adaptive_ratio=True):
-            Based on per-layer Ud ratio value:
-            - ratio < threshold: int4_hadamard (pure int4 with Hadamard transform fused into weights)
-            - ratio >= threshold: w8a8_dynamic quantization
+        - Fixed mode (adaptive_ratio=False): w8a8_dynamic
+        - Adaptive mode: ratio < threshold → int4_hadamard, else w8a8_dynamic
 
-        The threshold is determined by down_proj_ratio_threshold config, or defaults to
-        the midpoint of (adaptive_min_ratio + adaptive_max_ratio) / 2.
-
-        Args:
-            model: The transformer model
+        The threshold defaults to (adaptive_min_ratio + adaptive_max_ratio) / 2.
         """
+        import fnmatch
+
         num_layers = model.config.num_hidden_layers
 
         # Determine threshold
@@ -594,24 +592,32 @@ class ResQCalibrator:
         else:
             self.logger.info(f"Using configured down_proj ratio threshold: {threshold:.4f}")
 
-        if not self.cfg.adaptive_ratio:
-            # Fixed mode: all down_proj use w8a8_dynamic
-            self.logger.info("Fixed ratio mode: Setting all down_proj to w8a8_dynamic")
-            for i in range(num_layers):
-                layer_key = f'model.layers.{i}.mlp.down_proj'
-                self.cfg.mix_cfg[layer_key] = 'w8a8_dynamic'
-            self.logger.info(f"Set {num_layers} down_proj layers to w8a8_dynamic")
-        else:
-            # Adaptive mode: use ratio threshold to decide between int4_hadamard and w8a8_dynamic
-            int4_count = 0
-            w8a8_count = 0
+        int4_count = 0
+        w8a8_count = 0
+        user_count = 0
 
-            for i in range(num_layers):
-                # Get the Ud ratio for this layer
+        for i in range(num_layers):
+            layer_key = f'model.layers.{i}.mlp.down_proj'
+
+            # Check if user explicitly specified quant type via mix_cfg pattern
+            user_type = None
+            for pattern, qtype in self.cfg.mix_cfg.items():
+                if fnmatch.fnmatchcase(layer_key, pattern):
+                    user_type = qtype.lower()
+                    break
+
+            if user_type is not None:
+                # User directive takes precedence — expand to exact key
+                self.cfg.mix_cfg[layer_key] = user_type
+                user_count += 1
+            elif not self.cfg.adaptive_ratio:
+                # Fixed mode fallback
+                self.cfg.mix_cfg[layer_key] = 'w8a8_dynamic'
+                w8a8_count += 1
+            else:
+                # Adaptive mode: decide based on Ud ratio
                 ud_key = f'layer.{i}.Ud'
                 ratio = self.ratio_dict.get(ud_key, self.cfg.high_fraction) if self.ratio_dict else self.cfg.high_fraction
-
-                layer_key = f'model.layers.{i}.mlp.down_proj'
                 if ratio < threshold:
                     self.cfg.mix_cfg[layer_key] = 'int4_hadamard'
                     int4_count += 1
@@ -619,9 +625,10 @@ class ResQCalibrator:
                     self.cfg.mix_cfg[layer_key] = 'w8a8_dynamic'
                     w8a8_count += 1
 
-            self.logger.info(f"Adaptive down_proj quant types (threshold={threshold:.4f}):")
-            self.logger.info(f"  int4_hadamard: {int4_count} layers")
-            self.logger.info(f"  w8a8_dynamic: {w8a8_count} layers")
+        self.logger.info(
+            f"down_proj quant types: {user_count} user-specified, "
+            f"{int4_count} int4_hadamard, {w8a8_count} w8a8_dynamic"
+        )
 
     @torch.no_grad()
     def run(self) -> None:
@@ -1305,6 +1312,11 @@ class ResQCalibrator:
             "high_fraction": self.cfg.high_fraction,
             "group_size": getattr(self.cfg, 'w_groupsize', -1),
             "version": "1.0",
+            "resq_config": {
+                "ud_rotation_type": self.cfg.ud_rotation_type,
+                "down_proj_blocksize": self.cfg.down_proj_blocksize,
+                "remove_ub": self.cfg.remove_ub,
+            },
         }
 
         # Save model.embed_tokens.weight (already rotated with Ua)
@@ -1477,21 +1489,35 @@ class ResQCalibrator:
             blocksize = self.cfg.down_proj_blocksize
             ud_rotation_type = self.cfg.ud_rotation_type
 
+            # Check actual quantizer types to decide which rotation
+            # keys to save. This is the ground truth — add_resq_quantizers()
+            # already resolved fnmatch patterns in mix_cfg correctly.
+            layers_needing_down_rotation = set()
+            for i in range(nlayers):
+                dp = self.model.model.layers[i].mlp.down_proj
+                if isinstance(dp, LinearResQQuantizer):
+                    layers_needing_down_rotation.add(i)
+
             # Per-layer Uc: key_pos @ R2 (for K cache rotation after RoPE)
+            # Ub and Uc are both part of the attention head-dim rotation
+            # scheme; removing one without the other is meaningless.
             if self.basis_dict is not None:
-                for i in range(nlayers):
-                    key = f'layer.{i}.self_attn.key_pos'
-                    if key in self.basis_dict:
-                        U_key_pos = self.basis_dict[key].to(torch.float64)
-                        if R2 is not None:
-                            # U_key_pos can be per-head [num_kv_heads, head_dim, head_dim] or shared [head_dim, head_dim]
-                            Uc = torch.matmul(U_key_pos, R2)
-                            weight_dict[f'resq.layer.{i}.Uc'] = Uc.float().cpu()
-                            quant_description[f'resq.layer.{i}.Uc'] = "FLOAT"
-                        else:
-                            weight_dict[f'resq.layer.{i}.Uc'] = U_key_pos.float().cpu()
-                            quant_description[f'resq.layer.{i}.Uc'] = "FLOAT"
-                self.logger.info(f"  Saved {nlayers} per-layer Uc matrices (key_pos @ R2)")
+                if not self.cfg.remove_ub:
+                    for i in range(nlayers):
+                        key = f'layer.{i}.self_attn.key_pos'
+                        if key in self.basis_dict:
+                            U_key_pos = self.basis_dict[key].to(torch.float64)
+                            if R2 is not None:
+                                # U_key_pos can be per-head [num_kv_heads, head_dim, head_dim] or shared [head_dim, head_dim]
+                                Uc = torch.matmul(U_key_pos, R2)
+                                weight_dict[f'resq.layer.{i}.Uc'] = Uc.float().cpu()
+                                quant_description[f'resq.layer.{i}.Uc'] = "FLOAT"
+                            else:
+                                weight_dict[f'resq.layer.{i}.Uc'] = U_key_pos.float().cpu()
+                                quant_description[f'resq.layer.{i}.Uc'] = "FLOAT"
+                    self.logger.info(f"  Saved {nlayers} per-layer Uc matrices (key_pos @ R2)")
+                else:
+                    self.logger.info("  Skipped Uc saving (remove_ub=True)")
 
                 # Per-layer Ud: save based on ud_rotation_type
                 if ud_rotation_type == 'hadamard':
@@ -1501,10 +1527,8 @@ class ResQCalibrator:
                     # Save Pd per layer (only for layers that need rotation)
                     pd_saved_count = 0
                     for i in range(nlayers):
-                        layer_key = f'model.layers.{i}.mlp.down_proj'
-                        quant_type = self.cfg.mix_cfg.get(layer_key, 'resq')
-                        if quant_type in ('w8a8_dynamic', 'float'):
-                            continue  # These quant types don't use Pd rotation
+                        if i not in layers_needing_down_rotation:
+                            continue
                         key = f'layer.{i}.mlp.down_proj'
                         if key in self.basis_dict:
                             Pd = self.basis_dict[key].to(torch.float64)
@@ -1513,16 +1537,17 @@ class ResQCalibrator:
                             pd_saved_count += 1
                     self.logger.info(f"    Saved {pd_saved_count}/{nlayers} per-layer Pd matrices [{blocksize}x{blocksize}]")
 
-                    # Save global Hadamard info
-                    hadK = self.rotation_dict.get('Hd')
-                    K = self.rotation_dict.get('Hd_K', 1)
-                    if hadK is not None:
-                        weight_dict['resq.Hd'] = hadK.float().cpu().contiguous()
-                        quant_description['resq.Hd'] = "FLOAT"
-                        self.logger.info(f"    Saved resq.Hd [{hadK.shape[0]}x{hadK.shape[1]}]")
-                    # Note: Hd_K, intermediate_size, and down_proj_blocksize are NOT saved to safetensors
-                    # These metadata values should be stored in JSON config, not in the weight file
-                    self.logger.info(f"    Hd_K = {K} (not saved to safetensors, use config)")
+                    # Save global Hadamard info only if Pd was saved
+                    if pd_saved_count > 0:
+                        hadK = self.rotation_dict.get('Hd')
+                        K = self.rotation_dict.get('Hd_K', 1)
+                        if hadK is not None:
+                            weight_dict['resq.Hd'] = hadK.float().cpu().contiguous()
+                            quant_description['resq.Hd'] = "FLOAT"
+                            self.logger.info(f"    Saved resq.Hd [{hadK.shape[0]}x{hadK.shape[1]}]")
+                        # Note: Hd_K, intermediate_size, and down_proj_blocksize are NOT saved to safetensors
+                        # These metadata values should be stored in JSON config, not in the weight file
+                        self.logger.info(f"    Hd_K = {K} (not saved to safetensors, use config)")
 
                 else:  # 'random' mode
                     # Random mode: compute and save full Ud = block_diag(Pd) @ Rd per layer
@@ -1537,10 +1562,8 @@ class ResQCalibrator:
 
                         ud_saved_count = 0
                         for i in range(nlayers):
-                            layer_key = f'model.layers.{i}.mlp.down_proj'
-                            quant_type = self.cfg.mix_cfg.get(layer_key, 'resq')
-                            if quant_type in ('w8a8_dynamic', 'float'):
-                                continue  # These quant types don't use Ud rotation
+                            if i not in layers_needing_down_rotation:
+                                continue
                             key = f'layer.{i}.mlp.down_proj'
                             if key in self.basis_dict:
                                 Pd = self.basis_dict[key].to(torch.float64)

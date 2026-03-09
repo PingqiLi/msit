@@ -257,7 +257,8 @@ class ResQCalibrator:
             if not self.cfg.should_skip_fusion:
                 # Rearrange columns for mixed-precision layout (only when basis is available)
                 self.logger.info("Rearranging columns for mixed precision...")
-                rearrange_columns(model, self.cfg, training=False, ratio_dict=self.ratio_dict)
+                rearrange_columns(model, self.cfg, training=False, ratio_dict=self.ratio_dict,
+                                  scaled_splits_dict=self.scaled_splits_dict)
                 cleanup_memory(verbos=False)
 
         # Skip quantizer addition in transform-only mode
@@ -570,30 +571,20 @@ class ResQCalibrator:
 
     def _compute_down_proj_quant_types(self, model: nn.Module) -> None:
         """
-        Compute and set quantization types for down_proj layers based on adaptive ratios.
+        Set quantization types for down_proj layers.
 
-        User-provided mix_cfg patterns take precedence over adaptive decisions.
+        User-provided mix_cfg patterns take precedence.
         For layers not covered by mix_cfg:
 
-        - Fixed mode (adaptive_ratio=False): w8a8_dynamic
-        - Adaptive mode: ratio < threshold → int4_hadamard, else w8a8_dynamic
-
-        The threshold defaults to (adaptive_min_ratio + adaptive_max_ratio) / 2.
+        - Fixed mode (adaptive_ratio=False): no override, stays default 'resq'
+        - Adaptive mode: always w8a8_dynamic
         """
         import fnmatch
 
         num_layers = model.config.num_hidden_layers
 
-        # Determine threshold
-        threshold = self.cfg.down_proj_ratio_threshold
-        if threshold is None:
-            threshold = (self.cfg.adaptive_min_ratio + self.cfg.adaptive_max_ratio) / 2
-            self.logger.info(f"Using default down_proj ratio threshold: {threshold:.4f}")
-        else:
-            self.logger.info(f"Using configured down_proj ratio threshold: {threshold:.4f}")
-
-        int4_count = 0
         w8a8_count = 0
+        resq_count = 0
         user_count = 0
 
         for i in range(num_layers):
@@ -610,24 +601,17 @@ class ResQCalibrator:
                 # User directive takes precedence — expand to exact key
                 self.cfg.mix_cfg[layer_key] = user_type
                 user_count += 1
-            elif not self.cfg.adaptive_ratio:
-                # Fixed mode fallback
+            elif self.cfg.adaptive_ratio:
+                # Adaptive mode: down_proj always uses w8a8_dynamic
                 self.cfg.mix_cfg[layer_key] = 'w8a8_dynamic'
                 w8a8_count += 1
             else:
-                # Adaptive mode: decide based on Ud ratio
-                ud_key = f'layer.{i}.Ud'
-                ratio = self.ratio_dict.get(ud_key, self.cfg.high_fraction) if self.ratio_dict else self.cfg.high_fraction
-                if ratio < threshold:
-                    self.cfg.mix_cfg[layer_key] = 'int4_hadamard'
-                    int4_count += 1
-                else:
-                    self.cfg.mix_cfg[layer_key] = 'w8a8_dynamic'
-                    w8a8_count += 1
+                # Fixed mode: no override — down_proj uses default 'resq'
+                resq_count += 1
 
         self.logger.info(
             f"down_proj quant types: {user_count} user-specified, "
-            f"{int4_count} int4_hadamard, {w8a8_count} w8a8_dynamic"
+            f"{w8a8_count} w8a8_dynamic, {resq_count} resq (default)"
         )
 
     @torch.no_grad()
@@ -1466,17 +1450,15 @@ class ResQCalibrator:
                     weight_dict[f"{name}.bias"] = bias
                     quant_description[f"{name}.bias"] = "FLOAT"
 
-        # Save online rotation matrices following original ResQ
-        # Per-layer online projections:
-        # - Uc: layer.{i}.self_attn.key_pos @ R2 (for K cache rotation after RoPE)
-        # - Ud: depends on ud_rotation_type:
-        #   - 'hadamard': save Pd per layer + Hd globally (runtime: act @ block_diag(Pd) @ H)
-        #   - 'random': save full Ud = block_diag(Pd) @ Rd per layer (runtime: act @ Ud)
-        # Note: All other U matrices (attn_mlp, value, etc.) are merged into weights
-        if self.rotation_dict is not None and not self._use_simplified_mode:
+        # Save online rotation matrices (Uc, Pd, Hd, Ud) only when
+        # explicitly requested via save_online_rotations=True.
+        # Default (False) produces inference-ready checkpoints that
+        # vLLM can load directly (resq.* keys crash AutoWeightsLoader).
+        if (self.rotation_dict is not None
+                and not self._use_simplified_mode
+                and self.cfg.save_online_rotations):
             self.logger.info("Saving online rotation matrices (Uc, Ud)...")
 
-            # Build full R2 rotation matrix for head dimension
             R2_1 = self.rotation_dict.get('R2_1')
             R2_2 = self.rotation_dict.get('R2_2')
 
@@ -1489,42 +1471,40 @@ class ResQCalibrator:
             blocksize = self.cfg.down_proj_blocksize
             ud_rotation_type = self.cfg.ud_rotation_type
 
-            # Check actual quantizer types to decide which rotation
-            # keys to save. This is the ground truth — add_resq_quantizers()
-            # already resolved fnmatch patterns in mix_cfg correctly.
             layers_needing_down_rotation = set()
+            layers_needing_attn_rotation = set()
             for i in range(nlayers):
                 dp = self.model.model.layers[i].mlp.down_proj
                 if isinstance(dp, LinearResQQuantizer):
                     layers_needing_down_rotation.add(i)
+                op = self.model.model.layers[i].self_attn.o_proj
+                if isinstance(op, LinearResQQuantizer):
+                    layers_needing_attn_rotation.add(i)
 
-            # Per-layer Uc: key_pos @ R2 (for K cache rotation after RoPE)
-            # Ub and Uc are both part of the attention head-dim rotation
-            # scheme; removing one without the other is meaningless.
             if self.basis_dict is not None:
                 if not self.cfg.remove_ub:
+                    uc_saved_count = 0
                     for i in range(nlayers):
+                        if i not in layers_needing_attn_rotation:
+                            continue
                         key = f'layer.{i}.self_attn.key_pos'
                         if key in self.basis_dict:
                             U_key_pos = self.basis_dict[key].to(torch.float64)
                             if R2 is not None:
-                                # U_key_pos can be per-head [num_kv_heads, head_dim, head_dim] or shared [head_dim, head_dim]
                                 Uc = torch.matmul(U_key_pos, R2)
                                 weight_dict[f'resq.layer.{i}.Uc'] = Uc.float().cpu()
                                 quant_description[f'resq.layer.{i}.Uc'] = "FLOAT"
                             else:
                                 weight_dict[f'resq.layer.{i}.Uc'] = U_key_pos.float().cpu()
                                 quant_description[f'resq.layer.{i}.Uc'] = "FLOAT"
-                    self.logger.info(f"  Saved {nlayers} per-layer Uc matrices (key_pos @ R2)")
+                            uc_saved_count += 1
+                    self.logger.info(f"  Saved {uc_saved_count}/{nlayers} per-layer Uc matrices (key_pos @ R2)")
                 else:
                     self.logger.info("  Skipped Uc saving (remove_ub=True)")
 
-                # Per-layer Ud: save based on ud_rotation_type
                 if ud_rotation_type == 'hadamard':
-                    # Hadamard mode: save Pd per layer [blocksize, blocksize] + Hd globally
                     self.logger.info(f"  Saving Ud in Hadamard mode (Pd per layer + Hd globally)")
 
-                    # Save Pd per layer (only for layers that need rotation)
                     pd_saved_count = 0
                     for i in range(nlayers):
                         if i not in layers_needing_down_rotation:
@@ -1537,7 +1517,6 @@ class ResQCalibrator:
                             pd_saved_count += 1
                     self.logger.info(f"    Saved {pd_saved_count}/{nlayers} per-layer Pd matrices [{blocksize}x{blocksize}]")
 
-                    # Save global Hadamard info only if Pd was saved
                     if pd_saved_count > 0:
                         hadK = self.rotation_dict.get('Hd')
                         K = self.rotation_dict.get('Hd_K', 1)
@@ -1545,12 +1524,9 @@ class ResQCalibrator:
                             weight_dict['resq.Hd'] = hadK.float().cpu().contiguous()
                             quant_description['resq.Hd'] = "FLOAT"
                             self.logger.info(f"    Saved resq.Hd [{hadK.shape[0]}x{hadK.shape[1]}]")
-                        # Note: Hd_K, intermediate_size, and down_proj_blocksize are NOT saved to safetensors
-                        # These metadata values should be stored in JSON config, not in the weight file
                         self.logger.info(f"    Hd_K = {K} (not saved to safetensors, use config)")
 
                 else:  # 'random' mode
-                    # Random mode: compute and save full Ud = block_diag(Pd) @ Rd per layer
                     self.logger.info(f"  Saving Ud in random mode (full Ud per layer)")
 
                     Rd = self.rotation_dict.get('Rd')
@@ -1568,13 +1544,10 @@ class ResQCalibrator:
                             if key in self.basis_dict:
                                 Pd = self.basis_dict[key].to(torch.float64)
 
-                                # Build full Ud = block_diag(Pd) @ Rd
-                                # Efficient: apply Pd block-wise to Rd
                                 Ud = torch.zeros(intermediate_size, intermediate_size, dtype=torch.float64)
                                 for b in range(num_blocks):
                                     start_idx = b * blocksize
                                     end_idx = (b + 1) * blocksize
-                                    # Ud[start:end, :] = Pd @ Rd[start:end, :]
                                     Ud[start_idx:end_idx, :] = torch.matmul(Pd, Rd[start_idx:end_idx, :])
 
                                 weight_dict[f'resq.layer.{i}.Ud'] = Ud.float().cpu()
@@ -1584,10 +1557,16 @@ class ResQCalibrator:
                         self.logger.info(f"    Saved {ud_saved_count}/{nlayers} per-layer Ud matrices [{intermediate_size}x{intermediate_size}]")
 
             elif R2 is not None:
-                # Simplified mode: save R2 as shared Uc
                 weight_dict['resq.R2'] = R2.float().cpu()
                 quant_description['resq.R2'] = "FLOAT"
                 self.logger.info(f"  R2 shape: {R2.shape} (simplified mode)")
+        elif (self.rotation_dict is not None
+                and not self._use_simplified_mode
+                and not self.cfg.save_online_rotations):
+            self.logger.info(
+                "Skipping online rotation matrices (save_online_rotations=False). "
+                "Checkpoint is inference-ready for vLLM."
+            )
 
         # Save using SafeTensors
         if "safe_tensor" in save_type:

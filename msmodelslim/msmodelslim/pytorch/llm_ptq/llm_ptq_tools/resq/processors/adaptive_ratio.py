@@ -109,8 +109,8 @@ def align_dimension_split(
     else:
         raise ValueError(f"Unknown alignment mode: {mode}")
 
-    # Ensure high_dim is within valid range
-    high_dim = max(0, min(dim, high_dim))
+    # Ensure high_dim is at least one alignment block (never 0)
+    high_dim = max(alignment, min(dim, high_dim))
     low_dim = dim - high_dim
 
     return low_dim, high_dim

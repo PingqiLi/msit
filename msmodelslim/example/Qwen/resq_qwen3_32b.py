@@ -261,6 +261,10 @@ def parse_args():
                         help="JSON dict mapping layer name patterns to quant types: "
                              "'resq', 'w8a8_dynamic', 'int4_hadamard', or 'float'. "
                              "Example: '{\"*.mlp.down_proj\": \"w8a8_dynamic\"}'")
+    parser.add_argument('--save_online_rotations', type=cmd_bool, default=False,
+                        help="Save online rotation matrices (Uc, Pd, Hd, Ud) to weight file. "
+                             "Default False produces inference-ready checkpoints for vLLM. "
+                             "Set True only for debugging/research.")
 
     # GPTQ parameters
     parser.add_argument('--w_rtn', type=cmd_bool, default=True,
@@ -676,6 +680,7 @@ def main():
         kurtosis_percentile_low=args.kurtosis_percentile_low,
         kurtosis_percentile_high=args.kurtosis_percentile_high,
         mix_cfg=mix_cfg,
+        save_online_rotations=args.save_online_rotations,
         # GPTQ parameters
         w_rtn=args.w_rtn,
         percdamp=args.percdamp,

@@ -81,6 +81,14 @@ class ResQConfig:
         # - rearrange_o_proj() is skipped (no column reordering)
         self.remove_ub = kwargs.get('remove_ub', False)
 
+        # Save online rotation matrices (Uc, Pd, Hd, Ud) to the weight file.
+        # When False (default), these matrices are NOT saved — producing
+        # inference-ready checkpoints that vLLM can load directly.
+        # When True, rotation matrices are saved based on the actual
+        # quantizer types (e.g., Uc only if o_proj uses ResQ).
+        # Use True only for debugging or research purposes.
+        self.save_online_rotations = kwargs.get('save_online_rotations', False)
+
         # NPU optimization for rotation operations
         # When enabled (default), rotation matmul operations are performed on NPU
         # instead of CPU, providing significant speedup for large models
@@ -230,6 +238,9 @@ class ResQConfig:
         # Validate remove_ub configuration
         assert isinstance(self.remove_ub, bool), \
             f"remove_ub must be a boolean, got {type(self.remove_ub)}"
+
+        assert isinstance(self.save_online_rotations, bool), \
+            f"save_online_rotations must be a boolean, got {type(self.save_online_rotations)}"
 
         # Validate mix_cfg configuration
         if self.mix_cfg:

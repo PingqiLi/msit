@@ -478,6 +478,7 @@ def rearrange_o_proj(
     high_fraction: float,
     head_dim: int,
     training: bool = False,
+    high_dim_override: Optional[int] = None,
 ) -> None:
     """
     Rearrange o_proj columns for mixed-precision layout.
@@ -491,6 +492,10 @@ def rearrange_o_proj(
         high_fraction: Fraction of dimensions at high precision (e.g., 0.125)
         head_dim: Dimension per head
         training: Whether in training mode
+        high_dim_override: If provided, use this as the total high-precision
+            column count instead of computing from high_fraction.  This must
+            match the aligned split used by add_resq_quantizers so that the
+            column rearrangement is consistent with the weight split.
     """
     o_proj = layer.self_attn.o_proj
 
@@ -498,14 +503,18 @@ def rearrange_o_proj(
     num_replicated_heads = in_dim // head_dim
 
     # Compute high_bits_length based on actual o_proj input dimension
-    # This is critical for models where hidden_size != num_attention_heads * head_dim
-    # Example: Qwen3-32B has hidden_size=5120, but o_proj input is 8192 (64 heads × 128 head_dim)
-    high_bits_length = int(high_fraction * in_dim)
+    # When high_dim_override is provided (from aligned splits), use it directly
+    # to ensure consistency with the weight split in add_resq_quantizers.
+    if high_dim_override is not None:
+        high_bits_length = high_dim_override
+    else:
+        high_bits_length = int(high_fraction * in_dim)
     high_length_per_head = high_bits_length // num_replicated_heads
 
     logger.debug(f"rearrange_o_proj: in_dim={in_dim}, num_replicated_heads={num_replicated_heads}, "
                  f"high_fraction={high_fraction}, high_bits_length={high_bits_length}, "
-                 f"high_length_per_head={high_length_per_head}, head_dim={head_dim}")
+                 f"high_length_per_head={high_length_per_head}, head_dim={head_dim}"
+                 f", high_dim_override={high_dim_override}")
 
     # Build column indices for rearrangement
     chunk_starts = torch.arange(0, in_dim, head_dim)
@@ -541,6 +550,7 @@ def rearrange_columns(
     config: Any,
     training: bool = False,
     ratio_dict: Optional[Dict[str, float]] = None,
+    scaled_splits_dict: Optional[Dict[str, tuple]] = None,
 ) -> None:
     """
     Rearrange columns in all layers for mixed-precision layout.
@@ -551,6 +561,10 @@ def rearrange_columns(
         training: Whether in training mode
         ratio_dict: Optional dictionary of per-layer/per-transform ratios.
                    If None, uses config.high_fraction for all layers.
+        scaled_splits_dict: Optional dictionary of aligned dimension splits.
+                   Keys are 'layer.{i}.Ub' etc., values are (low_dim, high_dim).
+                   When provided, the aligned high_dim is passed to rearrange_o_proj
+                   to ensure the column rearrangement matches the weight split.
     """
     # Check if remove_ub mode is enabled - skip rearrangement
     remove_ub = getattr(config, 'remove_ub', False)
@@ -591,11 +605,20 @@ def rearrange_columns(
                 layer_fraction = ratio_dict[ub_key]
                 logger.debug(f"Layer {idx}: using adaptive ratio {layer_fraction:.4f}")
 
+        # Get aligned high_dim from scaled_splits_dict if available
+        high_dim_override = None
+        if scaled_splits_dict is not None:
+            ub_key = f'layer.{idx}.Ub'
+            if ub_key in scaled_splits_dict:
+                _, high_dim_override = scaled_splits_dict[ub_key]
+                logger.debug(f"Layer {idx}: using aligned high_dim={high_dim_override}")
+
         rearrange_o_proj(
             layer,
-            layer_fraction,  # Pass fraction (may be per-layer)
+            layer_fraction,
             head_dim,
             training,
+            high_dim_override=high_dim_override,
         )
 
     cleanup_memory(verbos=False)

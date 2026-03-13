@@ -238,14 +238,18 @@ class ResQCalibrator:
                 # H and Rd are applied to the full intermediate_size, not blocksize
                 intermediate_size = model.config.intermediate_size
                 ud_rotation_type = self.cfg.ud_rotation_type
-                self.logger.info(f"Generating rotations with ud_rotation_type={ud_rotation_type}, intermediate_size={intermediate_size}")
+                ffn_rotation_mode = self.cfg.ffn_rotation_mode
+                self.logger.info(f"Generating rotations with ud_rotation_type={ud_rotation_type}, "
+                                 f"ffn_rotation_mode={ffn_rotation_mode}, intermediate_size={intermediate_size}")
                 self.rotation_dict = generate_random_rotations(
                     hidden_dim=model.config.hidden_size,
                     head_dim=head_dim,
-                    intermediate_dim=intermediate_size,  # Use full intermediate_size for H/Rd
+                    intermediate_dim=intermediate_size,
                     high_fraction=self.cfg.high_fraction,
                     seed=self.cfg.seed,
                     ud_rotation_type=ud_rotation_type,
+                    ffn_rotation_mode=ffn_rotation_mode,
+                    rd_block_size=self.cfg.rd_block_size,
                 )
 
             # Apply rotations with basis
@@ -577,7 +581,9 @@ class ResQCalibrator:
         For layers not covered by mix_cfg:
 
         - Fixed mode (adaptive_ratio=False): no override, stays default 'resq'
-        - Adaptive mode: always w8a8_dynamic
+        - Adaptive mode + perm_rd: stays 'resq' (Perm sorts by variance
+          specifically for mixed-precision split)
+        - Adaptive mode + ud: always w8a8_dynamic
         """
         import fnmatch
 
@@ -601,8 +607,9 @@ class ResQCalibrator:
                 # User directive takes precedence — expand to exact key
                 self.cfg.mix_cfg[layer_key] = user_type
                 user_count += 1
-            elif self.cfg.adaptive_ratio:
-                # Adaptive mode: down_proj always uses w8a8_dynamic
+            elif (self.cfg.adaptive_ratio
+                  and self.cfg.ffn_rotation_mode != 'perm_rd'):
+                # Adaptive + ud: down_proj uses w8a8_dynamic
                 self.cfg.mix_cfg[layer_key] = 'w8a8_dynamic'
                 w8a8_count += 1
             else:
@@ -1390,9 +1397,12 @@ class ResQCalibrator:
                 # Get the actual high_fraction used for this layer
                 layer_high_fraction = quant_weights.get('high_fraction', self.cfg.high_fraction)
 
-                # Save high_fraction as a scalar tensor (readable from safetensor)
                 weight_dict[f"{name}.high_fraction"] = torch.tensor(layer_high_fraction, dtype=torch.float32)
                 quant_description[f"{name}.high_fraction"] = "RESQ"
+
+                if self.cfg.ffn_rotation_mode == 'perm_rd' and 'down_proj' in name:
+                    weight_dict[f"{name}.rd_block_size"] = torch.tensor(self.cfg.rd_block_size, dtype=torch.int32)
+                    quant_description[f"{name}.rd_block_size"] = "RESQ"
 
                 # Save low precision weights and scales
                 if 'weight_low' in quant_weights:

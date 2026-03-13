@@ -315,6 +315,78 @@ def rotate_mlp_output_random(
         W.bias.data = torch.matmul(Ua_T_dev, b).to(dtype=dtype)
 
 
+def _build_block_hadamard(dim: int, block_size: int) -> torch.Tensor:
+    """Build a block-diagonal normalized Hadamard matrix.
+
+    Returns H = block_diag(H_b, H_b, ...) of shape [dim, dim]
+    where H_b is a [block_size, block_size] normalized Hadamard.
+    Requires dim % block_size == 0 and block_size is a power of 2.
+    """
+    assert dim % block_size == 0
+    n_blocks = dim // block_size
+
+    def _hadamard(n):
+        if n == 1:
+            return torch.ones(1, 1, dtype=torch.float64)
+        half = _hadamard(n // 2)
+        return torch.cat([
+            torch.cat([half, half], dim=1),
+            torch.cat([half, -half], dim=1),
+        ], dim=0) / (2 ** 0.5)
+
+    H_b = _hadamard(block_size)
+    blocks = [H_b] * n_blocks
+    return torch.block_diag(*blocks)
+
+
+def rotate_mlp_perm_rd(
+    layer: nn.Module,
+    Ua: torch.Tensor,
+    perm_indices: torch.Tensor,
+    rd_block_size: int,
+) -> None:
+    """Apply Perm+Rd FFN rotation scheme.
+
+    Called AFTER rotate_mlp_input() has already absorbed Ua into
+    gate/up via W_gate = W_gate_orig @ Ua.
+
+    Derivation (PyTorch [out, in], forward y = x @ W.T):
+
+    gate/up:  W_new = Perm.T @ (W @ Ua)     = W_after_ua[perm_indices, :]
+              Produces gate' = gate @ Perm, up' = up @ Perm.
+
+    down_proj: W_new = Ua.T @ W_down @ Perm @ Rd
+               Step 1: Ua.T @ W_down         (left-multiply)
+               Step 2: result[:, perm_indices] (= @ Perm)
+               Step 3: result @ Rd            (block Hadamard, symmetric)
+
+    Equivalence: h @ Perm @ Rd @ Rd @ Perm.T @ W.T @ Ua = h @ W.T @ Ua  ✓
+    """
+    for W in [layer.mlp.gate_proj, layer.mlp.up_proj]:
+        dtype = W.weight.dtype
+        W.weight.data = W.weight.data[perm_indices, :].contiguous().to(dtype)
+
+    W = layer.mlp.down_proj
+    dtype = W.weight.data.dtype
+    dev = W.weight.device
+
+    W_ = W.weight.data.to(torch.float32)
+    Ua_T_dev = Ua.T.to(device=dev, dtype=torch.float32)
+    W_ = torch.matmul(Ua_T_dev, W_)
+
+    W_ = W_[:, perm_indices].contiguous()
+
+    intermediate_size = W_.shape[1]
+    Rd = _build_block_hadamard(intermediate_size, rd_block_size).to(device=dev, dtype=torch.float32)
+    W_ = torch.matmul(W_, Rd)
+
+    W.weight.data = W_.to(dtype=dtype)
+
+    if W.bias is not None:
+        b = W.bias.data.to(torch.float32)
+        W.bias.data = torch.matmul(Ua_T_dev, b).to(dtype=dtype)
+
+
 def rotate_head(model: nn.Module, R1: torch.Tensor) -> None:
     """
     Rotate the LM head weights.
@@ -697,6 +769,8 @@ def apply_rotations(
     # Get Ud rotation type and blocksize from config
     ud_rotation_type = getattr(config, 'ud_rotation_type', 'hadamard')
     blocksize = getattr(config, 'down_proj_blocksize', 256)
+    ffn_rotation_mode = getattr(config, 'ffn_rotation_mode', 'ud')
+    rd_block_size = getattr(config, 'rd_block_size', 32)
 
     # Build composite rotation matrices
     R1_1 = rotation_dict['R1_1'].to(torch.float64)
@@ -767,33 +841,36 @@ def apply_rotations(
         # Rotate attention output
         rotate_attention_output(layer, U_attn)
 
-        # Rotate MLP input
+        # Rotate MLP input (absorb Ua into gate/up)
         rotate_mlp_input(layer, U_attn)
 
-        # Rotate MLP output (down_proj) based on quant type and ud_rotation_type
+        # Rotate MLP output (down_proj) based on quant type and rotation mode
         pd_key = f'layer.{idx}.mlp.down_proj'
+        perm_key = f'layer.{idx}.mlp.perm'
         down_proj_name = f'model.layers.{idx}.mlp.down_proj'
 
-        # Get the quantization type for this down_proj layer
         quant_type = get_down_proj_quant_type(down_proj_name)
 
-        if quant_type == 'int4_hadamard':
-            # int4_hadamard: Apply Ua.T @ W @ Hd (skip Pd basis, fuse Hd into weights)
+        if ffn_rotation_mode == 'perm_rd' and perm_key in basis_dict:
+            perm_indices = basis_dict[perm_key].long()
+            if quant_type in ('w8a8_dynamic', 'float'):
+                logger.info(f"perm_rd: {down_proj_name} is {quant_type}, Ua-only (skip Perm/Rd)")
+                rotate_mlp_output(layer, R1=U_attn)
+            else:
+                rotate_mlp_perm_rd(layer, U_attn, perm_indices, rd_block_size)
+        elif quant_type == 'int4_hadamard':
             logger.info(f"Applying Hadamard-only rotation for {down_proj_name} (int4_hadamard)")
             rotate_mlp_output_hadamard_only(layer, U_attn, hadK, K)
         elif quant_type in ('w8a8_dynamic', 'float'):
-            # w8a8_dynamic or float: Only apply Ua rotation (no Ud fusion)
             logger.info(f"Skipping Ud fusion for {down_proj_name} ({quant_type})")
             rotate_mlp_output(layer, R1=U_attn)
         elif pd_key in basis_dict:
-            # resq (default): Apply full Ua.T @ W @ Pd @ Hd (or Rd)
             Pd = basis_dict[pd_key].to(torch.float64)
             if ud_rotation_type == 'hadamard':
                 rotate_mlp_output_hadamard(layer, U_attn, Pd, hadK, K, blocksize)
-            else:  # 'random'
+            else:
                 rotate_mlp_output_random(layer, U_attn, Pd, Rd, blocksize)
         else:
-            # Fallback to original rotation if Pd not available
             rotate_mlp_output(layer, R1=U_attn)
 
     cleanup_memory(verbos=False)

@@ -378,6 +378,23 @@ def compute_basis(
     else:
         kurtosis_accum = None
 
+    # Per-channel kurtosis accumulator for Perm computation (perm_rd mode)
+    # Unlike kurtosis_accum which tracks per-block stats [nlayers, blocksize],
+    # this tracks stats across the full intermediate_size [nlayers, intermediate_size]
+    # Kurtosis = E[(x-μ)⁴] / σ⁴ measures tail heaviness — the standard metric
+    # for quantization difficulty (scale-invariant, captures outlier severity).
+    ffn_rotation_mode = getattr(config, 'ffn_rotation_mode', 'ud')
+    perm_kurtosis_accum = None
+    if ffn_rotation_mode == 'perm_rd':
+        perm_kurtosis_accum = {
+            'sum': torch.zeros((nlayers, intermediate_size), device='cpu', dtype=torch.float64),
+            'sum_sq': torch.zeros((nlayers, intermediate_size), device='cpu', dtype=torch.float64),
+            'sum_x3': torch.zeros((nlayers, intermediate_size), device='cpu', dtype=torch.float64),
+            'sum_x4': torch.zeros((nlayers, intermediate_size), device='cpu', dtype=torch.float64),
+            'count': torch.zeros(nlayers, device='cpu', dtype=torch.int64),
+        }
+        logger.info("Perm kurtosis accumulation enabled for perm_rd mode")
+
     # Prepare output buffer
     outs = [None] * nbatches
 
@@ -558,6 +575,13 @@ def compute_basis(
                         kurtosis_accum['down_proj']['sum_sq'][layer_idx] += (x_flat ** 2).sum(dim=0)
                         kurtosis_accum['down_proj']['sum_4th'][layer_idx] += (x_flat ** 4).sum(dim=0)
                         kurtosis_accum['down_proj']['count'][layer_idx] += x_flat.shape[0]
+                    if perm_kurtosis_accum is not None:
+                        x_full = dp_input.view(-1, intermediate_size).to(torch.float64).cpu()
+                        perm_kurtosis_accum['sum'][layer_idx] += x_full.sum(dim=0)
+                        perm_kurtosis_accum['sum_sq'][layer_idx] += (x_full ** 2).sum(dim=0)
+                        perm_kurtosis_accum['sum_x3'][layer_idx] += (x_full ** 3).sum(dim=0)
+                        perm_kurtosis_accum['sum_x4'][layer_idx] += (x_full ** 4).sum(dim=0)
+                        perm_kurtosis_accum['count'][layer_idx] += x_full.shape[0]
                 except Exception as e:
                     logger.warning(f"Layer {layer_idx} batch {batch_idx} down_proj covariance failed: {e}")
 
@@ -684,6 +708,28 @@ def compute_basis(
     logger.info(f"Total time: {total_eigen_elapsed:.2f}s ({total_eigen_elapsed/60:.1f} min)")
     logger.info(f"Total basis matrices: {len(basis_dict)}")
     logger.info(f"Keys: {list(basis_dict.keys())[:10]}... (showing first 10)")
+
+    if perm_kurtosis_accum is not None:
+        logger.info("Computing per-layer Perm matrices from channel kurtosis...")
+        for i in range(nlayers):
+            n = perm_kurtosis_accum['count'][i].item()
+            if n < 2:
+                logger.warning(f"Layer {i}: insufficient samples ({n}) for Perm, using identity")
+                basis_dict[f'layer.{i}.mlp.perm'] = torch.arange(intermediate_size)
+                continue
+            # Central kurtosis: κ = E[(x-μ)⁴] / σ⁴
+            # From raw moments: μ₄ = m₄ - 4·m₁·m₃ + 6·m₁²·m₂ - 3·m₁⁴
+            m1 = perm_kurtosis_accum['sum'][i] / n
+            m2 = perm_kurtosis_accum['sum_sq'][i] / n
+            m3 = perm_kurtosis_accum['sum_x3'][i] / n
+            m4 = perm_kurtosis_accum['sum_x4'][i] / n
+            mu4 = m4 - 4 * m1 * m3 + 6 * m1 ** 2 * m2 - 3 * m1 ** 4
+            var = m2 - m1 ** 2
+            var = torch.clamp(var, min=1e-12)
+            kurtosis = mu4 / (var ** 2)
+            sorted_indices = torch.argsort(kurtosis)
+            basis_dict[f'layer.{i}.mlp.perm'] = sorted_indices
+        logger.info(f"Computed {nlayers} per-layer Perm matrices (sorted by ascending kurtosis)")
 
     # Determine return format based on config
     adaptive_algorithm = getattr(config, 'adaptive_algorithm', None)
@@ -817,26 +863,9 @@ def generate_random_rotations(
     high_fraction: float = 0.125,
     seed: int = 42,
     ud_rotation_type: str = 'hadamard',
+    ffn_rotation_mode: str = 'ud',
+    rd_block_size: int = 32,
 ) -> Dict[str, torch.Tensor]:
-    """
-    Generate random orthogonal rotation matrices for ResQ.
-
-    The rotations are block-diagonal to preserve precision groupings.
-    Only two precision levels: mid (4-bit) and high (8-bit).
-
-    Args:
-        hidden_dim: Hidden dimension of the model
-        head_dim: Dimension per attention head
-        intermediate_dim: Intermediate dimension for down_proj (MLP)
-        high_fraction: Fraction for high precision (8-bit)
-        seed: Random seed for reproducibility
-        ud_rotation_type: Type of rotation for Ud (down_proj):
-            - 'hadamard': Use Hadamard matrix for full intermediate_dim
-            - 'random': Use random orthogonal matrix for full intermediate_dim
-
-    Returns:
-        Dictionary of rotation matrices (R1_1, R1_2, R2_1, R2_2, and Hd/Hd_K or Rd)
-    """
     torch.manual_seed(seed)
 
     def random_orthogonal_matrix(size):
@@ -871,30 +900,19 @@ def generate_random_rotations(
     rotation_dict['R2_1'] = R2_1
     rotation_dict['R2_2'] = R2_2
 
-    # Generate rotation for down_proj (Ud = block_diag(Pd) @ H or Rd)
-    # H/Rd is applied to full intermediate_dim
     if intermediate_dim is not None:
-        if ud_rotation_type == 'hadamard':
-            # Get Hadamard for full intermediate dimension using get_hadK
+        if ffn_rotation_mode == 'perm_rd':
+            rotation_dict['rd_block_size'] = torch.tensor(rd_block_size, dtype=torch.int64)
+            logger.info(f"perm_rd mode: rd_block_size={rd_block_size} (Perm from basis, Rd = block Hadamard)")
+        elif ud_rotation_type == 'hadamard':
             hadK, K = get_hadK(intermediate_dim)
-            rotation_dict['Hd'] = hadK  # May be None for pure power-of-2
+            rotation_dict['Hd'] = hadK
             rotation_dict['Hd_K'] = K
             logger.info(f"Generated Hadamard rotation for Ud: intermediate_dim={intermediate_dim}, K={K}")
-        else:  # 'random'
-            # Generate random orthogonal for full intermediate dimension
-            # Use had_random_orthogonal for consistency with hadamard_utils
+        else:
             Rd = had_random_orthogonal(intermediate_dim)
             rotation_dict['Rd'] = Rd
             logger.info(f"Generated random orthogonal rotation for Ud: intermediate_dim={intermediate_dim}")
-
-        # NOTE: Rd_1/Rd_2 block-diagonal rotations are no longer used.
-        # Keeping commented out for reference.
-        # high_inter_dim = int(high_fraction * intermediate_dim)
-        # mid_inter_dim = intermediate_dim - high_inter_dim
-        # Rd_1 = random_orthogonal_matrix(mid_inter_dim)
-        # Rd_2 = random_orthogonal_matrix(high_inter_dim)
-        # rotation_dict['Rd_1'] = Rd_1
-        # rotation_dict['Rd_2'] = Rd_2
 
     return rotation_dict
 

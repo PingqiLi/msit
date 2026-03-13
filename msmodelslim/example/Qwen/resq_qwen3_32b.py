@@ -266,6 +266,15 @@ def parse_args():
                              "Default False produces inference-ready checkpoints for vLLM. "
                              "Set True only for debugging/research.")
 
+    # FFN rotation mode
+    parser.add_argument('--ffn_rotation_mode', type=str, default='ud',
+                        choices=['ud', 'perm_rd'],
+                        help="FFN rotation: 'ud' (default, Hd@block_diag(Pd) fused) "
+                             "or 'perm_rd' (Perm fused into gate/up, online block Hadamard Rd)")
+    parser.add_argument('--rd_block_size', type=int, default=32,
+                        help="Block size for online Rd block Hadamard (default: 32, must be power of 2). "
+                             "Only used when --ffn_rotation_mode=perm_rd")
+
     # GPTQ parameters
     parser.add_argument('--w_rtn', type=cmd_bool, default=True,
                         help="RTN mode (default: True). Set to False for GPTQ mode.")
@@ -681,6 +690,8 @@ def main():
         kurtosis_percentile_high=args.kurtosis_percentile_high,
         mix_cfg=mix_cfg,
         save_online_rotations=args.save_online_rotations,
+        ffn_rotation_mode=args.ffn_rotation_mode,
+        rd_block_size=args.rd_block_size,
         # GPTQ parameters
         w_rtn=args.w_rtn,
         percdamp=args.percdamp,

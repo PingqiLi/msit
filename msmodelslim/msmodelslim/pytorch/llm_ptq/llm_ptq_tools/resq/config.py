@@ -140,6 +140,21 @@ class ResQConfig:
         # - random: Ud = block_diag(Pd) @ Rd, save full Ud per layer
         self.ud_rotation_type = kwargs.get('ud_rotation_type', 'hadamard')
 
+        # FFN rotation mode: controls how down_proj rotation is performed
+        # - 'ud': (default) Current scheme: Ud = Hd @ block_diag(Pd), fully
+        #         fused into down_proj weight, activation quantized in raw space.
+        # - 'perm_rd': New scheme: Perm (permutation) forward-fused through
+        #         SwiGLU into gate/up weights; Rd (block Hadamard) applied
+        #         online to down_proj input before mixed-precision quantization.
+        #         Perm computed from per-channel variance of down_proj input.
+        self.ffn_rotation_mode = kwargs.get('ffn_rotation_mode', 'ud')
+
+        # Block size for online Rd (block Hadamard) in perm_rd mode.
+        # Each precision group is partitioned into blocks of this size,
+        # and a normalized Hadamard matrix H_{rd_block_size} is applied
+        # within each block.  Only used when ffn_rotation_mode='perm_rd'.
+        self.rd_block_size = kwargs.get('rd_block_size', 32)
+
         # Training rotations (for rotation optimization)
         self.train_rotations = kwargs.get('train_rotations', False)
 
@@ -202,6 +217,11 @@ class ResQConfig:
         """
         assert self.ud_rotation_type in ['hadamard', 'random'], \
             f"Invalid ud_rotation_type: {self.ud_rotation_type}. Only 'hadamard' and 'random' are supported."
+        assert self.ffn_rotation_mode in ['ud', 'perm_rd'], \
+            f"Invalid ffn_rotation_mode: {self.ffn_rotation_mode}. Only 'ud' and 'perm_rd' are supported."
+        if self.ffn_rotation_mode == 'perm_rd':
+            assert self.rd_block_size > 0 and (self.rd_block_size & (self.rd_block_size - 1)) == 0, \
+                f"rd_block_size must be a positive power of 2, got {self.rd_block_size}"
         assert self.output_mode in ['fused', 'transforms_only', 'debug'], \
             f"Invalid output_mode: {self.output_mode}. Valid options: 'fused', 'transforms_only', 'debug'"
         assert 0.0 <= self.high_fraction <= 1.0, "high_fraction must be between 0 and 1"

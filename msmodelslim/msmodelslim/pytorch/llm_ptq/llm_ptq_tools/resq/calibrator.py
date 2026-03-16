@@ -581,8 +581,8 @@ class ResQCalibrator:
         For layers not covered by mix_cfg:
 
         - Fixed mode (adaptive_ratio=False): no override, stays default 'resq'
-        - Adaptive mode + perm_rd: stays 'resq' (Perm sorts by variance
-          specifically for mixed-precision split)
+        - Adaptive mode + perm_rd: stays 'resq' (MassDiff + Hadamard
+          equalizes channels for mixed-precision split)
         - Adaptive mode + ud: always w8a8_dynamic
         """
         import fnmatch

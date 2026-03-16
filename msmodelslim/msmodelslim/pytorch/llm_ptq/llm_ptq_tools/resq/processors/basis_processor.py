@@ -28,6 +28,55 @@ from ..utils.hadamard_utils import get_hadK, random_orthogonal_matrix as had_ran
 logger = logging.getLogger(__name__)
 
 
+def _mass_diff_perm(avg_abs: torch.Tensor, block_size: int) -> torch.Tensor:
+    """MassDiff: greedy l1 norm equalization across blocks.
+
+    Assigns channels to blocks to minimize max per-block l1 norm.
+    Based on MixQuant (arXiv:2601.22347) Algorithm 1.
+
+    Args:
+        avg_abs: Per-channel average absolute activation, shape [dim].
+        block_size: Block size for Hadamard rotation.
+
+    Returns:
+        Permutation indices [dim] ordered by block assignment.
+    """
+    import heapq
+
+    dim = avg_abs.shape[0]
+    assert dim % block_size == 0, (
+        f"dim={dim} must be divisible by block_size={block_size}"
+    )
+    n_blocks = dim // block_size
+
+    # Sort channels by descending average magnitude
+    sorted_channels = torch.argsort(
+        avg_abs, descending=True
+    ).tolist()
+
+    # Greedy bin-packing: assign each channel to lightest block
+    # heap entries: (current_load, block_id)
+    heap = [(0.0, j) for j in range(n_blocks)]
+    heapq.heapify(heap)
+    block_members: list = [[] for _ in range(n_blocks)]
+    block_counts = [0] * n_blocks
+
+    for ch_idx in sorted_channels:
+        load, j = heapq.heappop(heap)
+        block_members[j].append(ch_idx)
+        block_counts[j] += 1
+        if block_counts[j] < block_size:
+            heapq.heappush(
+                heap, (load + avg_abs[ch_idx].item(), j)
+            )
+
+    # Flatten: block 0 channels, block 1 channels, ...
+    perm: list = []
+    for members in block_members:
+        perm.extend(members)
+    return torch.tensor(perm, dtype=torch.long)
+
+
 def cleanup_memory():
     """Clean up NPU memory."""
     gc.collect()
@@ -378,22 +427,19 @@ def compute_basis(
     else:
         kurtosis_accum = None
 
-    # Per-channel kurtosis accumulator for Perm computation (perm_rd mode)
-    # Unlike kurtosis_accum which tracks per-block stats [nlayers, blocksize],
-    # this tracks stats across the full intermediate_size [nlayers, intermediate_size]
-    # Kurtosis = E[(x-μ)⁴] / σ⁴ measures tail heaviness — the standard metric
-    # for quantization difficulty (scale-invariant, captures outlier severity).
+    # Per-channel l1 accumulator for MassDiff permutation (perm_rd mode)
+    # Tracks average |x| per channel across full intermediate_size.
+    # MassDiff uses this to equalize per-block l1 norms via greedy
+    # bin-packing, minimizing the theoretical bound on post-Hadamard
+    # outlier magnitude (MixQuant, arXiv:2601.22347).
     ffn_rotation_mode = getattr(config, 'ffn_rotation_mode', 'ud')
-    perm_kurtosis_accum = None
+    perm_l1_accum = None
     if ffn_rotation_mode == 'perm_rd':
-        perm_kurtosis_accum = {
-            'sum': torch.zeros((nlayers, intermediate_size), device='cpu', dtype=torch.float64),
-            'sum_sq': torch.zeros((nlayers, intermediate_size), device='cpu', dtype=torch.float64),
-            'sum_x3': torch.zeros((nlayers, intermediate_size), device='cpu', dtype=torch.float64),
-            'sum_x4': torch.zeros((nlayers, intermediate_size), device='cpu', dtype=torch.float64),
+        perm_l1_accum = {
+            'sum_abs': torch.zeros((nlayers, intermediate_size), device='cpu', dtype=torch.float64),
             'count': torch.zeros(nlayers, device='cpu', dtype=torch.int64),
         }
-        logger.info("Perm kurtosis accumulation enabled for perm_rd mode")
+        logger.info("Per-channel l1 accumulation enabled for perm_rd MassDiff")
 
     # Prepare output buffer
     outs = [None] * nbatches
@@ -575,13 +621,10 @@ def compute_basis(
                         kurtosis_accum['down_proj']['sum_sq'][layer_idx] += (x_flat ** 2).sum(dim=0)
                         kurtosis_accum['down_proj']['sum_4th'][layer_idx] += (x_flat ** 4).sum(dim=0)
                         kurtosis_accum['down_proj']['count'][layer_idx] += x_flat.shape[0]
-                    if perm_kurtosis_accum is not None:
+                    if perm_l1_accum is not None:
                         x_full = dp_input.view(-1, intermediate_size).to(torch.float64).cpu()
-                        perm_kurtosis_accum['sum'][layer_idx] += x_full.sum(dim=0)
-                        perm_kurtosis_accum['sum_sq'][layer_idx] += (x_full ** 2).sum(dim=0)
-                        perm_kurtosis_accum['sum_x3'][layer_idx] += (x_full ** 3).sum(dim=0)
-                        perm_kurtosis_accum['sum_x4'][layer_idx] += (x_full ** 4).sum(dim=0)
-                        perm_kurtosis_accum['count'][layer_idx] += x_full.shape[0]
+                        perm_l1_accum['sum_abs'][layer_idx] += x_full.abs().sum(dim=0)
+                        perm_l1_accum['count'][layer_idx] += x_full.shape[0]
                 except Exception as e:
                     logger.warning(f"Layer {layer_idx} batch {batch_idx} down_proj covariance failed: {e}")
 
@@ -709,27 +752,45 @@ def compute_basis(
     logger.info(f"Total basis matrices: {len(basis_dict)}")
     logger.info(f"Keys: {list(basis_dict.keys())[:10]}... (showing first 10)")
 
-    if perm_kurtosis_accum is not None:
-        logger.info("Computing per-layer Perm matrices from channel kurtosis...")
+    if perm_l1_accum is not None:
+        rd_block_size = getattr(config, 'rd_block_size', 32)
+        logger.info(
+            f"Computing per-layer Perm via MassDiff "
+            f"(block_size={rd_block_size})..."
+        )
         for i in range(nlayers):
-            n = perm_kurtosis_accum['count'][i].item()
-            if n < 2:
-                logger.warning(f"Layer {i}: insufficient samples ({n}) for Perm, using identity")
-                basis_dict[f'layer.{i}.mlp.perm'] = torch.arange(intermediate_size)
+            n = perm_l1_accum['count'][i].item()
+            if n < 1:
+                logger.warning(
+                    f"Layer {i}: no samples for Perm, "
+                    f"using identity"
+                )
+                basis_dict[f'layer.{i}.mlp.perm'] = (
+                    torch.arange(intermediate_size)
+                )
                 continue
-            # Central kurtosis: κ = E[(x-μ)⁴] / σ⁴
-            # From raw moments: μ₄ = m₄ - 4·m₁·m₃ + 6·m₁²·m₂ - 3·m₁⁴
-            m1 = perm_kurtosis_accum['sum'][i] / n
-            m2 = perm_kurtosis_accum['sum_sq'][i] / n
-            m3 = perm_kurtosis_accum['sum_x3'][i] / n
-            m4 = perm_kurtosis_accum['sum_x4'][i] / n
-            mu4 = m4 - 4 * m1 * m3 + 6 * m1 ** 2 * m2 - 3 * m1 ** 4
-            var = m2 - m1 ** 2
-            var = torch.clamp(var, min=1e-12)
-            kurtosis = mu4 / (var ** 2)
-            sorted_indices = torch.argsort(kurtosis)
-            basis_dict[f'layer.{i}.mlp.perm'] = sorted_indices
-        logger.info(f"Computed {nlayers} per-layer Perm matrices (sorted by ascending kurtosis)")
+            avg_abs = perm_l1_accum['sum_abs'][i] / n
+            perm_indices = _mass_diff_perm(avg_abs, rd_block_size)
+            basis_dict[f'layer.{i}.mlp.perm'] = perm_indices
+
+            # Log equalization quality
+            n_blocks = intermediate_size // rd_block_size
+            block_loads = torch.tensor([
+                avg_abs[perm_indices[j * rd_block_size:
+                                     (j + 1) * rd_block_size]]
+                .sum().item()
+                for j in range(n_blocks)
+            ])
+            logger.debug(
+                f"Layer {i}: block l1 range "
+                f"[{block_loads.min():.4f}, "
+                f"{block_loads.max():.4f}], "
+                f"std={block_loads.std():.4f}"
+            )
+        logger.info(
+            f"Computed {nlayers} per-layer Perm matrices "
+            f"via MassDiff l1 equalization"
+        )
 
     # Determine return format based on config
     adaptive_algorithm = getattr(config, 'adaptive_algorithm', None)

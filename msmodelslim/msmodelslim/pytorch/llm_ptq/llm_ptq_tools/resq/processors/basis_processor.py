@@ -754,9 +754,17 @@ def compute_basis(
 
     if perm_l1_accum is not None:
         rd_block_size = getattr(config, 'rd_block_size', 32)
+        max_tp = getattr(config, 'max_tp', 2)
+        group_size = intermediate_size // max_tp
+        assert group_size % rd_block_size == 0, (
+            f"group_size={group_size} (intermediate_size={intermediate_size} "
+            f"/ max_tp={max_tp}) must be divisible by "
+            f"rd_block_size={rd_block_size}"
+        )
         logger.info(
             f"Computing per-layer Perm via MassDiff "
-            f"(block_size={rd_block_size})..."
+            f"(block_size={rd_block_size}, max_tp={max_tp}, "
+            f"group_size={group_size})..."
         )
         for i in range(nlayers):
             n = perm_l1_accum['count'][i].item()
@@ -770,26 +778,40 @@ def compute_basis(
                 )
                 continue
             avg_abs = perm_l1_accum['sum_abs'][i] / n
-            perm_indices = _mass_diff_perm(avg_abs, rd_block_size)
+
+            # Per-group MassDiff: sort within each group independently
+            perm_parts = []
+            for g in range(max_tp):
+                base = g * group_size
+                group_avg = avg_abs[base:base + group_size]
+                group_perm = _mass_diff_perm(group_avg, rd_block_size)
+                # Offset indices to global coordinate
+                perm_parts.append(group_perm + base)
+            perm_indices = torch.cat(perm_parts)
             basis_dict[f'layer.{i}.mlp.perm'] = perm_indices
 
-            # Log equalization quality
-            n_blocks = intermediate_size // rd_block_size
-            block_loads = torch.tensor([
-                avg_abs[perm_indices[j * rd_block_size:
-                                     (j + 1) * rd_block_size]]
-                .sum().item()
-                for j in range(n_blocks)
-            ])
-            logger.debug(
-                f"Layer {i}: block l1 range "
-                f"[{block_loads.min():.4f}, "
-                f"{block_loads.max():.4f}], "
-                f"std={block_loads.std():.4f}"
-            )
+            # Log equalization quality per group
+            for g in range(max_tp):
+                g_start = g * group_size
+                g_end = g_start + group_size
+                g_perm = perm_indices[g_start:g_end]
+                n_blocks = group_size // rd_block_size
+                block_loads = torch.tensor([
+                    avg_abs[g_perm[j * rd_block_size:
+                                   (j + 1) * rd_block_size]]
+                    .sum().item()
+                    for j in range(n_blocks)
+                ])
+                logger.debug(
+                    f"Layer {i} group {g}: block l1 range "
+                    f"[{block_loads.min():.4f}, "
+                    f"{block_loads.max():.4f}], "
+                    f"std={block_loads.std():.4f}"
+                )
         logger.info(
             f"Computed {nlayers} per-layer Perm matrices "
-            f"via MassDiff l1 equalization"
+            f"via per-group MassDiff l1 equalization "
+            f"(max_tp={max_tp})"
         )
 
     # Determine return format based on config

@@ -642,7 +642,6 @@ def rearrange_columns(
     remove_ub = getattr(config, 'remove_ub', False)
     if remove_ub:
         logger.info("remove_ub=True: Skipping o_proj column rearrangement")
-        return
 
     model_config = model.config
     num_heads = model_config.num_attention_heads
@@ -661,6 +660,42 @@ def rearrange_columns(
     # The actual o_proj high_bits_length is computed inside rearrange_o_proj
     # based on o_proj input dimension (num_attention_heads * head_dim)
     high_bits_length_hidden = int(config.high_fraction * model_dim)
+
+    ffn_rotation_mode = getattr(config, 'ffn_rotation_mode', 'ud')
+    rd_block_size = getattr(config, 'rd_block_size', 32)
+    max_tp = getattr(config, 'max_tp', 2)
+
+    perm_rd_gather_order = None
+    if ffn_rotation_mode == 'perm_rd':
+        intermediate_size = model_config.intermediate_size
+        assert intermediate_size % max_tp == 0, (
+            f"intermediate_size={intermediate_size} must be divisible by "
+            f"max_tp={max_tp}"
+        )
+        group_size = intermediate_size // max_tp
+        assert group_size % rd_block_size == 0, (
+            f"group_size={group_size} (intermediate_size={intermediate_size} "
+            f"/ max_tp={max_tp}) must be divisible by "
+            f"rd_block_size={rd_block_size}"
+        )
+
+        n_blocks_per_group = group_size // rd_block_size
+        high_blocks_per_group = int(round(n_blocks_per_group * config.high_fraction))
+        high_blocks_per_group = min(max(high_blocks_per_group, 0), n_blocks_per_group)
+        high_per_group = high_blocks_per_group * rd_block_size
+        low_per_group = group_size - high_per_group
+
+        low_indices, high_indices = [], []
+        for g in range(max_tp):
+            base = g * group_size
+            low_indices.extend(range(base, base + low_per_group))
+            high_indices.extend(range(base + low_per_group, base + group_size))
+        perm_rd_gather_order = torch.tensor(low_indices + high_indices, dtype=torch.long)
+
+        logger.info(
+            f"perm_rd down_proj gather: max_tp={max_tp}, group_size={group_size}, "
+            f"low_per_group={low_per_group}, high_per_group={high_per_group}"
+        )
 
     logger.debug(f"rearrange_columns: model_dim={model_dim}, head_dim={head_dim}, "
                  f"num_heads={num_heads}, num_kv_heads={num_kv_heads}, "
@@ -685,13 +720,28 @@ def rearrange_columns(
                 _, high_dim_override = scaled_splits_dict[ub_key]
                 logger.debug(f"Layer {idx}: using aligned high_dim={high_dim_override}")
 
-        rearrange_o_proj(
-            layer,
-            layer_fraction,
-            head_dim,
-            training,
-            high_dim_override=high_dim_override,
-        )
+        if not remove_ub:
+            rearrange_o_proj(
+                layer,
+                layer_fraction,
+                head_dim,
+                training,
+                high_dim_override=high_dim_override,
+            )
+
+        if perm_rd_gather_order is not None:
+            down_proj = layer.mlp.down_proj
+            in_dim = down_proj.weight.shape[1]
+            assert in_dim == perm_rd_gather_order.numel(), (
+                f"down_proj in_dim={in_dim} does not match perm_rd gather "
+                f"size={perm_rd_gather_order.numel()}"
+            )
+
+            if training:
+                layer.mlp.perm_rd_column_order = perm_rd_gather_order
+            else:
+                gather_order = perm_rd_gather_order.to(down_proj.weight.device)
+                down_proj.weight.data = down_proj.weight.data[:, gather_order]
 
     cleanup_memory(verbos=False)
 

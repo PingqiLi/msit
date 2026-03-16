@@ -265,6 +265,39 @@ class ResQCalibrator:
                                   scaled_splits_dict=self.scaled_splits_dict)
                 cleanup_memory(verbos=False)
 
+                # perm_rd: ensure quantizer uses block-aligned split matching rearrange_columns.
+                # rearrange_columns computes high_per_group as
+                #   round(n_blocks_per_group * high_fraction) * rd_block_size
+                # which may differ from int(high_fraction * intermediate_size) due to
+                # banker's rounding (e.g., max_tp=8: 3072 vs 3200).
+                if self.cfg.ffn_rotation_mode == 'perm_rd':
+                    intermediate_size = model.config.intermediate_size
+                    max_tp = self.cfg.max_tp
+                    group_size = intermediate_size // max_tp
+                    n_blocks_per_group = group_size // self.cfg.rd_block_size
+                    high_blocks_per_group = int(round(
+                        n_blocks_per_group * self.cfg.high_fraction))
+                    high_blocks_per_group = min(max(
+                        high_blocks_per_group, 0), n_blocks_per_group)
+                    perm_rd_high_dim = (high_blocks_per_group
+                                        * self.cfg.rd_block_size * max_tp)
+                    perm_rd_low_dim = intermediate_size - perm_rd_high_dim
+
+                    if self.scaled_splits_dict is None:
+                        self.scaled_splits_dict = {}
+                    for i in range(model.config.num_hidden_layers):
+                        key = f'layer.{i}.Ud'
+                        self.scaled_splits_dict[key] = (
+                            perm_rd_low_dim, perm_rd_high_dim)
+
+                    naive_high = int(
+                        self.cfg.high_fraction * intermediate_size)
+                    self.logger.info(
+                        f"perm_rd: block-aligned down_proj split: "
+                        f"low={perm_rd_low_dim}, high={perm_rd_high_dim} "
+                        f"(vs naive int(fraction*dim)={naive_high})"
+                    )
+
         # Skip quantizer addition in transform-only mode
         if self.cfg.should_skip_fusion:
             self.logger.info(f"output_mode='{self.cfg.output_mode}': Skipping quantizer addition")
@@ -1403,6 +1436,11 @@ class ResQCalibrator:
                 if self.cfg.ffn_rotation_mode == 'perm_rd' and 'down_proj' in name:
                     weight_dict[f"{name}.rd_block_size"] = torch.tensor(self.cfg.rd_block_size, dtype=torch.int32)
                     quant_description[f"{name}.rd_block_size"] = "RESQ"
+                    # perm_group_size: group size for per-group [low|high] split
+                    # Online inference uses this to split activation per-group
+                    perm_group_size = self.model.config.intermediate_size // self.cfg.max_tp
+                    weight_dict[f"{name}.perm_group_size"] = torch.tensor(perm_group_size, dtype=torch.int32)
+                    quant_description[f"{name}.perm_group_size"] = "RESQ"
 
                 # Save low precision weights and scales
                 if 'weight_low' in quant_weights:

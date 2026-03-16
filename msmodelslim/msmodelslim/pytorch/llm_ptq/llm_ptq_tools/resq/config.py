@@ -155,6 +155,13 @@ class ResQConfig:
         # within each block.  Only used when ffn_rotation_mode='perm_rd'.
         self.rd_block_size = kwargs.get('rd_block_size', 32)
 
+        # Maximum tensor parallelism supported by the checkpoint.
+        # Used in perm_rd mode to compute per-group permutation:
+        #   group_size = intermediate_size / max_tp
+        # Each TP rank receives exactly N/max_tp contiguous channels,
+        # and the [low | high] split is applied within each group.
+        self.max_tp = kwargs.get('max_tp', 2)
+
         # Training rotations (for rotation optimization)
         self.train_rotations = kwargs.get('train_rotations', False)
 
@@ -222,6 +229,8 @@ class ResQConfig:
         if self.ffn_rotation_mode == 'perm_rd':
             assert self.rd_block_size > 0 and (self.rd_block_size & (self.rd_block_size - 1)) == 0, \
                 f"rd_block_size must be a positive power of 2, got {self.rd_block_size}"
+            assert self.max_tp >= 1 and (self.max_tp & (self.max_tp - 1)) == 0, \
+                f"max_tp must be a positive power of 2, got {self.max_tp}"
         assert self.output_mode in ['fused', 'transforms_only', 'debug'], \
             f"Invalid output_mode: {self.output_mode}. Valid options: 'fused', 'transforms_only', 'debug'"
         assert 0.0 <= self.high_fraction <= 1.0, "high_fraction must be between 0 and 1"

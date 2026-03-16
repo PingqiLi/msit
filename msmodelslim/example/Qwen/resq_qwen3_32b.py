@@ -274,6 +274,10 @@ def parse_args():
     parser.add_argument('--rd_block_size', type=int, default=32,
                         help="Block size for online Rd block Hadamard (default: 32, must be power of 2). "
                              "Only used when --ffn_rotation_mode=perm_rd")
+    parser.add_argument('--max_tp', type=int, default=2,
+                        help="Max tensor parallelism for perm_rd mode (default: 2). "
+                             "Determines per-group permutation: group_size = intermediate_size / max_tp. "
+                             "Must be a power of 2.")
 
     # GPTQ parameters
     parser.add_argument('--w_rtn', type=cmd_bool, default=True,
@@ -692,6 +696,7 @@ def main():
         save_online_rotations=args.save_online_rotations,
         ffn_rotation_mode=args.ffn_rotation_mode,
         rd_block_size=args.rd_block_size,
+        max_tp=args.max_tp,
         # GPTQ parameters
         w_rtn=args.w_rtn,
         percdamp=args.percdamp,

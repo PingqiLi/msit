@@ -588,7 +588,7 @@ class ResQCalibrator:
                 fraction = high_dim / (low_dim + high_dim)
                 if full_dim % alignment == 0:
                     scaled_splits[key] = align_dimension_split(
-                        full_dim, fraction, alignment)
+                        full_dim, fraction, alignment, mode='ceil')
                 else:
                     scaled_splits[key] = (
                         low_dim * num_heads, high_dim * num_heads)
@@ -597,7 +597,7 @@ class ResQCalibrator:
                 fraction = high_dim / (low_dim + high_dim)
                 if full_dim % alignment == 0:
                     scaled_splits[key] = align_dimension_split(
-                        full_dim, fraction, alignment)
+                        full_dim, fraction, alignment, mode='ceil')
                 else:
                     scaled_splits[key] = (
                         low_dim * num_kv_heads, high_dim * num_kv_heads)

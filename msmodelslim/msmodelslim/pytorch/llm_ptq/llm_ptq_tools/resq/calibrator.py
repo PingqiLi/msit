@@ -8,6 +8,7 @@ msmodelslim framework, following the pattern of Calibrator.
 
 import os
 import gc
+import re
 import functools
 from collections import defaultdict
 from typing import List, Optional, Dict, Any
@@ -1640,7 +1641,156 @@ class ResQCalibrator:
             save_adaptive_ratios(self.adaptive_ratio_result, adaptive_ratio_path)
             self.logger.info(f"Saved adaptive ratios to {adaptive_ratio_path}")
 
+        # Generate and save quantization summary
+        self._save_quant_summary(output_path, weight_dict)
+
         self.logger.info("Save complete!")
+
+    # ---- Quantization summary (mixed-precision ratio analysis) ----
+
+    _GROUP_MAP = {
+        "q_proj": "qkv", "k_proj": "qkv", "v_proj": "qkv",
+        "qkv_proj": "qkv", "query_key_value": "qkv",
+        "o_proj": "o", "dense": "o",
+        "gate_proj": "up_gate", "up_proj": "up_gate",
+        "gate_up_proj": "up_gate", "dense_h_to_4h": "up_gate",
+        "down_proj": "down", "dense_4h_to_h": "down",
+    }
+    _GROUP_NAMES = ["qkv", "o", "up_gate", "down"]
+
+    def _save_quant_summary(self, output_path: str, weight_dict: Dict[str, torch.Tensor]) -> None:
+        """Analyze weight_dict for int4/int8 mixed-precision ratios and save summary."""
+        # Collect per-layer, per-group stats from weight_dict keys
+        # ResQ layers have weight_low (4-bit) and weight_high (8-bit)
+        # W8A8 layers have weight (8-bit)
+        stats = defaultdict(lambda: defaultdict(lambda: {"int4": 0, "int8": 0, "total": 0}))
+
+        for name, tensor in weight_dict.items():
+            # Parse layer index
+            m = re.search(r"model\.layers\.(\d+)\.", name)
+            if m is None:
+                continue
+            layer_id = int(m.group(1))
+
+            # Parse projection name → group
+            # name like: model.layers.0.self_attn.q_proj.weight_low
+            parts = name.split(".")
+            # Find the projection leaf (the part before weight_low/weight_high/weight)
+            proj_leaf = None
+            for p in parts:
+                if p in self._GROUP_MAP:
+                    proj_leaf = p
+                    break
+            if proj_leaf is None:
+                continue
+            group = self._GROUP_MAP[proj_leaf]
+
+            numel = tensor.numel()
+            if name.endswith(".weight_low"):
+                stats[layer_id][group]["int4"] += numel
+                stats[layer_id][group]["total"] += numel
+            elif name.endswith(".weight_high"):
+                stats[layer_id][group]["int8"] += numel
+                stats[layer_id][group]["total"] += numel
+            elif name.endswith(".weight") and f"{'.'.join(parts[:-1])}.weight_low" not in weight_dict:
+                # Pure weight (W8A8 or float) — only count if no weight_low exists for same module
+                stats[layer_id][group]["int8"] += numel
+                stats[layer_id][group]["total"] += numel
+
+        if not stats:
+            return
+
+        # Compute aggregated stats
+        per_group_global = {g: {"int4": 0, "int8": 0, "total": 0} for g in self._GROUP_NAMES}
+        total_int4 = 0
+        total_int8 = 0
+        total_numel = 0
+
+        for layer_id in sorted(stats.keys()):
+            for g in self._GROUP_NAMES:
+                s = stats[layer_id].get(g, {"int4": 0, "int8": 0, "total": 0})
+                per_group_global[g]["int4"] += s["int4"]
+                per_group_global[g]["int8"] += s["int8"]
+                per_group_global[g]["total"] += s["total"]
+                total_int4 += s["int4"]
+                total_int8 += s["int8"]
+                total_numel += s["total"]
+
+        def _ratio(n, d):
+            return n / d if d > 0 else 0.0
+
+        global_ratio4 = _ratio(total_int4, total_numel)
+        global_eq_bit = _ratio(4 * total_int4 + 8 * total_int8, total_numel)
+
+        # Print summary to logger
+        self.logger.info("")
+        self.logger.info("=" * 60)
+        self.logger.info("Quantization Summary (Mixed-Precision Ratios)")
+        self.logger.info("=" * 60)
+
+        # Per-layer table
+        header = f"{'layer':>6} | {'qkv':>8} | {'o':>8} | {'up_gate':>8} | {'down':>8} | {'overall':>8}"
+        self.logger.info(header)
+        self.logger.info("-" * len(header))
+
+        for layer_id in sorted(stats.keys()):
+            vals = []
+            layer_total = {"int4": 0, "total": 0}
+            for g in self._GROUP_NAMES:
+                s = stats[layer_id].get(g, {"int4": 0, "int8": 0, "total": 0})
+                vals.append(_ratio(s["int4"], s["total"]))
+                layer_total["int4"] += s["int4"]
+                layer_total["total"] += s["total"]
+            overall = _ratio(layer_total["int4"], layer_total["total"])
+            self.logger.info(
+                f"{layer_id:>6} | {vals[0]:>8.4f} | {vals[1]:>8.4f} | "
+                f"{vals[2]:>8.4f} | {vals[3]:>8.4f} | {overall:>8.4f}"
+            )
+
+        # Final summary
+        self.logger.info("")
+        items = [
+            ("qkv avg 4bit ratio", _ratio(per_group_global["qkv"]["int4"], per_group_global["qkv"]["total"])),
+            ("o avg 4bit ratio", _ratio(per_group_global["o"]["int4"], per_group_global["o"]["total"])),
+            ("up_gate avg 4bit ratio", _ratio(per_group_global["up_gate"]["int4"], per_group_global["up_gate"]["total"])),
+            ("down avg 4bit ratio", _ratio(per_group_global["down"]["int4"], per_group_global["down"]["total"])),
+            ("global 4bit ratio", global_ratio4),
+            ("weighted equivalent bit", global_eq_bit),
+        ]
+        for k, v in items:
+            self.logger.info(f"  {k:<28}: {v:.6f}")
+        self.logger.info("=" * 60)
+
+        # Save as markdown
+        md_lines = ["# ResQ Quantization Summary\n"]
+        md_lines.append("## Per-Layer 4-bit Ratio\n")
+        md_lines.append(f"| layer | qkv | o | up_gate | down | overall |")
+        md_lines.append(f"|------:|--------:|--------:|--------:|--------:|--------:|")
+
+        for layer_id in sorted(stats.keys()):
+            vals = []
+            layer_total = {"int4": 0, "total": 0}
+            for g in self._GROUP_NAMES:
+                s = stats[layer_id].get(g, {"int4": 0, "int8": 0, "total": 0})
+                vals.append(_ratio(s["int4"], s["total"]))
+                layer_total["int4"] += s["int4"]
+                layer_total["total"] += s["total"]
+            overall = _ratio(layer_total["int4"], layer_total["total"])
+            md_lines.append(
+                f"| {layer_id} | {vals[0]:.4f} | {vals[1]:.4f} | "
+                f"{vals[2]:.4f} | {vals[3]:.4f} | {overall:.4f} |"
+            )
+
+        md_lines.append("\n## Summary\n")
+        md_lines.append("| metric | value |")
+        md_lines.append("|:-------|------:|")
+        for k, v in items:
+            md_lines.append(f"| {k} | {v:.6f} |")
+
+        md_path = os.path.join(output_path, "quant_summary.md")
+        with open(md_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(md_lines) + "\n")
+        self.logger.info(f"Saved quantization summary to {md_path}")
 
     def _save_index_json(self, output_path: str, safetensors_name: str, weight_dict: dict) -> None:
         """Generate model.safetensors.index.json for the quantized model."""

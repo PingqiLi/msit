@@ -561,23 +561,21 @@ class ResQCalibrator:
         Compute scaled dimension splits for actual weight dimensions.
 
         The adaptive ratio computation works on transform dimensions (head_dim,
-        blocksize), but actual weights have larger dimensions. This method
-        scales splits and re-aligns at the full dimension level.
-
-        Alignment is only applied when the full dimension is divisible by the
-        alignment boundary; otherwise the unaligned scaled split is kept as-is.
+        blocksize), but the actual weights have different dimensions that need
+        proper scaling:
+        - Ua: hidden_dim -> hidden_dim (1:1, direct mapping)
+        - Ub: head_dim -> num_heads * head_dim (scale by num_heads)
+        - Uc: head_dim -> num_kv_heads * head_dim (scale by num_kv_heads)
+        - Ud: blocksize -> intermediate_size (scale by num_blocks)
         """
         if self.splits_dict is None:
             return None
-
-        from .processors.adaptive_ratio import align_dimension_split
 
         config = model.config
         hidden_size = config.hidden_size
         num_heads = config.num_attention_heads
         num_kv_heads = getattr(config, 'num_key_value_heads', num_heads)
         head_dim = getattr(config, 'head_dim', hidden_size // num_heads)
-        alignment = self.cfg.adaptive_alignment
 
         scaled_splits = {}
 
@@ -585,23 +583,10 @@ class ResQCalibrator:
             if key == 'Ua':
                 scaled_splits[key] = (low_dim, high_dim)
             elif key.endswith('.Ub'):
-                full_dim = num_heads * head_dim
-                fraction = high_dim / (low_dim + high_dim)
-                if full_dim % alignment == 0:
-                    scaled_splits[key] = align_dimension_split(
-                        full_dim, fraction, alignment, mode='ceil')
-                else:
-                    scaled_splits[key] = (
-                        low_dim * num_heads, high_dim * num_heads)
+                scale_factor = num_heads
+                scaled_splits[key] = (low_dim * scale_factor, high_dim * scale_factor)
             elif key.endswith('.Uc'):
-                full_dim = num_kv_heads * head_dim
-                fraction = high_dim / (low_dim + high_dim)
-                if full_dim % alignment == 0:
-                    scaled_splits[key] = align_dimension_split(
-                        full_dim, fraction, alignment, mode='ceil')
-                else:
-                    scaled_splits[key] = (
-                        low_dim * num_kv_heads, high_dim * num_kv_heads)
+                scaled_splits[key] = (low_dim * num_kv_heads, high_dim * num_kv_heads)
             elif key.endswith('.Ud'):
                 scaled_splits[key] = (low_dim, high_dim)
 

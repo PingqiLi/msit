@@ -216,6 +216,14 @@ for layer_idx in range(nlayers):
 
 用于后续自适应比率计算。
 
+#### 2.5 Per-channel l1 累积（perm_rd 模式）
+
+当 `ffn_rotation_mode='perm_rd'` 时，在 down_proj hook 中额外累积：
+- `sum_abs`：`[nlayers, intermediate_size]` — per-channel `|x|` 之和
+- `count`：每层样本数
+
+用于后续 MassDiff 贪心 bin-packing 置换计算。
+
 ---
 
 ### Step 3: 特征分解
@@ -287,13 +295,19 @@ R2 = block_diag(R2_1[112×112], R2_2[16×16])
 
 #### Hd/Rd: intermediate_dim 旋转
 
-根据 `ud_rotation_type` 配置：
+根据 `ffn_rotation_mode` 和 `ud_rotation_type` 配置：
+
+**`ffn_rotation_mode='ud'`（默认）**：
 
 - **`hadamard`（默认）**：调用 `get_hadK(25600)`
   - 25600 = 100 × 256，`get_hadK` 返回预计算的 `hadK100` 矩阵 `[100, 100]`（`hadamard_utils.py` 中的 `get_hadK100()` 函数）
   - 运行时 Hadamard 变换通过 butterfly 算法分解为 `hadK @ (n/K 个独立 DFT)` 形式
 
 - **`random`**：`Rd = random_orthogonal_matrix(25600)` — QR 分解生成正交矩阵
+
+**`ffn_rotation_mode='perm_rd'`**：
+
+不生成 Hd/Rd，改为使用 MassDiff 置换 + 块对角 Hadamard 方案（详见 Step 5.3）。此模式下 `generate_random_rotations()` 仅生成 R1、R2，跳过 intermediate_dim 旋转矩阵。
 
 所有随机矩阵使用 `torch.float64` 精度生成，通过 QR 分解确保正交性。
 
@@ -324,9 +338,11 @@ Ua = Pa @ R1  # [5120, 5120]
 | Up/Gate proj | `W_up/gate = W_up/gate @ Ua` | `rotate_mlp_input()` |
 | Down proj | 见下文 | 见下文 |
 
-#### 5.3 Down proj 旋转（3 种模式）
+#### 5.3 Down proj 旋转
 
-根据 `mix_cfg` 中该层的 `quant_type` 决定：
+根据 `ffn_rotation_mode` 和 `mix_cfg` 中该层的 `quant_type` 决定：
+
+**A. `ffn_rotation_mode='ud'`（默认，3 种模式）**
 
 **`resq`（默认）**：
 ```python
@@ -346,6 +362,56 @@ W_d = Ua.T @ W_d @ Hd    # 跳过 Pd
 W_d = Ua.T @ W_d          # 跳过整个 Ud
 ```
 函数：`rotate_mlp_output()`
+
+**B. `ffn_rotation_mode='perm_rd'`（MassDiff 置换 + 块 Hadamard）**
+
+用 MassDiff 通道置换替代 Pd 特征基，配合块对角 Hadamard 旋转。对 `w8a8_dynamic` / `float` 层仍退化为仅 Ua 旋转。
+
+**为什么需要均衡化**：块 Hadamard 变换会将 block 内各通道的能量"摊平"——如果某个 block 集中了大通道，变换后离群值仍然大，量化误差不降反升。MassDiff 的目标是让每个 block 的 l1 范数（通道绝对值之和）尽可能一致，从而最小化 Hadamard 后的最大值上界（基于 MixQuant, arXiv:2601.22347）。
+
+**MassDiff 算法**（`basis_processor.py` — `_mass_diff_perm()`）：
+
+输入：per-channel 平均绝对激活值 `avg_abs[dim]`，`block_size`。
+
+```
+1. 将所有通道按 avg_abs 从大到小排序
+2. 初始化最小堆，每个 block 一个条目 (负载=0, block_id)
+3. 依次取最大的未分配通道：
+   a. 弹出堆顶（当前负载最小的 block）
+   b. 将该通道放入此 block
+   c. 更新负载 = 旧负载 + avg_abs[该通道]
+   d. 若 block 未满（< block_size），推回堆
+4. 按 block 顺序拼接各 block 的通道索引，得到置换
+```
+
+举例：`block_size=4`，8 通道 `avg_abs = [10, 1, 8, 2, 7, 3, 6, 4]`
+
+| 轮次 | 取通道 (值) | 分到 block | block 0 (负载) | block 1 (负载) |
+|------|------------|-----------|---------------|---------------|
+| 1 | ch0 (10) | 0 | {ch0} (10) | {} (0) |
+| 2 | ch2 (8) | 1 | {ch0} (10) | {ch2} (8) |
+| 3 | ch4 (7) | 1 | {ch0} (10) | {ch2,ch4} (15) |
+| 4 | ch6 (6) | 0 | {ch0,ch6} (16) | {ch2,ch4} (15) |
+| 5 | ch7 (4) | 1 | {ch0,ch6} (16) | {ch2,ch4,ch7} (19) |
+| 6 | ch5 (3) | 0 | {ch0,ch6,ch5} (19) | {ch2,ch4,ch7} (19) |
+| 7 | ch3 (2) | 0 (满) | {ch0,ch6,ch5,ch3} (21) | {ch2,ch4,ch7} (19) |
+| 8 | ch1 (1) | 1 (满) | — | {ch2,ch4,ch7,ch1} (20) |
+
+结果：block 0 = `{10,6,3,2}` (sum=21), block 1 = `{8,7,4,1}` (sum=20)，非常均匀。
+
+**Per-group 分组**：按 `max_tp` 将 `intermediate_size` 切分为 `max_tp` 个 group（`group_size = intermediate_size / max_tp`），每组独立执行 MassDiff，各组 Perm 拼接得到全局置换索引 `layer.{i}.mlp.perm`。per-group 置换保证每个 TP rank 收到 `group_size` 个连续通道，无需跨 rank 通信。
+
+**权重融合**（`resq_processor.py` — `rotate_mlp_perm_rd()`）：
+```python
+# gate/up: 行置换（已先乘 Ua）
+W_gate = W_gate[perm_indices, :]
+W_up   = W_up[perm_indices, :]
+
+# down_proj: Ua.T @ W_d @ Perm @ Rd (Rd = block_diag Hadamard)
+W_d = Ua.T @ W_d
+W_d = W_d[:, perm_indices]
+W_d = W_d @ block_diag(H_b, H_b, ...)   # H_b: [rd_block_size, rd_block_size]
+```
 
 #### 5.4 V/O proj 旋转详解
 
@@ -395,7 +461,46 @@ new_order = [mid_columns | high_columns]
 o_proj.weight.data = W[:, new_order]
 ```
 
-当 `remove_ub=True` 时跳过此步。
+当 `remove_ub=True` 时跳过 o_proj 重排。
+
+#### perm_rd 模式的 down_proj 列重排
+
+当 `ffn_rotation_mode='perm_rd'` 时，`rearrange_columns()` 还需将 down_proj 的列从 per-group block 布局重排为量化器所需的全局 `[low | high]` 连续布局。
+
+**为什么需要这一步**：经过 Step 5 的 MassDiff 置换 + 块 Hadamard 后，每组内的通道按 block 排列，但混合精度切分是以**整 block 为单位**的（不在 block 内部切分）。量化器要求 `weight[:, :low_dim]` 全部是 4-bit、`weight[:, low_dim:]` 全部是 8-bit，因此需要把各组的 low/high block 收集到一起。
+
+**切分与 gather 过程**：
+
+```python
+group_size = intermediate_size // max_tp           # e.g. 25600/2 = 12800
+n_blocks_per_group = group_size // rd_block_size   # e.g. 12800/32 = 400
+high_blocks_per_group = round(n_blocks_per_group * high_fraction)  # round(400*0.125) = 50
+high_per_group = high_blocks_per_group * rd_block_size  # 50*32 = 1600
+low_per_group  = group_size - high_per_group            # 11200
+```
+
+每组内：前 `low_per_group` 列 → 4-bit，后 `high_per_group` 列 → 8-bit。然后跨组收集：
+
+```
+重排前 (per-group 布局):
+  group 0: [low_0 (11200) | high_0 (1600)]
+  group 1: [low_1 (11200) | high_1 (1600)]
+
+重排后 (全局连续布局):
+  [low_0, low_1 | high_0, high_1]
+  ← total_low (22400) →← total_high (3200) →
+```
+
+```python
+# 全局 gather order
+low_indices  = [g0: 0..11199,    g1: 12800..23999]
+high_indices = [g0: 11200..12799, g1: 24000..25599]
+gather_order = low_indices + high_indices
+
+down_proj.weight.data = down_proj.weight.data[:, gather_order]
+```
+
+重排后量化器直接按 `split_dim=1` 一刀切：`weight[:, :22400]` → `weight_low` (int4)，`weight[:, 22400:]` → `weight_high` (int8)。
 
 ---
 
@@ -522,7 +627,14 @@ for module in model.modules():
 | `transforms_only` | 仅分解的 P/R 矩阵（不修改权重） |
 | `debug` | 两者都保存 |
 
-#### 9.2 保存内容详解
+#### 9.2 量化摘要自动生成
+
+保存完成后自动调用 `_save_quant_summary()`（`calibrator.py`），分析 `weight_dict` 中的 int4/int8 分布：
+- **Per-layer 表格**：每层 qkv / o / up_gate / down 各组的 4-bit 比率
+- **全局汇总**：等效 bit（`4 × int4_ratio + 8 × int8_ratio`）、各组平均比率
+- 输出到 logger 并保存为 `quant_summary.md`
+
+#### 9.3 保存内容详解
 
 见下文 [输出文件格式](#9-输出文件格式) 章节。
 
@@ -559,12 +671,20 @@ for module in model.modules():
 
 ### Ud 详解
 
+**`ffn_rotation_mode='ud'`（默认）**：
 - **Pd** `[256, 256]`：per-layer down_proj 特征向量（blocksize 级别）
 - **Hd**：Hadamard 矩阵（`get_hadK(25600)` → `hadK100[100, 100]`, K=100）
 - 或 **Rd** `[25600, 25600]`：随机正交矩阵
 
 **Hadamard 模式保存**：`resq.layer.{i}.Pd` + 全局 `resq.Hd`
 **Random 模式保存**：`resq.layer.{i}.Ud`（完整 25600×25600 矩阵）
+
+**`ffn_rotation_mode='perm_rd'`**：
+- **Perm** `[25600]`：per-layer MassDiff 置换索引（融合进权重，不需在线推理）
+- **Rd**：块对角 Hadamard `block_diag(H_b × n_blocks)`，`H_b` 为 `[rd_block_size, rd_block_size]`
+- 推理时在线变换为 Rd（块 Hadamard）+ Perm 的逆置换
+
+**perm_rd 模式保存**：checkpoint 中 down_proj 层额外保存 `rd_block_size` 和 `perm_group_size` 标量
 
 ---
 
@@ -629,7 +749,7 @@ ratio = 0.4 * hessian_ratio + 0.3 * kurtosis_ratio + 0.3 * cev_ratio
 
 | 变换 | 特征值来源 | 维度 | 对齐 |
 |------|-----------|------|------|
-| Ua | `attn_mlp` per-layer traces | 5120 | 512 |
+| Ua | `attn_mlp` per-layer traces | 5120 | 512 (ceil 对齐) |
 | Ub | `value` per-head (aggregated max/mean) | 128 | 512 (>128, 退化为无对齐) |
 | Uc | `key_pos` per-layer | 128 | 512 (>128, 退化为无对齐) |
 | Ud | `down_proj` per-layer | 25600 (对齐级别) | 512 |
@@ -771,6 +891,7 @@ else:
 | `config.json` | 模型配置 + `"quantize": "W4A8_ResQ"` |
 | `resq_basis.pt` | 计算的基向量（如果 `--compute_basis`） |
 | `resq_adaptive_ratios.json` | 自适应比率结果（如果使用自适应模式） |
+| `quant_summary.md` | 量化摘要：per-layer int4/int8 比率表 + 全局等效 bit 统计 |
 
 ### 张量命名规范
 
@@ -785,6 +906,12 @@ model.layers.{i}.self_attn.q_proj.high_fraction   # float32 scalar
 ```
 
 同样适用于 `k_proj`, `v_proj`, `o_proj`, `gate_proj`, `up_proj`。
+
+**perm_rd 模式下 down_proj 额外字段**：
+```
+model.layers.{i}.mlp.down_proj.rd_block_size      # int32 scalar
+model.layers.{i}.mlp.down_proj.perm_group_size     # int32 scalar (= intermediate_size / max_tp)
+```
 
 #### W8A8 Dynamic 层 (LinearW8A8DynamicQuantizer)
 
@@ -915,6 +1042,14 @@ resq.layer.{i}.Ud        # float32, [25600, 25600] (完整矩阵)
 |------|------|--------|------|
 | `--mix_cfg` | str | None | JSON dict 指定每层量化类型 |
 
+### FFN 旋转参数
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `--ffn_rotation_mode` | str | `ud` | FFN 旋转模式: `ud`（Pd+Hd）/ `perm_rd`（MassDiff+块Hadamard） |
+| `--rd_block_size` | int | 32 | perm_rd 模式块 Hadamard 大小（必须为 2 的幂） |
+| `--max_tp` | int | 2 | perm_rd 模式最大 TP 并行度（group_size = intermediate_size / max_tp，必须为 2 的幂） |
+
 ### GPTQ 参数
 
 | 参数 | 类型 | 默认值 | 说明 |
@@ -954,6 +1089,18 @@ python msmodelslim/example/Qwen/resq_qwen3_32b.py \
     --adaptive_ratio_mode hybrid \
     --compute_basis \
     --compute_kurtosis
+```
+
+### perm_rd 模式
+
+```bash
+python msmodelslim/example/Qwen/resq_qwen3_32b.py \
+    --model_path /path/to/Qwen3-32B \
+    --save_directory /path/to/output \
+    --compute_basis \
+    --ffn_rotation_mode perm_rd \
+    --rd_block_size 32 \
+    --max_tp 2
 ```
 
 ### GPTQ 模式
@@ -1085,6 +1232,9 @@ usable_mem = int(props.total_memory * 0.85)  # 85% 利用率
 | `gptq_blocksize` | int | 128 | GPTQ block size |
 | `gptq_device` | str | None | GPTQ 处理设备 |
 | `ud_rotation_type` | str | `hadamard` | Ud 旋转类型: `hadamard` / `random` |
+| `ffn_rotation_mode` | str | `ud` | FFN 旋转模式: `ud` / `perm_rd` |
+| `rd_block_size` | int | 32 | perm_rd 块 Hadamard 大小 |
+| `max_tp` | int | 2 | perm_rd 最大 TP 并行度 |
 | `down_proj_blocksize` | int | 256 | Pd 块大小 |
 | `output_mode` | str | `fused` | 输出模式 |
 | `a_bits` | int | 4 | 激活量化位数 |
